@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "fmsc"
+version = "0.1.0"
+description = "Full Metal Shopping Cart and Wishlist Service"
+authors = ["Eri Wiana <eriwiana@gmail.com>"]
+license = "MIT"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+tinydb = "^4.7.1"
+falcon = "^3.1.1"
+uvicorn = "^0.20.0"
+
+[tool.poetry.dev-dependencies]
+flake8 = "^6.0.0"
+black = "^22.12.0"
+pre-commit = "^2.21.0"
+ipython = "^8.8.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
