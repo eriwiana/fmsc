@@ -25,7 +25,9 @@ jobs:
           enable-cache: true
       - uses: actions/setup-python@v6
         with:
-          python-version-file: pyproject.toml
+          # .python-version, not pyproject: setup-python reads requires-python as a
+          # range and picks the NEWEST match, which silently ran CI on 3.14.
+          python-version-file: .python-version
       # Over the whole repo, not the changed files: a pre-commit hook only
       # formats what a commit touches, so a file nobody has edited since the
       # formatter changed its mind drifts silently.
@@ -52,7 +54,9 @@ jobs:
           enable-cache: true
       - uses: actions/setup-python@v6
         with:
-          python-version-file: pyproject.toml
+          # .python-version, not pyproject: setup-python reads requires-python as a
+          # range and picks the NEWEST match, which silently ran CI on 3.14.
+          python-version-file: .python-version
 
       - name: Install
         run: uv sync --extra dev --locked
