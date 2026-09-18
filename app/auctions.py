@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 from litestar import WebSocket, get, post, websocket
 from litestar.channels import ChannelsPlugin
 from litestar.di import Provide
-from litestar.exceptions import ClientException, NotFoundException, NotAuthorizedException
+from litestar.exceptions import ClientException, NotAuthorizedException, NotFoundException
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -31,10 +31,16 @@ def resolve_deadline(dt: datetime) -> datetime:
 
 def _to_response(a: Auction) -> AuctionResponse:
     return AuctionResponse(
-        id=a.id, title=a.title, seller_id=a.seller_id, starting_bid=a.starting_bid,
-        current_bid=a.current_bid, current_winner_id=a.current_winner_id,
-        bid_count=a.bid_count, status=a.status,
-        starts_at=a.starts_at.astimezone(APP_TZ), ends_at=a.ends_at.astimezone(APP_TZ),
+        id=a.id,
+        title=a.title,
+        seller_id=a.seller_id,
+        starting_bid=a.starting_bid,
+        current_bid=a.current_bid,
+        current_winner_id=a.current_winner_id,
+        bid_count=a.bid_count,
+        status=a.status,
+        starts_at=a.starts_at.astimezone(APP_TZ),
+        ends_at=a.ends_at.astimezone(APP_TZ),
     )
 
 
@@ -52,8 +58,10 @@ async def create_auction(
     if data.starting_bid <= 0:
         raise ClientException("starting_bid must be positive")
     auction = Auction(
-        title=data.title, seller_id=current_user.id,
-        starting_bid=data.starting_bid, ends_at=ends_at,
+        title=data.title,
+        seller_id=current_user.id,
+        starting_bid=data.starting_bid,
+        ends_at=ends_at,
     )
     db_session.add(auction)
     await db_session.commit()
@@ -77,16 +85,14 @@ async def get_auction(auction_id: int, db_session: AsyncSession) -> AuctionRespo
 
 # The entire correctness of an absolute auction: one conditional UPDATE. Postgres MVCC
 # serializes concurrent bids, so no two bidders ever both win. Empty result = rejected.
-_BID_SQL = text(
-    """
+_BID_SQL = text("""
     UPDATE auctions
        SET current_bid = :amount, current_winner_id = :uid, bid_count = bid_count + 1
      WHERE id = :id AND status = 'open' AND ends_at > now()
        AND :amount >= starting_bid
        AND (current_bid IS NULL OR :amount > current_bid)
     RETURNING bid_count
-    """
-)
+    """)
 
 
 async def place_bid_tx(
@@ -110,8 +116,11 @@ async def place_bid_tx(
 
 @post("/auctions/{auction_id:int}/bids", dependencies=_authed)
 async def place_bid(
-    auction_id: int, data: BidRequest, current_user: User,
-    db_session: AsyncSession, channels: ChannelsPlugin,
+    auction_id: int,
+    data: BidRequest,
+    current_user: User,
+    db_session: AsyncSession,
+    channels: ChannelsPlugin,
 ) -> AuctionResponse:
     if data.amount <= 0:
         raise ClientException("amount must be positive")
@@ -119,8 +128,13 @@ async def place_bid(
         raise ClientException("bid rejected: too low, or auction closed/ended/not found")
     auction = await db_session.get(Auction, auction_id)
     channels.publish(
-        {"type": "bid", "auction_id": auction_id, "amount": str(data.amount),
-         "winner_id": current_user.id, "bid_count": auction.bid_count},
+        {
+            "type": "bid",
+            "auction_id": auction_id,
+            "amount": str(data.amount),
+            "winner_id": current_user.id,
+            "bid_count": auction.bid_count,
+        },
         _channel(auction_id),
     )
     return _to_response(auction)
@@ -141,13 +155,11 @@ async def auction_ws(
             await socket.send_text(event.decode() if isinstance(event, bytes) else event)
 
 
-_CLOSE_SQL = text(
-    """
+_CLOSE_SQL = text("""
     UPDATE auctions SET status = 'closed'
      WHERE status = 'open' AND ends_at <= now()
     RETURNING id, current_winner_id, current_bid
-    """
-)
+    """)
 
 
 async def run_closer(
@@ -165,8 +177,12 @@ async def run_closer(
                 await session.commit()
             for auction_id, winner_id, amount in rows:
                 channels.publish(
-                    {"type": "closed", "auction_id": auction_id, "winner_id": winner_id,
-                     "amount": str(amount) if amount is not None else None},
+                    {
+                        "type": "closed",
+                        "auction_id": auction_id,
+                        "winner_id": winner_id,
+                        "amount": str(amount) if amount is not None else None,
+                    },
                     _channel(auction_id),
                 )
         except asyncio.CancelledError:

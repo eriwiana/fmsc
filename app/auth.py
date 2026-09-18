@@ -15,7 +15,7 @@ from app.models import Session, User
 from app.schemas import SignupRequest, TokenResponse
 
 # scrypt params: stdlib, no dependency. n=2**14 is a sane interactive cost.
-_SCRYPT = dict(n=2**14, r=8, p=1)
+_SCRYPT = {"n": 2**14, "r": 8, "p": 1}
 
 
 def hash_password(password: str) -> str:

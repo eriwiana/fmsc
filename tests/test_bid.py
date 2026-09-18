@@ -8,6 +8,7 @@ sessions — the HTTP layer is thin glue and is smoke-tested manually (see READM
     alembic upgrade head
     DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/fmsc pytest
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -49,7 +50,9 @@ async def _seed(maker, starting="10.00", ends_delta=timedelta(hours=1)) -> tuple
         s.add(user)
         await s.flush()
         auction = Auction(
-            title="t", seller_id=user.id, starting_bid=Decimal(starting),
+            title="t",
+            seller_id=user.id,
+            starting_bid=Decimal(starting),
             ends_at=datetime.now(timezone.utc) + ends_delta,
         )
         s.add(auction)
