@@ -2,12 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import time
-
-# Run the process in Asia/Jakarta so logs and localtime are WIB. Domain logic uses explicit
-# aware UTC datetimes + Postgres now(), so this is cosmetic, not correctness.
-os.environ.setdefault("TZ", "Asia/Jakarta")
-time.tzset()
 
 from advanced_alchemy.config import AsyncSessionConfig
 from advanced_alchemy.extensions.litestar import SQLAlchemyAsyncConfig, SQLAlchemyPlugin
