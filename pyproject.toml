@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Real-time absolute auction service"
 authors = [{ name = "Eri Wiana", email = "eriwiana@gmail.com" }]
 license = { text = "MIT" }
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "litestar[standard]",
     "advanced-alchemy",
@@ -13,10 +13,30 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio"]
+dev = ["pytest", "pytest-asyncio", "pytest-cov"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+
+# Line length lives here, not only in the workflow, so a local `black .` and CI agree.
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.black]
+line-length = 100
+# Pin the target: without it black formats for the newest Python it knows and then
+# fails its own AST safety check when run on 3.12.
+target-version = ["py312"]
+
+[tool.coverage.run]
+source = ["app"]
+
+[tool.coverage.report]
+# Migrations are generated and the app factory is an entry point; counting them
+# flatters the number without testing anything.
+omit = ["alembic/*", "app/main.py"]
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:"]
 
 [build-system]
 requires = ["setuptools>=61"]
