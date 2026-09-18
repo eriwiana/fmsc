@@ -1,27 +1,31 @@
 default_language_version:
-  python: python3.9.13
+  python: python3.12
+# Commits stay fast, pushes stay safe: the suite runs on pre-push, not pre-commit.
+default_install_hook_types: [pre-commit, pre-push]
 repos:
   - repo: 'https://github.com/pre-commit/pre-commit-hooks'
-    rev: v4.4.0
+    rev: v6.0.0
     hooks:
       - id: check-ast
       - id: check-case-conflict
       - id: check-executables-have-shebangs
       - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-added-large-files
       - id: debug-statements
       - id: end-of-file-fixer
       - id: name-tests-test
+        # Keep pytest's own convention (test_*.py), not the _test.py default.
+        args: ['--pytest-test-first']
       - id: trailing-whitespace
-  - repo: 'https://github.com/asottile/reorder_python_imports'
-    rev: v3.9.0
+  - repo: 'https://github.com/PyCQA/isort'
+    rev: 9.0.1
     hooks:
-      - id: reorder-python-imports
-        args: [
-          '--application-directories', '.:src',
-          '--py39-plus',
-        ]
+      # isort, not reorder-python-imports: the latter strips the blank line after a
+      # module docstring that black then puts back, so the two never converge.
+      - id: isort
   - repo: 'https://github.com/PyCQA/flake8'
-    rev: 6.0.0
+    rev: 7.3.0
     hooks:
       - id: flake8
         additional_dependencies:
@@ -29,7 +33,17 @@ repos:
           - flake8-comprehensions
           - flake8-simplify
   - repo: 'https://github.com/psf/black'
-    rev: 22.12.0
+    rev: 26.5.1
     hooks:
+      # line-length comes from pyproject.toml so a local `black .` matches CI.
       - id: black
-        args: ['--line-length=79']
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest (requires Postgres on DATABASE_URL)
+        # `uv run` resolves the project environment itself, so the hook works
+        # without a virtualenv being activated first.
+        entry: uv run --extra dev pytest
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

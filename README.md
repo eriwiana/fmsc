@@ -1,2 +1,63 @@
-# fmsc
-Full Metal Shopping Cart and Wishlist Service
+# fmsc — real-time absolute auction
+
+Foundation for a community auction platform. **Absolute auction**: highest bid at a fixed
+deadline wins. One service (Litestar + WebSocket) + Postgres. No Redis until you scale past a
+single instance.
+
+## Stack
+Litestar · advanced-alchemy (SQLAlchemy 2.0 async + Alembic) · asyncpg · Postgres · uvicorn.
+Auth is stdlib only (`hashlib.scrypt` + opaque session tokens). 4 direct deps.
+
+## Time
+App timezone is **Asia/Jakarta** (`APP_TZ` in `app/auctions.py`). Storage stays UTC
+(`timestamptz` + Postgres `now()`); the zone only governs the edges — naive input is read as
+Jakarta wall time, responses render `+07:00`. Process runs with `TZ=Asia/Jakarta` for logs.
+
+## API
+- `POST /auth/signup`, `POST /auth/login` → `{token}`
+- `POST /auctions` (auth) — `{title, starting_bid, ends_at}` (ends_at in the future; a naive
+  value is read as **Asia/Jakarta** wall time)
+- `GET /auctions`, `GET /auctions/{id}`
+- `POST /auctions/{id}/bids` (auth) — `{amount}`; atomic, highest-wins
+- `GET /ws/auctions/{id}?token=...` — live bid + close events
+- `GET /health`, `GET /schema` (OpenAPI/Swagger UI)
+
+Auth is `Authorization: Bearer <token>` (query `?token=` for the WebSocket).
+
+## Local dev
+```bash
+python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
+docker run -d --name fmsc-pg -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=fmsc \
+    -p 5432:5432 postgres:16-alpine
+export DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/fmsc
+.venv/bin/alembic upgrade head
+.venv/bin/uvicorn app.main:app --reload
+```
+
+### Tests
+```bash
+DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/fmsc .venv/bin/pytest
+```
+`tests/test_bid.py` is the critical check: accept/reject rules, ended-auction rejection, and
+true concurrent single-winner.
+
+### Manual real-time smoke
+Create an auction ending ~30s out, then in two terminals:
+```bash
+wscat -c "ws://localhost:8000/ws/auctions/1?token=YOUR_TOKEN"
+```
+POST bids from each; both sockets receive every update and the final `closed` event with the winner.
+
+## Deploy (Railway)
+Add a Postgres plugin (injects `DATABASE_URL`). `railway.toml` runs `alembic upgrade head` then
+uvicorn on deploy. Healthcheck is `/health`.
+
+## Changing the schema
+```bash
+alembic revision --autogenerate -m "what changed"   # review the generated file
+alembic upgrade head
+```
+
+## Deferred (see plan)
+Redis fan-out (before multi-instance), anti-snipe soft-close, payments, reserve prices.
+Each has a clean seam; the bid stays one atomic SQL statement.

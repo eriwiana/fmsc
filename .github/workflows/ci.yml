@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A rapid second push supersedes the first instead of queueing behind it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The suite talks to the same engine production does; a sqlite pass is a
+  # convenience, not the contract.
+  DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/fmsc
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v6
+        with:
+          # .python-version, not pyproject: setup-python reads requires-python as a
+          # range and picks the NEWEST match, which silently ran CI on 3.14.
+          python-version-file: .python-version
+      # Over the whole repo, not the changed files: a pre-commit hook only
+      # formats what a commit touches, so a file nobody has edited since the
+      # formatter changed its mind drifts silently.
+      - run: uvx pre-commit run --all-files --show-diff-on-failure
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: fmsc
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v6
+        with:
+          # .python-version, not pyproject: setup-python reads requires-python as a
+          # range and picks the NEWEST match, which silently ran CI on 3.14.
+          python-version-file: .python-version
+
+      - name: Install
+        run: uv sync --extra dev --locked
+
+      - name: Compile
+        run: uv run python -m compileall -q app alembic tests
+
+      - name: App boots
+        run: uv run python -c "import app.main"
+
+      - name: Migrate
+        run: uv run alembic upgrade head
+
+      - name: Migrations match models
+        # An autogenerate that still has something to say means a model changed
+        # without a migration.
+        run: uv run alembic check
+
+      - name: Tests
+        # The floor lives in pyproject, so a local run gates identically.
+        run: uv run pytest --cov --cov-report=term-missing
