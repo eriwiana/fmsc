@@ -147,6 +147,20 @@ async def test_bid_on_ended_auction_rejected(sm):
         assert await place_bid_tx(s, aid, bidder, Decimal("10.00")) is False
 
 
+async def test_late_bid_rejected_despite_stale_transaction_clock(sm):
+    """Postgres `now()` is transaction_timestamp(), not wall time.
+
+    On the real HTTP path the auth dependency queries the session table first, so the
+    transaction is already open — and its clock already frozen — before the bid statement
+    runs. A bid that arrives after the deadline must still lose.
+    """
+    _, bidder, aid = await _seed(sm, ends_delta=timedelta(milliseconds=300))
+    async with sm() as s:
+        await s.execute(text("SELECT 1"))  # opens the transaction, freezing now()
+        await asyncio.sleep(0.6)  # the deadline passes on the wall clock
+        assert await place_bid_tx(s, aid, bidder, Decimal("10.00")) is False
+
+
 async def test_bid_on_missing_auction_rejected(sm):
     _, bidder, aid = await _seed(sm)
     async with sm() as s:

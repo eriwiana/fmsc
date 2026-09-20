@@ -85,10 +85,14 @@ async def get_auction(auction_id: int, db_session: AsyncSession) -> AuctionRespo
 
 # The entire correctness of an absolute auction: one conditional UPDATE. Postgres MVCC
 # serializes concurrent bids, so no two bidders ever both win. Empty result = rejected.
+#
+# clock_timestamp(), not now(): now() is transaction_timestamp(), and the auth dependency
+# has already opened the transaction by the time this runs, so now() reads a clock frozen
+# before the request arrived. Only clock_timestamp() advances inside a transaction.
 _BID_SQL = text("""
     UPDATE auctions
        SET current_bid = :amount, current_winner_id = :uid, bid_count = bid_count + 1
-     WHERE id = :id AND status = 'open' AND ends_at > now()
+     WHERE id = :id AND status = 'open' AND ends_at > clock_timestamp()
        AND :amount >= starting_bid
        AND (current_bid IS NULL OR :amount > current_bid)
     RETURNING bid_count
