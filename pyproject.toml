@@ -37,15 +37,13 @@ source = ["app"]
 # flatters the number without testing anything.
 omit = ["alembic/*", "app/main.py"]
 exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:"]
-# Measured baseline, not an aspiration. The target is 90%; the untested remainder is
-# the auth handlers, the websocket and the closer, which M2 and M3 cover.
+# Measured baseline, not an aspiration. The target is 90%; what is left uncovered is
+# the auth handlers and the websocket, which M3 covers.
 #
-# 65, not 66: repeated runs measure 65.93% or 66.37% from identical code, because one
-# line inside run_closer is intermittently reported as executed although nothing calls
-# it. Cause not identified. The floor is the lower of the two so the gate cannot fail
-# at random; M2 tests the closer, which should settle it.
+# The 65.93/66.37 wobble that forced the previous floor down is gone: it was a line in
+# run_closer, which no test called, and four consecutive runs now measure 72.37%.
 # Ratchet it up as tests land, never down to make a change pass.
-fail_under = 65
+fail_under = 72
 
 [build-system]
 requires = ["setuptools>=61"]

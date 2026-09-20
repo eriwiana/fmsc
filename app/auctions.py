@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import logging
 from datetime import datetime, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -18,6 +18,8 @@ from app.models import Auction, Bid, User
 from app.schemas import AuctionResponse, BidRequest, CreateAuctionRequest
 
 _authed = {"current_user": Provide(provide_current_user)}
+
+logger = logging.getLogger(__name__)
 
 # The app operates in Asia/Jakarta (WIB, UTC+7). Storage stays UTC (timestamptz); this only
 # governs the boundaries — naive input is read as Jakarta wall time, output is rendered in it.
@@ -207,11 +209,57 @@ async def auction_ws(
             await socket.send_text(event.decode() if isinstance(event, bytes) else event)
 
 
+# SKIP LOCKED so a second instance is not stuck behind the first. Without it the closers
+# serialize: the loser blocks on the row lock for the whole of the winner's transaction
+# before finding out it has nothing to do. Correctness never needed it — the conditional
+# UPDATE already re-checks `status` under the lock, so only one closer ever wins the row.
+#
+# clock_timestamp() matches the bid statement. A fresh session per tick means now() reads
+# almost the same instant today, so this is not observable; it is here so that a later
+# change which opens the transaction earlier cannot reintroduce the bug M1 fixed.
+#
+# ponytail: the batch is unbounded. Add `ORDER BY ends_at LIMIT n` to the CTE if a single
+# tick ever closes enough auctions for one transaction to matter.
 _CLOSE_SQL = text("""
-    UPDATE auctions SET status = 'closed'
-     WHERE status = 'open' AND ends_at <= now()
-    RETURNING id, current_winner_id, current_bid
+    WITH due AS (
+        SELECT id FROM auctions
+         WHERE status = 'open' AND ends_at <= clock_timestamp()
+           FOR UPDATE SKIP LOCKED
+    )
+    UPDATE auctions a SET status = 'closed'
+      FROM due
+     WHERE a.id = due.id
+    RETURNING a.id, a.current_winner_id, a.current_bid,
+              clock_timestamp() - a.ends_at AS late_by
     """)
+
+
+async def close_due(
+    session_maker: async_sessionmaker[AsyncSession], channels: ChannelsPlugin
+) -> int:
+    """One closing pass. Returns how many auctions it closed.
+
+    Separate from the loop so a test can run exactly one pass and assert on it.
+    """
+    async with session_maker() as session:
+        rows = (await session.execute(_CLOSE_SQL)).all()
+        await session.commit()
+    for auction_id, winner_id, amount, late_by in rows:
+        # How far past its deadline an auction actually closed. The interval is measured
+        # by Postgres, so it covers the poll interval and any time the tick spent queued.
+        logger.info(
+            "closed auction %s %.3fs after its deadline", auction_id, late_by.total_seconds()
+        )
+        channels.publish(
+            {
+                "type": "closed",
+                "auction_id": auction_id,
+                "winner_id": winner_id,
+                "amount": str(amount) if amount is not None else None,
+            },
+            _channel(auction_id),
+        )
+    return len(rows)
 
 
 async def run_closer(
@@ -224,22 +272,7 @@ async def run_closer(
     """
     while True:
         try:
-            async with session_maker() as session:
-                rows = (await session.execute(_CLOSE_SQL)).all()
-                await session.commit()
-            for auction_id, winner_id, amount in rows:
-                channels.publish(
-                    {
-                        "type": "closed",
-                        "auction_id": auction_id,
-                        "winner_id": winner_id,
-                        "amount": str(amount) if amount is not None else None,
-                    },
-                    _channel(auction_id),
-                )
-        except asyncio.CancelledError:
-            raise
+            await close_due(session_maker, channels)
         except Exception:  # noqa: BLE001 — a transient DB error must not kill the loop
-            pass
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.sleep(interval)
+            logger.exception("closer tick failed")
+        await asyncio.sleep(interval)
