@@ -1,9 +1,9 @@
 [build]
-builder = "nixpacks"
+# DOCKERFILE, not nixpacks: nixpacks resolves from pyproject and ignores uv.lock, which
+# left production on unpinned dependencies. The start command lives in the Dockerfile so
+# there is one place to read it.
+builder = "DOCKERFILE"
 
 [deploy]
-# Single instance: migrate then serve in one command (no migration race). Split this out
-# (separate release step + locking) before scaling to multiple instances.
-startCommand = "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT"
 healthcheckPath = "/health"
 restartPolicyType = "on_failure"
