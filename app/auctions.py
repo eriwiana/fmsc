@@ -214,6 +214,29 @@ _CLOSE_SQL = text("""
     """)
 
 
+async def close_due(
+    session_maker: async_sessionmaker[AsyncSession], channels: ChannelsPlugin
+) -> int:
+    """One closing pass. Returns how many auctions it closed.
+
+    Separate from the loop so a test can run exactly one pass and assert on it.
+    """
+    async with session_maker() as session:
+        rows = (await session.execute(_CLOSE_SQL)).all()
+        await session.commit()
+    for auction_id, winner_id, amount in rows:
+        channels.publish(
+            {
+                "type": "closed",
+                "auction_id": auction_id,
+                "winner_id": winner_id,
+                "amount": str(amount) if amount is not None else None,
+            },
+            _channel(auction_id),
+        )
+    return len(rows)
+
+
 async def run_closer(
     session_maker: async_sessionmaker[AsyncSession], channels: ChannelsPlugin, interval: float = 1.0
 ) -> None:
@@ -224,19 +247,7 @@ async def run_closer(
     """
     while True:
         try:
-            async with session_maker() as session:
-                rows = (await session.execute(_CLOSE_SQL)).all()
-                await session.commit()
-            for auction_id, winner_id, amount in rows:
-                channels.publish(
-                    {
-                        "type": "closed",
-                        "auction_id": auction_id,
-                        "winner_id": winner_id,
-                        "amount": str(amount) if amount is not None else None,
-                    },
-                    _channel(auction_id),
-                )
+            await close_due(session_maker, channels)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — a transient DB error must not kill the loop
