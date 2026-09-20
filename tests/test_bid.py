@@ -132,6 +132,14 @@ async def test_rejected_bid_writes_no_history_row(sm):
     assert await _bid_rows(sm, aid) == 0
 
 
+async def test_seller_cannot_bid_on_their_own_auction(sm):
+    """Shill bidding: the seller bidding up their own item. Nothing else about the
+    auction is wrong, so only the seller guard can reject this."""
+    seller, _, aid = await _seed(sm)
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, seller, Decimal("10.00")) is False
+
+
 async def test_bid_on_closed_auction_rejected(sm):
     """The status guard alone: the deadline is still an hour away."""
     _, bidder, aid = await _seed(sm)
