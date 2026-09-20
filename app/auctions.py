@@ -122,6 +122,31 @@ async def place_bid_tx(
     return row
 
 
+async def reject_reason(
+    session: AsyncSession, auction_id: int, user_id: int, amount: Decimal
+) -> str:
+    """Why the bid statement matched nothing. One extra read, on the reject path only.
+
+    The row it reads is a moment newer than the one the statement saw, so this is a
+    diagnosis and not a proof — the last line covers a row that moved in between. The
+    order mirrors the guards in _BID_SQL so the wording matches what actually failed.
+    """
+    auction = await session.get(Auction, auction_id)
+    if auction is None:
+        return "auction not found"
+    if auction.status != "open":
+        return "auction is closed"
+    if auction.ends_at <= datetime.now(timezone.utc):
+        return "auction has ended"
+    if auction.seller_id == user_id:
+        return "a seller cannot bid on their own auction"
+    if amount < auction.starting_bid:
+        return f"bid must be at least {auction.starting_bid}"
+    if auction.current_bid is not None and amount <= auction.current_bid:
+        return f"bid must be above {auction.current_bid}"
+    return "outbid while the bid was in flight"
+
+
 @post("/auctions/{auction_id:int}/bids", dependencies=_authed)
 async def place_bid(
     auction_id: int,
@@ -134,7 +159,9 @@ async def place_bid(
         raise ClientException("amount must be positive")
     auction = await place_bid_tx(db_session, auction_id, current_user.id, data.amount)
     if auction is None:
-        raise ClientException("bid rejected: too low, or auction closed/ended/not found")
+        raise ClientException(
+            await reject_reason(db_session, auction_id, current_user.id, data.amount)
+        )
     channels.publish(
         {
             "type": "bid",

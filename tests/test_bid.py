@@ -22,7 +22,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from app.auctions import APP_TZ, place_bid_tx, resolve_deadline
+from app.auctions import APP_TZ, place_bid_tx, reject_reason, resolve_deadline
 from app.models import Auction, User
 
 PG_URL = os.environ.get(
@@ -237,3 +237,50 @@ async def test_highest_bid_survives_n_way_concurrency(sm):
     assert auction.current_winner_id == ids[amounts.index(max(amounts))]
     assert auction.bid_count == accepted
     assert await _bid_rows(sm, aid) == accepted
+
+
+async def _reason(sm, aid: int, uid: int, amount: str = "10.00") -> str:
+    async with sm() as s:
+        return await reject_reason(s, aid, uid, Decimal(amount))
+
+
+async def test_reason_names_a_missing_auction(sm):
+    _, bidder, aid = await _seed(sm)
+    assert await _reason(sm, aid + 1000, bidder) == "auction not found"
+
+
+async def test_reason_names_a_closed_auction(sm):
+    _, bidder, aid = await _seed(sm)
+    async with sm() as s:
+        await s.execute(text("UPDATE auctions SET status = 'closed' WHERE id = :id"), {"id": aid})
+        await s.commit()
+    assert await _reason(sm, aid, bidder) == "auction is closed"
+
+
+async def test_reason_names_an_ended_auction(sm):
+    _, bidder, aid = await _seed(sm, ends_delta=timedelta(seconds=-1))
+    assert await _reason(sm, aid, bidder) == "auction has ended"
+
+
+async def test_reason_names_a_self_bid(sm):
+    seller, _, aid = await _seed(sm)
+    assert await _reason(sm, aid, seller) == "a seller cannot bid on their own auction"
+
+
+async def test_reason_names_the_starting_bid(sm):
+    _, bidder, aid = await _seed(sm)
+    assert await _reason(sm, aid, bidder, "9.99") == "bid must be at least 10.00"
+
+
+async def test_reason_names_the_current_bid(sm):
+    _, bidder, aid = await _seed(sm)
+    async with sm() as s:
+        await place_bid_tx(s, aid, bidder, Decimal("15.00"))
+    assert await _reason(sm, aid, bidder, "15.00") == "bid must be above 15.00"
+
+
+async def test_reason_falls_back_when_the_row_moved_in_flight(sm):
+    """Nothing about the auction is wrong by the time the reason is read, which is
+    what a bid losing the race to a concurrent higher bid looks like from here."""
+    _, bidder, aid = await _seed(sm)
+    assert await _reason(sm, aid, bidder) == "outbid while the bid was in flight"
