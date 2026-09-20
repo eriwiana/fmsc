@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -184,3 +185,35 @@ async def test_concurrent_bids_single_winner(sm):
     assert auction.current_bid == Decimal("20.00")
     assert auction.bid_count == 1
     assert await _bid_rows(sm, aid) == 1
+
+
+async def test_highest_bid_survives_n_way_concurrency(sm):
+    """The lost-update case: 50 distinct bidders at 50 distinct amounts, all at once.
+
+    Whatever order Postgres grants the row lock in, the largest amount cannot be
+    overwritten by a smaller one — the guard re-reads current_bid under the lock.
+    """
+    _, _, aid = await _seed(sm)
+    n = 50
+    async with sm() as s:
+        users = [User(email=f"b{i}@x.com", pw_hash="x") for i in range(n)]
+        s.add_all(users)
+        await s.commit()
+        ids = [u.id for u in users]
+    amounts = [Decimal(f"{11 + i}.00") for i in range(n)]
+    order = list(zip(ids, amounts))
+    random.shuffle(order)  # so the race is not always "each bid beats the last"
+
+    async def bid(uid: int, amount: Decimal) -> bool:
+        async with sm() as s:
+            return await place_bid_tx(s, aid, uid, amount)
+
+    results = await asyncio.gather(*(bid(uid, amount) for uid, amount in order))
+    accepted = sum(results)
+
+    async with sm() as s:
+        auction = await s.get(Auction, aid)
+    assert auction.current_bid == max(amounts)
+    assert auction.current_winner_id == ids[amounts.index(max(amounts))]
+    assert auction.bid_count == accepted
+    assert await _bid_rows(sm, aid) == accepted
