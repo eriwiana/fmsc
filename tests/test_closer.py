@@ -139,3 +139,18 @@ async def test_run_closer_survives_a_failing_tick(sm, channels):
     task.cancel()
     await asyncio.sleep(0.02)
     assert calls > 1  # it retried rather than dying on the first failure
+
+
+async def test_close_skips_a_row_another_closer_holds(sm, channels):
+    """Two instances, and one already holds the row. The second must find nothing and
+    move on, not block for the length of the other's transaction."""
+    aid = await _seed(sm)
+    async with sm() as holder:
+        await holder.execute(
+            text("SELECT id FROM auctions WHERE id = :id FOR UPDATE"), {"id": aid}
+        )
+        assert await asyncio.wait_for(close_due(sm, channels), timeout=2) == 0
+        assert channels.published == []
+        await holder.rollback()
+    # and the row is not lost — the next pass takes it
+    assert await close_due(sm, channels) == 1

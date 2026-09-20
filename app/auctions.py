@@ -206,10 +206,27 @@ async def auction_ws(
             await socket.send_text(event.decode() if isinstance(event, bytes) else event)
 
 
+# SKIP LOCKED so a second instance is not stuck behind the first. Without it the closers
+# serialize: the loser blocks on the row lock for the whole of the winner's transaction
+# before finding out it has nothing to do. Correctness never needed it — the conditional
+# UPDATE already re-checks `status` under the lock, so only one closer ever wins the row.
+#
+# clock_timestamp() matches the bid statement. A fresh session per tick means now() reads
+# almost the same instant today, so this is not observable; it is here so that a later
+# change which opens the transaction earlier cannot reintroduce the bug M1 fixed.
+#
+# ponytail: the batch is unbounded. Add `ORDER BY ends_at LIMIT n` to the CTE if a single
+# tick ever closes enough auctions for one transaction to matter.
 _CLOSE_SQL = text("""
-    UPDATE auctions SET status = 'closed'
-     WHERE status = 'open' AND ends_at <= now()
-    RETURNING id, current_winner_id, current_bid
+    WITH due AS (
+        SELECT id FROM auctions
+         WHERE status = 'open' AND ends_at <= clock_timestamp()
+           FOR UPDATE SKIP LOCKED
+    )
+    UPDATE auctions a SET status = 'closed'
+      FROM due
+     WHERE a.id = due.id
+    RETURNING a.id, a.current_winner_id, a.current_bid
     """)
 
 
