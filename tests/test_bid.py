@@ -1,48 +1,20 @@
 """The one critical check: the atomic bid money path (`place_bid_tx`).
 
-Tests the real SQL the handler uses, against a real Postgres, with truly concurrent
-sessions — the HTTP layer is thin glue and is smoke-tested manually (see README).
-
-    docker run -d --name fmsc-pg -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=fmsc \
-        -p 5432:5432 postgres:16-alpine
-    alembic upgrade head
-    DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/fmsc pytest
+Tests the real SQL the handler uses, with truly concurrent sessions — the HTTP layer is
+thin glue and is smoke-tested manually (see README). Fixtures live in conftest.py.
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 import random
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
 
 from app.auctions import APP_TZ, MAX_BID, place_bid_tx, reject_reason, resolve_deadline
 from app.models import Auction, User
-
-PG_URL = os.environ.get(
-    "DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/fmsc"
-)
-if PG_URL.startswith("postgresql://"):
-    PG_URL = PG_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
-
-
-@pytest.fixture
-async def sm():
-    # NullPool: every checkout is a fresh connection on the current loop — no cross-loop reuse,
-    # and concurrent sessions get distinct connections so they genuinely contend in Postgres.
-    engine = create_async_engine(PG_URL, poolclass=NullPool)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
-    async with maker() as s:
-        await s.execute(text("TRUNCATE bids, auctions, sessions, users RESTART IDENTITY CASCADE"))
-        await s.commit()
-    yield maker
-    await engine.dispose()
 
 
 async def _seed(maker, starting="10.00", ends_delta=timedelta(hours=1)) -> tuple[int, int, int]:
