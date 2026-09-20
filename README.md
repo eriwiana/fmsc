@@ -49,8 +49,17 @@ wscat -c "ws://localhost:8000/ws/auctions/1?token=YOUR_TOKEN"
 POST bids from each; both sockets receive every update and the final `closed` event with the winner.
 
 ## Deploy (Railway)
-Add a Postgres plugin (injects `DATABASE_URL`). `railway.toml` runs `alembic upgrade head` then
-uvicorn on deploy. Healthcheck is `/health`.
+Add a Postgres plugin (injects `DATABASE_URL`). Railway builds the `Dockerfile`, which installs
+from `uv.lock` so production runs the versions CI tested. The image migrates then serves;
+healthcheck is `/health`.
+
+Build and run it locally exactly as Railway does:
+
+```bash
+docker build -t fmsc .
+docker run --rm -p 8000:8000 -e PORT=8000 \
+    -e DATABASE_URL=postgresql://postgres:postgres@host.docker.internal:5432/fmsc fmsc
+```
 
 ## Changing the schema
 ```bash

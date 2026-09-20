@@ -1,0 +1,11 @@
+# .venv is built inside the image and is the wrong platform coming from a Mac; the rest
+# is either not needed at runtime or actively harmful to cache keys.
+.venv/
+.git/
+.github/
+.pytest_cache/
+__pycache__/
+*.egg-info/
+.coverage
+.DS_Store
+tests/
