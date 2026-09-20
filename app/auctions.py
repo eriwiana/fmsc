@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from datetime import datetime, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -248,9 +247,6 @@ async def run_closer(
     while True:
         try:
             await close_due(session_maker, channels)
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 — a transient DB error must not kill the loop
             pass
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.sleep(interval)
+        await asyncio.sleep(interval)

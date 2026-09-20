@@ -12,7 +12,7 @@ from decimal import Decimal
 
 from sqlalchemy import text
 
-from app.auctions import close_due, place_bid_tx
+from app.auctions import close_due, place_bid_tx, run_closer
 from app.models import Auction, User
 
 # Its own seeder rather than the bid suite's: these want an auction already past its
@@ -107,3 +107,35 @@ async def test_two_closers_at_once_publish_once(sm, channels, other_channels):
     counts = await asyncio.gather(close_due(sm, channels), close_due(sm, other_channels))
     assert sorted(counts) == [0, 1]
     assert len(channels.published) + len(other_channels.published) == 1
+
+
+async def test_run_closer_stops_when_cancelled(sm, channels):
+    """`_stop_closer` cancels this task on shutdown. Swallowing the CancelledError the
+    sleep raises loses the cancellation for good: the loop keeps ticking, and anything
+    that waits for the task — including `asyncio.wait_for`, which cancels then waits —
+    waits forever. Nothing here awaits the task, so a regression fails instead of hanging.
+    """
+    task = asyncio.create_task(run_closer(sm, channels, interval=0.01))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    assert task.cancelled()
+
+
+async def test_run_closer_survives_a_failing_tick(sm, channels):
+    """A transient database error must not kill the loop: an auction whose deadline
+    passes during an outage still has to close once the database is back."""
+
+    class Broken:
+        calls = 0
+
+        def __call__(self):
+            Broken.calls += 1
+            raise RuntimeError("connection refused")
+
+    task = asyncio.create_task(run_closer(Broken(), channels, interval=0.01))
+    await asyncio.sleep(0.1)
+    calls = Broken.calls
+    task.cancel()
+    await asyncio.sleep(0.02)
+    assert calls > 1  # it retried rather than dying on the first failure
