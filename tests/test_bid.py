@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -21,7 +22,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from app.auctions import APP_TZ, place_bid_tx, resolve_deadline
+from app.auctions import APP_TZ, MAX_BID, place_bid_tx, reject_reason, resolve_deadline
 from app.models import Auction, User
 
 PG_URL = os.environ.get(
@@ -44,20 +45,40 @@ async def sm():
     await engine.dispose()
 
 
-async def _seed(maker, starting="10.00", ends_delta=timedelta(hours=1)) -> tuple[int, int]:
+async def _seed(maker, starting="10.00", ends_delta=timedelta(hours=1)) -> tuple[int, int, int]:
+    """One seller, one bidder, one auction. Seller and bidder are distinct on purpose:
+    an auction whose seller is also its only bidder cannot exercise the real guards."""
     async with maker() as s:
-        user = User(email="x@x.com", pw_hash="x")
-        s.add(user)
+        seller = User(email="seller@x.com", pw_hash="x")
+        bidder = User(email="bidder@x.com", pw_hash="x")
+        s.add_all([seller, bidder])
         await s.flush()
         auction = Auction(
             title="t",
-            seller_id=user.id,
+            seller_id=seller.id,
             starting_bid=Decimal(starting),
             ends_at=datetime.now(timezone.utc) + ends_delta,
         )
         s.add(auction)
         await s.commit()
-        return user.id, auction.id
+        return seller.id, bidder.id, auction.id
+
+
+async def _add_bidder(maker, email: str) -> int:
+    async with maker() as s:
+        user = User(email=email, pw_hash="x")
+        s.add(user)
+        await s.commit()
+        return user.id
+
+
+async def _bid_rows(maker, auction_id: int) -> int:
+    async with maker() as s:
+        return (
+            await s.execute(
+                text("SELECT count(*) FROM bids WHERE auction_id = :id"), {"id": auction_id}
+            )
+        ).scalar()
 
 
 def test_naive_deadline_is_jakarta():
@@ -70,45 +91,225 @@ def test_naive_deadline_is_jakarta():
     assert APP_TZ.key == "Asia/Jakarta"
 
 
-async def test_accept_and_reject(sm):
-    uid, aid = await _seed(sm)
+async def test_opening_bid_may_equal_starting_bid(sm):
+    _, bidder, aid = await _seed(sm)
     async with sm() as s:
-        assert await place_bid_tx(s, aid, uid, Decimal("10.00")) is True  # opening == starting ok
-    async with sm() as s:
-        assert await place_bid_tx(s, aid, uid, Decimal("9.99")) is False  # lower
-    async with sm() as s:
-        assert await place_bid_tx(s, aid, uid, Decimal("10.00")) is False  # equal must lose
-    async with sm() as s:
-        assert await place_bid_tx(s, aid, uid, Decimal("11.00")) is True  # strictly higher
+        assert await place_bid_tx(s, aid, bidder, Decimal("10.00")) is not None
 
+
+async def test_bid_below_starting_bid_rejected(sm):
+    _, bidder, aid = await _seed(sm)
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("9.99")) is None
+
+
+async def test_bid_equal_to_current_bid_rejected(sm):
+    _, bidder, aid = await _seed(sm)
+    async with sm() as s:
+        await place_bid_tx(s, aid, bidder, Decimal("10.00"))
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("10.00")) is None
+
+
+async def test_higher_bid_replaces_the_leader(sm):
+    _, bidder, aid = await _seed(sm)
+    other = await _add_bidder(sm, "other@x.com")
+    async with sm() as s:
+        await place_bid_tx(s, aid, bidder, Decimal("10.00"))
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, other, Decimal("11.00")) is not None
     async with sm() as s:
         auction = await s.get(Auction, aid)
-        assert auction.current_bid == Decimal("11.00")
-        assert auction.bid_count == 2
+    assert auction.current_bid == Decimal("11.00")
+    assert auction.current_winner_id == other
+    assert auction.bid_count == 2
+
+
+async def test_accepted_bid_returns_the_row_it_wrote(sm):
+    """The caller is told the state its own bid produced, not whatever the row holds
+    by the time a second query gets to it."""
+    _, bidder, aid = await _seed(sm)
+    async with sm() as s:
+        row = await place_bid_tx(s, aid, bidder, Decimal("12.50"))
+    assert row.id == aid
+    assert row.current_bid == Decimal("12.50")
+    assert row.current_winner_id == bidder
+    assert row.bid_count == 1
+
+
+async def test_rejected_bid_writes_no_history_row(sm):
+    _, bidder, aid = await _seed(sm)
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("9.99")) is None
+    assert await _bid_rows(sm, aid) == 0
+
+
+async def test_seller_cannot_bid_on_their_own_auction(sm):
+    """Shill bidding: the seller bidding up their own item. Nothing else about the
+    auction is wrong, so only the seller guard can reject this."""
+    seller, _, aid = await _seed(sm)
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, seller, Decimal("10.00")) is None
+
+
+async def test_bid_on_closed_auction_rejected(sm):
+    """The status guard alone: the deadline is still an hour away."""
+    _, bidder, aid = await _seed(sm)
+    async with sm() as s:
+        await s.execute(text("UPDATE auctions SET status = 'closed' WHERE id = :id"), {"id": aid})
+        await s.commit()
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("10.00")) is None
 
 
 async def test_bid_on_ended_auction_rejected(sm):
-    uid, aid = await _seed(sm, ends_delta=timedelta(seconds=-1))  # already past deadline
+    _, bidder, aid = await _seed(sm, ends_delta=timedelta(seconds=-1))  # already past deadline
     async with sm() as s:
-        assert await place_bid_tx(s, aid, uid, Decimal("10.00")) is False
+        assert await place_bid_tx(s, aid, bidder, Decimal("10.00")) is None
+
+
+async def test_late_bid_rejected_despite_stale_transaction_clock(sm):
+    """Postgres `now()` is transaction_timestamp(), not wall time.
+
+    On the real HTTP path the auth dependency queries the session table first, so the
+    transaction is already open — and its clock already frozen — before the bid statement
+    runs. A bid that arrives after the deadline must still lose.
+    """
+    _, bidder, aid = await _seed(sm, ends_delta=timedelta(milliseconds=300))
+    async with sm() as s:
+        await s.execute(text("SELECT 1"))  # opens the transaction, freezing now()
+        await asyncio.sleep(0.6)  # the deadline passes on the wall clock
+        assert await place_bid_tx(s, aid, bidder, Decimal("10.00")) is None
+
+
+async def test_bid_on_missing_auction_rejected(sm):
+    _, bidder, aid = await _seed(sm)
+    async with sm() as s:
+        assert await place_bid_tx(s, aid + 1000, bidder, Decimal("10.00")) is None
 
 
 async def test_concurrent_bids_single_winner(sm):
-    uid, aid = await _seed(sm)
+    _, bidder, aid = await _seed(sm)
+    other = await _add_bidder(sm, "other@x.com")
 
-    async def bid() -> bool:
+    async def bid(uid: int):
         async with sm() as s:
             return await place_bid_tx(s, aid, uid, Decimal("20.00"))
 
-    r1, r2 = await asyncio.gather(bid(), bid())
+    r1, r2 = await asyncio.gather(bid(bidder), bid(other))
     # equal amounts → exactly one wins, the other can't strictly beat it
-    assert sorted([r1, r2]) == [False, True]
+    assert [r1, r2].count(None) == 1
 
     async with sm() as s:
         auction = await s.get(Auction, aid)
-        bid_rows = (
-            await s.execute(text("SELECT count(*) FROM bids WHERE auction_id = :id"), {"id": aid})
-        ).scalar()
     assert auction.current_bid == Decimal("20.00")
     assert auction.bid_count == 1
-    assert bid_rows == 1
+    assert await _bid_rows(sm, aid) == 1
+
+
+async def test_highest_bid_survives_n_way_concurrency(sm):
+    """The lost-update case: 50 distinct bidders at 50 distinct amounts, all at once.
+
+    Whatever order Postgres grants the row lock in, the largest amount cannot be
+    overwritten by a smaller one — the guard re-reads current_bid under the lock.
+    """
+    _, _, aid = await _seed(sm)
+    n = 50
+    async with sm() as s:
+        users = [User(email=f"b{i}@x.com", pw_hash="x") for i in range(n)]
+        s.add_all(users)
+        await s.commit()
+        ids = [u.id for u in users]
+    amounts = [Decimal(f"{11 + i}.00") for i in range(n)]
+    order = list(zip(ids, amounts))
+    random.shuffle(order)  # so the race is not always "each bid beats the last"
+
+    async def bid(uid: int, amount: Decimal):
+        async with sm() as s:
+            return await place_bid_tx(s, aid, uid, amount)
+
+    results = await asyncio.gather(*(bid(uid, amount) for uid, amount in order))
+    accepted = sum(r is not None for r in results)
+
+    async with sm() as s:
+        auction = await s.get(Auction, aid)
+    assert auction.current_bid == max(amounts)
+    assert auction.current_winner_id == ids[amounts.index(max(amounts))]
+    assert auction.bid_count == accepted
+    assert await _bid_rows(sm, aid) == accepted
+
+
+async def _reason(sm, aid: int, uid: int, amount: str = "10.00") -> str:
+    async with sm() as s:
+        return await reject_reason(s, aid, uid, Decimal(amount))
+
+
+async def test_reason_names_a_missing_auction(sm):
+    _, bidder, aid = await _seed(sm)
+    assert await _reason(sm, aid + 1000, bidder) == "auction not found"
+
+
+async def test_reason_names_a_closed_auction(sm):
+    _, bidder, aid = await _seed(sm)
+    async with sm() as s:
+        await s.execute(text("UPDATE auctions SET status = 'closed' WHERE id = :id"), {"id": aid})
+        await s.commit()
+    assert await _reason(sm, aid, bidder) == "auction is closed"
+
+
+async def test_reason_names_an_ended_auction(sm):
+    _, bidder, aid = await _seed(sm, ends_delta=timedelta(seconds=-1))
+    assert await _reason(sm, aid, bidder) == "auction has ended"
+
+
+async def test_reason_names_a_self_bid(sm):
+    seller, _, aid = await _seed(sm)
+    assert await _reason(sm, aid, seller) == "a seller cannot bid on their own auction"
+
+
+async def test_reason_names_the_starting_bid(sm):
+    _, bidder, aid = await _seed(sm)
+    assert await _reason(sm, aid, bidder, "9.99") == "bid must be at least 10.00"
+
+
+async def test_reason_names_the_current_bid(sm):
+    _, bidder, aid = await _seed(sm)
+    async with sm() as s:
+        await place_bid_tx(s, aid, bidder, Decimal("15.00"))
+    assert await _reason(sm, aid, bidder, "15.00") == "bid must be above 15.00"
+
+
+async def test_reason_falls_back_when_the_row_moved_in_flight(sm):
+    """Nothing about the auction is wrong by the time the reason is read, which is
+    what a bid losing the race to a concurrent higher bid looks like from here."""
+    _, bidder, aid = await _seed(sm)
+    assert await _reason(sm, aid, bidder) == "outbid while the bid was in flight"
+
+
+async def test_amount_beyond_the_column_range_rejected(sm):
+    """Numeric(12,2) overflows in Postgres; the bid must not reach the statement."""
+    _, bidder, aid = await _seed(sm)
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, MAX_BID + 1) is None
+
+
+async def test_amount_below_one_cent_precision_rejected(sm):
+    """Postgres rounds a third decimal place, so 10.005 would be stored as 10.01 and
+    outbid a 10.00 leader by half a cent it never offered."""
+    _, bidder, aid = await _seed(sm)
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("10.005")) is None
+
+
+async def test_non_positive_amount_rejected(sm):
+    _, bidder, aid = await _seed(sm)
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("0")) is None
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("-1.00")) is None
+
+
+async def test_reason_names_an_out_of_range_amount(sm):
+    _, bidder, aid = await _seed(sm)
+    reason = await _reason(sm, aid, bidder, "10000000000.00")
+    assert reason == "amount must be between 0.01 and 9999999999.99, to at most 2 decimal places"

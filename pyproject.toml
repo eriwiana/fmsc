@@ -37,11 +37,15 @@ source = ["app"]
 # flatters the number without testing anything.
 omit = ["alembic/*", "app/main.py"]
 exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:"]
-# Measured baseline on the day CI landed, not an aspiration. The target is 90%;
-# M1 adds the missing money-path and closer tests and raises this with them.
-# (62, not 63: the measured figure is 62.93% and fail_under does not round up.)
+# Measured baseline, not an aspiration. The target is 90%; the untested remainder is
+# the auth handlers, the websocket and the closer, which M2 and M3 cover.
+#
+# 65, not 66: repeated runs measure 65.93% or 66.37% from identical code, because one
+# line inside run_closer is intermittently reported as executed although nothing calls
+# it. Cause not identified. The floor is the lower of the two so the gate cannot fail
+# at random; M2 tests the closer, which should settle it.
 # Ratchet it up as tests land, never down to make a change pass.
-fail_under = 62
+fail_under = 65
 
 [build-system]
 requires = ["setuptools>=61"]
