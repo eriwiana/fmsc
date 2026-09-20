@@ -78,3 +78,25 @@ jobs:
       - name: Tests
         # The floor lives in pyproject, so a local run gates identically.
         run: uv run pytest --cov --cov-report=term-missing
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Production is built from this file, so a broken one fails here and not at
+      # deploy time. `uv sync --locked` inside it fails the build if uv.lock has
+      # drifted from pyproject.toml, which is what keeps production on the lock.
+      - name: Build the production image
+        run: docker build -t fmsc:ci .
+
+      - name: Image interpreter matches .python-version
+        # The base image tag states the version a second time. This is what stops the
+        # two drifting apart.
+        run: |
+          want=$(cat .python-version)
+          got=$(docker run --rm fmsc:ci python -V | cut -d' ' -f2)
+          case "$got" in
+            "$want".*) echo "image runs $got, .python-version says $want" ;;
+            *) echo "::error::image runs $got but .python-version says $want"; exit 1 ;;
+          esac
