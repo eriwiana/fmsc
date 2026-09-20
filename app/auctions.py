@@ -46,6 +46,20 @@ def _to_response(a: Auction | Row) -> AuctionResponse:
     )
 
 
+# The Money column is Numeric(12,2). Postgres raises NumericValueOutOfRange above this,
+# which asyncpg surfaces as a 500, and it silently rounds a third decimal place — 10.005
+# becomes 10.01, so a bidder outbids by half a cent and is charged a whole one.
+MAX_BID = Decimal("9999999999.99")
+
+
+def _is_valid_amount(amount: Decimal) -> bool:
+    """is_finite() first: ordering a Decimal NaN raises InvalidOperation rather than
+    answering False the way a float does."""
+    return (
+        amount.is_finite() and Decimal(0) < amount <= MAX_BID and amount.as_tuple().exponent >= -2
+    )
+
+
 def _channel(auction_id: int) -> str:
     return f"auction:{auction_id}"
 
@@ -110,6 +124,9 @@ async def place_bid_tx(
 
     This is the whole money path — the handler and the tests both go through here.
     """
+    if not _is_valid_amount(amount):
+        await session.rollback()
+        return None
     row = (
         await session.execute(_BID_SQL, {"amount": amount, "uid": user_id, "id": auction_id})
     ).first()
@@ -131,6 +148,8 @@ async def reject_reason(
     diagnosis and not a proof — the last line covers a row that moved in between. The
     order mirrors the guards in _BID_SQL so the wording matches what actually failed.
     """
+    if not _is_valid_amount(amount):
+        return f"amount must be between 0.01 and {MAX_BID}, to at most 2 decimal places"
     auction = await session.get(Auction, auction_id)
     if auction is None:
         return "auction not found"
@@ -155,8 +174,6 @@ async def place_bid(
     db_session: AsyncSession,
     channels: ChannelsPlugin,
 ) -> AuctionResponse:
-    if data.amount <= 0:
-        raise ClientException("amount must be positive")
     auction = await place_bid_tx(db_session, auction_id, current_user.id, data.amount)
     if auction is None:
         raise ClientException(

@@ -22,7 +22,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from app.auctions import APP_TZ, place_bid_tx, reject_reason, resolve_deadline
+from app.auctions import APP_TZ, MAX_BID, place_bid_tx, reject_reason, resolve_deadline
 from app.models import Auction, User
 
 PG_URL = os.environ.get(
@@ -284,3 +284,32 @@ async def test_reason_falls_back_when_the_row_moved_in_flight(sm):
     what a bid losing the race to a concurrent higher bid looks like from here."""
     _, bidder, aid = await _seed(sm)
     assert await _reason(sm, aid, bidder) == "outbid while the bid was in flight"
+
+
+async def test_amount_beyond_the_column_range_rejected(sm):
+    """Numeric(12,2) overflows in Postgres; the bid must not reach the statement."""
+    _, bidder, aid = await _seed(sm)
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, MAX_BID + 1) is None
+
+
+async def test_amount_below_one_cent_precision_rejected(sm):
+    """Postgres rounds a third decimal place, so 10.005 would be stored as 10.01 and
+    outbid a 10.00 leader by half a cent it never offered."""
+    _, bidder, aid = await _seed(sm)
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("10.005")) is None
+
+
+async def test_non_positive_amount_rejected(sm):
+    _, bidder, aid = await _seed(sm)
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("0")) is None
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("-1.00")) is None
+
+
+async def test_reason_names_an_out_of_range_amount(sm):
+    _, bidder, aid = await _seed(sm)
+    reason = await _reason(sm, aid, bidder, "10000000000.00")
+    assert reason == "amount must be between 0.01 and 9999999999.99, to at most 2 decimal places"
