@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -17,6 +18,8 @@ from app.models import Auction, Bid, User
 from app.schemas import AuctionResponse, BidRequest, CreateAuctionRequest
 
 _authed = {"current_user": Provide(provide_current_user)}
+
+logger = logging.getLogger(__name__)
 
 # The app operates in Asia/Jakarta (WIB, UTC+7). Storage stays UTC (timestamptz); this only
 # governs the boundaries — naive input is read as Jakarta wall time, output is rendered in it.
@@ -226,7 +229,8 @@ _CLOSE_SQL = text("""
     UPDATE auctions a SET status = 'closed'
       FROM due
      WHERE a.id = due.id
-    RETURNING a.id, a.current_winner_id, a.current_bid
+    RETURNING a.id, a.current_winner_id, a.current_bid,
+              clock_timestamp() - a.ends_at AS late_by
     """)
 
 
@@ -240,7 +244,12 @@ async def close_due(
     async with session_maker() as session:
         rows = (await session.execute(_CLOSE_SQL)).all()
         await session.commit()
-    for auction_id, winner_id, amount in rows:
+    for auction_id, winner_id, amount, late_by in rows:
+        # How far past its deadline an auction actually closed. The interval is measured
+        # by Postgres, so it covers the poll interval and any time the tick spent queued.
+        logger.info(
+            "closed auction %s %.3fs after its deadline", auction_id, late_by.total_seconds()
+        )
         channels.publish(
             {
                 "type": "closed",
@@ -265,5 +274,5 @@ async def run_closer(
         try:
             await close_due(session_maker, channels)
         except Exception:  # noqa: BLE001 — a transient DB error must not kill the loop
-            pass
+            logger.exception("closer tick failed")
         await asyncio.sleep(interval)

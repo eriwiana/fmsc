@@ -7,6 +7,7 @@ exactly once. These run one pass at a time via `close_due` rather than driving t
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -77,7 +78,10 @@ async def test_publishes_the_winner_on_the_auction_channel(sm, channels):
     aid, uid = await _seed_with_winner(sm)
     await close_due(sm, channels)
     assert channels.published == [
-        (f"auction:{aid}", {"type": "closed", "auction_id": aid, "winner_id": uid, "amount": "25.00"})
+        (
+            f"auction:{aid}",
+            {"type": "closed", "auction_id": aid, "winner_id": uid, "amount": "25.00"},
+        )
     ]
 
 
@@ -146,11 +150,37 @@ async def test_close_skips_a_row_another_closer_holds(sm, channels):
     move on, not block for the length of the other's transaction."""
     aid = await _seed(sm)
     async with sm() as holder:
-        await holder.execute(
-            text("SELECT id FROM auctions WHERE id = :id FOR UPDATE"), {"id": aid}
-        )
+        await holder.execute(text("SELECT id FROM auctions WHERE id = :id FOR UPDATE"), {"id": aid})
         assert await asyncio.wait_for(close_due(sm, channels), timeout=2) == 0
         assert channels.published == []
         await holder.rollback()
     # and the row is not lost — the next pass takes it
     assert await close_due(sm, channels) == 1
+
+
+async def test_logs_how_late_each_close_was(sm, channels, caplog):
+    """The closer polls, so an auction always closes some time after its deadline. How
+    far after is the number that says whether the poll interval is good enough."""
+    await _seed(sm, ends_delta=timedelta(seconds=-5))
+    with caplog.at_level(logging.INFO, logger="app.auctions"):
+        await close_due(sm, channels)
+    record = next(r for r in caplog.records if r.msg.startswith("closed auction"))
+    _, late = record.args
+    assert 5 <= late < 15  # it ended 5s ago; anything near zero means it is not measured
+
+
+async def test_a_failing_tick_says_why(sm, channels, caplog):
+    """The loop swallowed every exception silently, so an outage looked identical to
+    having nothing to close."""
+
+    class Broken:
+        def __call__(self):
+            raise RuntimeError("connection refused")
+
+    with caplog.at_level(logging.ERROR, logger="app.auctions"):
+        task = asyncio.create_task(run_closer(Broken(), channels, interval=0.01))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.sleep(0.02)
+    assert "closer tick failed" in caplog.text
+    assert "connection refused" in caplog.text
