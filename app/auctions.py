@@ -10,7 +10,7 @@ from litestar import WebSocket, get, post, websocket
 from litestar.channels import ChannelsPlugin
 from litestar.di import Provide
 from litestar.exceptions import ClientException, NotAuthorizedException, NotFoundException
-from sqlalchemy import select, text
+from sqlalchemy import Row, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.auth import provide_current_user, user_for_token
@@ -29,7 +29,9 @@ def resolve_deadline(dt: datetime) -> datetime:
     return dt.replace(tzinfo=APP_TZ) if dt.tzinfo is None else dt
 
 
-def _to_response(a: Auction) -> AuctionResponse:
+def _to_response(a: Auction | Row) -> AuctionResponse:
+    """Works off either the ORM object or a raw RETURNING row — both expose the columns
+    by name, and the bid path has only the row."""
     return AuctionResponse(
         id=a.id,
         title=a.title,
@@ -96,14 +98,15 @@ _BID_SQL = text("""
        AND seller_id <> :uid
        AND :amount >= starting_bid
        AND (current_bid IS NULL OR :amount > current_bid)
-    RETURNING bid_count
+    RETURNING *
     """)
 
 
 async def place_bid_tx(
     session: AsyncSession, auction_id: int, user_id: int, amount: Decimal
-) -> bool:
-    """Atomic bid. Returns True if accepted, False if rejected. Commits/rolls back `session`.
+) -> Row | None:
+    """Atomic bid. Returns the auction row this bid wrote, or None if rejected.
+    Commits/rolls back `session`.
 
     This is the whole money path — the handler and the tests both go through here.
     """
@@ -112,11 +115,11 @@ async def place_bid_tx(
     ).first()
     if row is None:
         await session.rollback()
-        return False
+        return None
     # history row, same transaction as the accepted bid
     session.add(Bid(auction_id=auction_id, user_id=user_id, amount=amount))
     await session.commit()
-    return True
+    return row
 
 
 @post("/auctions/{auction_id:int}/bids", dependencies=_authed)
@@ -129,9 +132,9 @@ async def place_bid(
 ) -> AuctionResponse:
     if data.amount <= 0:
         raise ClientException("amount must be positive")
-    if not await place_bid_tx(db_session, auction_id, current_user.id, data.amount):
+    auction = await place_bid_tx(db_session, auction_id, current_user.id, data.amount)
+    if auction is None:
         raise ClientException("bid rejected: too low, or auction closed/ended/not found")
-    auction = await db_session.get(Auction, auction_id)
     channels.publish(
         {
             "type": "bid",
