@@ -289,11 +289,7 @@ async def close_due(
 async def run_closer(
     session_maker: async_sessionmaker[AsyncSession], channels: ChannelsPlugin, interval: float = 1.0
 ) -> None:
-    """Hard-deadline closer. Flips expired auctions to 'closed' and announces the winner.
-
-    ponytail: in-process loop assumes a single instance; for multi-instance switch the
-    UPDATE to `... FOR UPDATE SKIP LOCKED` semantics or a leader-elected ticker.
-    """
+    """Hard-deadline closer. Flips expired auctions to 'closed' and announces the winner."""
     while True:
         try:
             await close_due(session_maker, channels)
