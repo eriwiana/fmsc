@@ -6,11 +6,19 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
-from litestar import WebSocket, get, post, websocket
+import msgspec
+from litestar import Request, WebSocket, get, post, websocket
 from litestar.channels import ChannelsPlugin
 from litestar.di import Provide
-from litestar.exceptions import ClientException, NotAuthorizedException, NotFoundException
+from litestar.exceptions import (
+    ClientException,
+    HTTPException,
+    NotAuthorizedException,
+    NotFoundException,
+)
+from litestar.status_codes import HTTP_409_CONFLICT
 from sqlalchemy import Row, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.auth import provide_current_user, user_for_token
@@ -144,8 +152,34 @@ _BID_SQL = text("""
     """)
 
 
+# IETF draft-ietf-httpapi-idempotency-key-header spells it this way, and caps the key at
+# the width of the column that stores it.
+IDEMPOTENCY_HEADER = "Idempotency-Key"
+MAX_IDEMPOTENCY_KEY = 128
+_IDEMPOTENCY_CONSTRAINT = "uq_bids_auction_user_idempotency_key"
+
+
+async def first_attempt(
+    session: AsyncSession, auction_id: int, user_id: int, key: str
+) -> Row | None:
+    """The bid this key already placed: the amount it asked for and the body it returned."""
+    return (
+        await session.execute(
+            select(Bid.amount, Bid.response).where(
+                Bid.auction_id == auction_id,
+                Bid.user_id == user_id,
+                Bid.idempotency_key == key,
+            )
+        )
+    ).first()
+
+
 async def place_bid_tx(
-    session: AsyncSession, auction_id: int, user_id: int, amount: Decimal
+    session: AsyncSession,
+    auction_id: int,
+    user_id: int,
+    amount: Decimal,
+    idempotency_key: str | None = None,
 ) -> Row | None:
     """Atomic bid. Returns the auction row this bid wrote, or None if rejected.
     Commits/rolls back `session`.
@@ -165,8 +199,26 @@ async def place_bid_tx(
         await session.rollback()
         return None
     # history row, same transaction as the accepted bid
-    session.add(Bid(auction_id=auction_id, user_id=user_id, amount=amount))
-    await session.commit()
+    bid = Bid(auction_id=auction_id, user_id=user_id, amount=amount)
+    if idempotency_key is not None:
+        # The key and the response it is replaying are written with the money, not after
+        # it. A crash between the two would leave a bid whose retry places a second one.
+        bid.idempotency_key = idempotency_key
+        bid.response = msgspec.json.encode(_to_response(row)).decode()
+    session.add(bid)
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        # A request with this key got there first; reported as a refusal so the caller
+        # keeps one path. The constraint name is read off asyncpg's own exception, which
+        # sits on __cause__ behind SQLAlchemy's wrapper — not matched in the message text,
+        # which a reworded driver error would silently turn into a 500.
+        if getattr(exc.orig.__cause__, "constraint_name", None) == _IDEMPOTENCY_CONSTRAINT:
+            return None
+        # Unreached today; every other constraint on bids is enforced before the insert.
+        # Kept so the next one added is not swallowed and reported as a refusal.
+        raise
     return row
 
 
@@ -201,6 +253,7 @@ async def reject_reason(
 async def place_bid(
     auction_id: int,
     data: BidRequest,
+    request: Request,
     current_user: User,
     db_session: AsyncSession,
     channels: ChannelsPlugin,
@@ -210,8 +263,39 @@ async def place_bid(
     # current_user afterwards attempts a lazy reload, which raises MissingGreenlet inside an
     # async session and turns every rejected bid into a 500 with no reason in it.
     user_id = current_user.id
-    auction = await place_bid_tx(db_session, auction_id, user_id, data.amount)
+    # `or None`: a bare `Idempotency-Key:` is a client sending the header by accident, not
+    # one asking to be deduplicated under the key "". Length is checked because the column
+    # is 128 wide and Postgres answers an over-long value with a DataError, which is not an
+    # IntegrityError and would reach the client as a 500.
+    key = request.headers.get(IDEMPOTENCY_HEADER) or None
+    if key is not None and len(key) > MAX_IDEMPOTENCY_KEY:
+        raise ClientException(
+            f"{IDEMPOTENCY_HEADER} must be at most {MAX_IDEMPOTENCY_KEY} characters"
+        )
+    auction = await place_bid_tx(db_session, auction_id, user_id, data.amount, key)
     if auction is None:
+        # Every duplicate arrives here, which is why there is no "have I seen this key"
+        # test before the bid. A retry carrying the same amount can never be accepted
+        # twice: after the first one, current_bid equals that amount, so
+        # `:amount > current_bid` refuses it. A retry whose amount was edited upward clears
+        # that guard instead and is refused by the unique key.
+        if key is not None:
+            first = await first_attempt(db_session, auction_id, user_id, key)
+            if first is not None:
+                # Same key, different body: no second bid was placed either way, so this
+                # is only about whether the client finds out. Replaying silently would let
+                # it believe it placed a bid it never placed.
+                #
+                # ponytail: the request body is one field, so the stored amount is the
+                # whole fingerprint. Hash the body if BidRequest ever grows.
+                if first.amount != data.amount:
+                    raise HTTPException(
+                        status_code=HTTP_409_CONFLICT,
+                        detail=f"{IDEMPOTENCY_HEADER} was already used with a different amount",
+                    )
+                # Decoded back into the struct so the reply goes through the same encoder
+                # litestar used the first time and the two bodies are identical.
+                return msgspec.json.decode(first.response, type=AuctionResponse)
         raise ClientException(await reject_reason(db_session, auction_id, user_id, data.amount))
     response = _to_response(auction)
     channels.publish(

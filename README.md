@@ -21,7 +21,8 @@ Jakarta wall time, responses render `+07:00`. Process runs with `TZ=Asia/Jakarta
 - `GET /auctions`, `GET /auctions/{id}`
 - `POST /auctions/{id}/bids` (auth) — `{amount}`; atomic, highest-wins, extends the
   deadline when it lands inside the anti-snipe window. A refused bid answers **400** with
-  the guard that refused it in `detail` (too low, outbid, closed, ended, self-bid)
+  the guard that refused it in `detail` (too low, outbid, closed, ended, self-bid).
+  Send `Idempotency-Key: <string>` to make a retry safe
 - `GET /ws/auctions/{id}?token=...` — live bid + close events
 - `GET /health`, `GET /schema` (OpenAPI/Swagger UI)
 
@@ -36,6 +37,14 @@ auction cannot be extended forever. Both are global constants, not per-auction s
 Every `bid` and `closed` event on the WebSocket carries the current `ends_at`, so a
 watcher's countdown follows the extension instead of expiring on a deadline that has
 already moved.
+
+## Idempotency
+A bid sent with an `Idempotency-Key` header (at most 128 characters) stores the response it
+returned. A retry on the same key replays that response and places no second bid, so a
+client that times out and resends is not told it has outbid itself. Reusing the key with a
+**different amount** answers **409** rather than replaying, so a client with a key-reuse bug
+finds out instead of believing a bid it never placed. A refused bid consumes nothing: the key
+is free to reuse.
 
 ## Guardrails
 The invariants the bid path assumes are enforced by the schema, not only by Python —

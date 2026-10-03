@@ -10,13 +10,16 @@ import asyncio
 import random
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
-from litestar.exceptions import ClientException
+from litestar.exceptions import ClientException, HTTPException
 from sqlalchemy import event, text
+from sqlalchemy.exc import IntegrityError
 
 from app.auctions import (
     APP_TZ,
+    IDEMPOTENCY_HEADER,
     MAX_BID,
     MAX_EXTENSION,
     _to_response,
@@ -276,15 +279,7 @@ async def test_bid_event_tells_watchers_the_new_deadline(sm, channels):
     extension exists to prevent."""
     _, bidder, aid = await _seed(sm, ends_delta=timedelta(seconds=30))
     before = await _deadline(sm, aid)
-    async with sm() as s:
-        user = await s.get(User, bidder)
-        response = await place_bid.fn(
-            auction_id=aid,
-            data=BidRequest(amount=Decimal("10.00")),
-            current_user=user,
-            db_session=s,
-            channels=channels,
-        )
+    response = await _post_bid(sm, aid, bidder, "10.00", None, channels)
 
     ((channel, event),) = channels.published
     assert channel == f"auction:{aid}"
@@ -294,6 +289,144 @@ async def test_bid_event_tells_watchers_the_new_deadline(sm, channels):
     assert datetime.fromisoformat(event["ends_at"]) > before
 
 
+async def _post_bid(sm, aid: int, uid: int, amount: str, key: str | None, channels):
+    async with sm() as s:
+        return await place_bid.fn(
+            auction_id=aid,
+            data=BidRequest(amount=Decimal(amount)),
+            # Only `headers` is read by the handler; litestar's Request is not needed.
+            request=SimpleNamespace(headers={} if key is None else {IDEMPOTENCY_HEADER: key}),
+            current_user=await s.get(User, uid),
+            db_session=s,
+            channels=channels,
+        )
+
+
+async def test_a_retry_replays_rather_than_being_told_it_was_outbid(sm, channels):
+    """M4 criterion 1 at the handler, sequentially — what a client does after a timeout.
+
+    No race: the first bid is committed before the retry starts, so the retry's UPDATE is
+    refused by `:amount > current_bid` and the replay is the only thing that can answer it.
+    """
+    _, bidder, aid = await _seed(sm)
+
+    first = await _post_bid(sm, aid, bidder, "10.00", "retry", channels)
+    second = await _post_bid(sm, aid, bidder, "10.00", "retry", channels)
+
+    assert second == first
+    assert await _bid_rows(sm, aid) == 1
+    assert len(channels.published) == 1
+
+
+async def test_two_requests_with_one_key_place_one_bid(sm, channels):
+    """M4 criterion 2. Two retries arriving together — a client that resent before the
+    first reply landed. The unique constraint decides; an application-level "have I seen
+    this key" check would let both through."""
+    _, bidder, aid = await _seed(sm)
+
+    first, second = await asyncio.gather(
+        _post_bid(sm, aid, bidder, "12.00", "same-key", channels),
+        _post_bid(sm, aid, bidder, "12.00", "same-key", channels),
+    )
+
+    assert first == second
+    assert await _bid_rows(sm, aid) == 1
+    # The replay must not publish again, or every watcher counts the bid twice.
+    assert len(channels.published) == 1
+
+
+async def test_an_over_long_key_is_refused_not_a_500(sm, channels):
+    """The key is client input at a trust boundary. Longer than the column and Postgres
+    raises StringDataRightTruncation, which is a DataError and not an IntegrityError, so
+    nothing downstream catches it and the bidder gets a 500."""
+    _, bidder, aid = await _seed(sm)
+    with pytest.raises(ClientException) as refused:
+        await _post_bid(sm, aid, bidder, "10.00", "k" * 129, channels)
+    assert "128" in refused.value.detail
+    assert await _bid_rows(sm, aid) == 0
+
+
+async def test_an_empty_key_counts_as_no_key(sm, channels):
+    """`Idempotency-Key:` with nothing after it is a client sending the header by accident,
+    not a client asking for deduplication under the key "". Treating it as a real key makes
+    the next such bid replay instead of bidding."""
+    _, bidder, aid = await _seed(sm)
+
+    await _post_bid(sm, aid, bidder, "10.00", "", channels)
+    second = await _post_bid(sm, aid, bidder, "11.00", "", channels)
+
+    assert second.bid_count == 2
+    assert await _bid_rows(sm, aid) == 2
+
+
+async def test_a_key_is_not_consumed_by_a_rejected_bid(sm, channels):
+    """M4 criterion 3. The key and the response are written in the bid's own transaction,
+    so a refusal rolls both back and the client may reuse the key for a real bid."""
+    _, bidder, aid = await _seed(sm)
+
+    with pytest.raises(ClientException):
+        await _post_bid(sm, aid, bidder, "9.99", "reused", channels)
+
+    accepted = await _post_bid(sm, aid, bidder, "10.00", "reused", channels)
+    assert accepted.current_bid == Decimal("10.00")
+    assert await _bid_rows(sm, aid) == 1
+
+
+async def test_a_different_key_places_a_second_bid(sm, channels):
+    """M4 criterion 4. Idempotency must not collapse two genuine bids from one bidder."""
+    _, bidder, aid = await _seed(sm)
+
+    await _post_bid(sm, aid, bidder, "10.00", "first-key", channels)
+    second = await _post_bid(sm, aid, bidder, "11.00", "second-key", channels)
+
+    assert second.bid_count == 2
+    assert await _bid_rows(sm, aid) == 2
+
+
+async def test_the_unique_key_alone_stops_a_second_bid(sm):
+    """Straight at place_bid_tx, past the handler's replay check: the constraint is what
+    actually prevents the duplicate, and nothing above it should be trusted to. A second
+    bid on the same key is reported as a refusal so the caller replays the first answer."""
+    _, bidder, aid = await _seed(sm)
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("10.00"), "dup") is not None
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("11.00"), "dup") is None
+    assert await _bid_rows(sm, aid) == 1
+
+
+async def test_an_unrelated_integrity_failure_is_not_reported_as_a_refusal(sm):
+    """A bid for a user that does not exist must raise, not come back as a refusal.
+
+    This one fails on the UPDATE's own foreign key, before the commit, so it does not
+    reach the re-raise inside place_bid_tx — see the comment there. What it does pin is
+    that no integrity failure on the money path is quietly turned into "refused".
+    """
+    _, _, aid = await _seed(sm)
+    with pytest.raises(IntegrityError):
+        async with sm() as s:
+            await place_bid_tx(s, aid, 999_999, Decimal("10.00"), "a-key")
+
+
+async def test_one_key_with_a_changed_amount_is_a_conflict(sm, channels):
+    """Same key, different body — a client with a key-reuse bug. No second bid is placed
+    either way, so this is only about whether the client finds out. It does: replaying the
+    first answer silently would let it believe it placed a bid it never placed.
+
+    Sequential, not raced: the first bid is committed, so the second clears the bid guard
+    (11 > 10) and the stored amount is the only thing that can tell them apart.
+    """
+    _, bidder, aid = await _seed(sm)
+
+    await _post_bid(sm, aid, bidder, "10.00", "one-key", channels)
+    with pytest.raises(HTTPException) as conflict:
+        await _post_bid(sm, aid, bidder, "11.00", "one-key", channels)
+
+    assert conflict.value.status_code == 409
+    assert await _bid_rows(sm, aid) == 1
+    assert len(channels.published) == 1
+
+
 async def test_a_rejected_bid_says_why_and_publishes_nothing(sm, channels):
     """The handler's reject path. The bidder is told which guard refused the bid, and no
     event goes out — a rejected bid that published would move every watcher's countdown
@@ -301,16 +434,8 @@ async def test_a_rejected_bid_says_why_and_publishes_nothing(sm, channels):
     _, bidder, aid = await _seed(sm, ends_delta=timedelta(seconds=30))
     before = await _deadline(sm, aid)
 
-    async with sm() as s:
-        user = await s.get(User, bidder)
-        with pytest.raises(ClientException) as rejected:
-            await place_bid.fn(
-                auction_id=aid,
-                data=BidRequest(amount=Decimal("9.99")),
-                current_user=user,
-                db_session=s,
-                channels=channels,
-            )
+    with pytest.raises(ClientException) as rejected:
+        await _post_bid(sm, aid, bidder, "9.99", None, channels)
 
     assert rejected.value.detail == "bid must be at least 10.00"
     assert channels.published == []
