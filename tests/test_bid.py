@@ -17,7 +17,6 @@ from app.auctions import (
     APP_TZ,
     MAX_BID,
     MAX_EXTENSION,
-    SNIPE_WINDOW,
     _to_response,
     create_auction,
     place_bid,
@@ -93,7 +92,9 @@ async def test_created_auction_records_its_extension_ceiling(sm):
             current_user=seller,
             db_session=s,
         )
-    assert created.hard_ends_at - created.ends_at == MAX_EXTENSION
+    # The literal 2h, not MAX_EXTENSION: comparing the constant with itself passes for any
+    # value, so a ceiling quietly widened to 48h would go unnoticed.
+    assert created.hard_ends_at - created.ends_at == timedelta(hours=2)
 
 
 async def test_opening_bid_may_equal_starting_bid(sm):
@@ -261,8 +262,10 @@ async def test_bid_inside_the_final_minute_extends_the_deadline(sm):
         assert await place_bid_tx(s, aid, bidder, Decimal("10.00")) is not None
     after = await _deadline(sm, aid)
     assert after > before
-    # Measured from when the bid landed, not from the old deadline.
-    assert after - datetime.now(timezone.utc) > SNIPE_WINDOW - timedelta(seconds=5)
+    # Literal bounds, not SNIPE_WINDOW: asserting against the constant compares it with
+    # itself, so any value it held would pass. Measured from when the bid landed, not from
+    # the old deadline. Both sides matter — a lower bound alone accepts a 10-minute window.
+    assert timedelta(seconds=55) < after - datetime.now(timezone.utc) < timedelta(seconds=65)
 
 
 async def test_bid_event_tells_watchers_the_new_deadline(sm, channels):
