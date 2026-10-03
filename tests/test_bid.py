@@ -11,7 +11,7 @@ import random
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 from app.auctions import (
     APP_TZ,
@@ -295,6 +295,32 @@ async def test_extension_never_pulls_a_deadline_backwards(sm):
     async with sm() as s:
         assert await place_bid_tx(s, aid, bidder, Decimal("10.00")) is not None
     assert await _deadline(sm, aid) == before
+
+
+async def test_the_bid_and_its_extension_are_one_statement(sm):
+    """The deadline has to move in the very UPDATE that accepts the bid.
+
+    Splitting them leaves a window in which the row is bid-on but still due, and the
+    closer can fire inside it. That window is too narrow to catch by racing — a
+    deliberately split implementation went undetected in 20 out of 20 raced runs — so
+    the property is pinned by counting the UPDATEs instead of trying to lose the race.
+    """
+    updates = []
+    engine = sm.kw["bind"].sync_engine
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def record(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("UPDATE AUCTIONS"):
+            updates.append(statement)
+
+    try:
+        _, bidder, aid = await _seed(sm, ends_delta=timedelta(seconds=30))
+        async with sm() as s:
+            assert await place_bid_tx(s, aid, bidder, Decimal("10.00")) is not None
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    assert len(updates) == 1, f"the bid path issued {len(updates)} UPDATEs on auctions"
 
 
 async def _reason(sm, aid: int, uid: int, amount: str = "10.00") -> str:
