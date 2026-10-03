@@ -47,6 +47,16 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      redis:
+        # Only the socket suite uses it, and only to prove the fan-out backend is
+        # interchangeable. Nothing else in CI needs Redis running.
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
@@ -59,7 +69,7 @@ jobs:
           python-version-file: .python-version
 
       - name: Install
-        run: uv sync --extra dev --locked
+        run: uv sync --extra dev --extra redis --locked
 
       - name: Compile
         run: uv run python -m compileall -q app alembic tests
@@ -78,6 +88,20 @@ jobs:
       - name: Tests
         # The floor lives in pyproject, so a local run gates identically.
         run: uv run pytest --cov --cov-report=term-missing
+
+      # M5 criterion 4: the same socket suite, against each fan-out backend. The default
+      # is in-memory and single-instance; these are the two that let several processes see
+      # each other's events, and a backend nobody runs the suite against is a backend
+      # nobody knows works.
+      - name: Sockets over Redis
+        env:
+          CHANNELS_URL: redis://localhost:6379/0
+        run: uv run pytest --no-cov -q tests/test_e2e.py
+
+      - name: Sockets over Postgres LISTEN/NOTIFY
+        env:
+          CHANNELS_URL: postgresql://postgres:postgres@localhost:5432/fmsc
+        run: uv run pytest --no-cov -q tests/test_e2e.py
 
   image:
     runs-on: ubuntu-latest
