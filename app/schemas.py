@@ -15,6 +15,11 @@ class TokenResponse(msgspec.Struct):
     token: str
 
 
+class TicketResponse(msgspec.Struct):
+    ticket: str
+    expires_at: datetime
+
+
 class CreateAuctionRequest(msgspec.Struct):
     title: str
     starting_bid: Decimal

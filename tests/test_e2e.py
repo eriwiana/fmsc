@@ -56,7 +56,10 @@ def clean_db():
         engine = create_async_engine(PG_URL, poolclass=NullPool)
         async with engine.begin() as conn:
             await conn.execute(
-                text("TRUNCATE bids, auctions, sessions, users RESTART IDENTITY CASCADE")
+                text(
+                    "TRUNCATE outbox, bids, auctions, ws_tickets, sessions, users"
+                    " RESTART IDENTITY CASCADE"
+                )
             )
         await engine.dispose()
 
@@ -68,6 +71,26 @@ def _signup(client: TestClient, email: str) -> str:
     response = client.post("/auth/signup", json={"email": email, "password": PASSWORD})
     assert response.status_code == 201, response.text
     return response.json()["token"]
+
+
+def _ticket(client: TestClient, token: str) -> str:
+    """The socket's own credential. A session token in a query string ends up in access
+    logs, browser history and Referer headers; a ticket is single-use and dies in seconds."""
+    response = client.post("/ws/tickets", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 201, response.text
+    return response.json()["ticket"]
+
+
+def _expire_tickets() -> None:
+    async def run():
+        engine = create_async_engine(PG_URL, poolclass=NullPool)
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE ws_tickets SET expires_at = now() - interval '1 second'")
+            )
+        await engine.dispose()
+
+    asyncio.run(run())
 
 
 def _open_auction(client: TestClient, seller_token: str) -> int:
@@ -100,7 +123,9 @@ def test_a_socket_receives_a_snapshot_before_any_event(clean_db):
         )
         assert placed.status_code == 201, placed.text
 
-        with client.websocket_connect(f"/ws/auctions/{auction_id}?token={watcher}") as socket:
+        with client.websocket_connect(
+            f"/ws/auctions/{auction_id}?ticket={_ticket(client, watcher)}"
+        ) as socket:
             snapshot = socket.receive_json(timeout=READ_TIMEOUT)
 
         current = client.get(f"/auctions/{auction_id}").json()
@@ -120,7 +145,9 @@ def test_a_watcher_receives_a_bid_over_a_real_socket(clean_db):
 
         auction_id = _open_auction(client, seller)
 
-        with client.websocket_connect(f"/ws/auctions/{auction_id}?token={watcher}") as socket:
+        with client.websocket_connect(
+            f"/ws/auctions/{auction_id}?ticket={_ticket(client, watcher)}"
+        ) as socket:
             # The snapshot is the handshake: once it has arrived the subscription is live,
             # so there is no window left to race and no sleep needed. Before the snapshot
             # existed this test had to guess at 0.3s.
@@ -208,7 +235,9 @@ def test_a_socket_that_fell_behind_is_dropped(clean_db):
         watcher = _signup(client, "watcher@x.com")
         auction_id = _open_auction(client, seller)
 
-        with client.websocket_connect(f"/ws/auctions/{auction_id}?token={watcher}") as socket:
+        with client.websocket_connect(
+            f"/ws/auctions/{auction_id}?ticket={_ticket(client, watcher)}"
+        ) as socket:
             assert socket.receive_json(timeout=READ_TIMEOUT)["seq"] == 0
             # Events 1 and 2 never arrive; 3 does.
             channels.publish(
@@ -229,7 +258,9 @@ def test_a_relayed_duplicate_is_not_sent_twice(clean_db):
         bidder = _signup(client, "bidder@x.com")
         auction_id = _open_auction(client, seller)
 
-        with client.websocket_connect(f"/ws/auctions/{auction_id}?token={watcher}") as socket:
+        with client.websocket_connect(
+            f"/ws/auctions/{auction_id}?ticket={_ticket(client, watcher)}"
+        ) as socket:
             assert socket.receive_json(timeout=READ_TIMEOUT)["type"] == "snapshot"
             placed = client.post(
                 f"/auctions/{auction_id}/bids",
@@ -247,13 +278,65 @@ def test_a_relayed_duplicate_is_not_sent_twice(clean_db):
                 socket.receive(timeout=1.0)
 
 
-def test_a_socket_without_a_valid_token_is_closed(clean_db):
-    """The query-string token is the only auth on the socket. If it stopped being checked,
-    nothing else in the suite would notice."""
+def test_a_socket_without_a_valid_ticket_is_closed(clean_db):
+    """The ticket is the only auth on the socket. If it stopped being checked, nothing
+    else in the suite would notice."""
     with (
         TestClient(app=app) as client,
-        client.websocket_connect("/ws/auctions/1?token=not-a-real-token") as socket,
+        client.websocket_connect("/ws/auctions/1?ticket=not-a-real-ticket") as socket,
         pytest.raises(WebSocketDisconnect) as closed,
     ):
         socket.receive(timeout=READ_TIMEOUT)
+    assert closed.value.code == 4401
+
+
+def test_a_session_token_no_longer_opens_a_socket(clean_db):
+    """M5 criterion 5. The old form has to stop working, not merely be discouraged: a
+    token that still authenticates is a token that still leaks through access logs and
+    browser history, and it is the long-lived one."""
+    with TestClient(app=app) as client:
+        seller = _signup(client, "seller@x.com")
+        auction_id = _open_auction(client, seller)
+        with (
+            client.websocket_connect(f"/ws/auctions/{auction_id}?token={seller}") as socket,
+            pytest.raises(WebSocketDisconnect) as closed,
+        ):
+            socket.receive(timeout=READ_TIMEOUT)
+    assert closed.value.code == 4401
+
+
+def test_a_ticket_works_once(clean_db):
+    """Single use, so a ticket captured from a log or a Referer header is already spent."""
+    with TestClient(app=app) as client:
+        seller = _signup(client, "seller@x.com")
+        watcher = _signup(client, "watcher@x.com")
+        auction_id = _open_auction(client, seller)
+        url = f"/ws/auctions/{auction_id}?ticket={_ticket(client, watcher)}"
+
+        with client.websocket_connect(url) as socket:
+            assert socket.receive_json(timeout=READ_TIMEOUT)["type"] == "snapshot"
+
+        with (
+            client.websocket_connect(url) as socket,
+            pytest.raises(WebSocketDisconnect) as closed,
+        ):
+            socket.receive(timeout=READ_TIMEOUT)
+    assert closed.value.code == 4401
+
+
+def test_an_expired_ticket_is_rejected(clean_db):
+    """Short-lived is the point. Without the expiry check a ticket is just a second
+    long-lived credential with a different name."""
+    with TestClient(app=app) as client:
+        seller = _signup(client, "seller@x.com")
+        watcher = _signup(client, "watcher@x.com")
+        auction_id = _open_auction(client, seller)
+        ticket = _ticket(client, watcher)
+        _expire_tickets()
+
+        with (
+            client.websocket_connect(f"/ws/auctions/{auction_id}?ticket={ticket}") as socket,
+            pytest.raises(WebSocketDisconnect) as closed,
+        ):
+            socket.receive(timeout=READ_TIMEOUT)
     assert closed.value.code == 4401

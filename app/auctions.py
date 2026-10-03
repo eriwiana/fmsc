@@ -21,7 +21,7 @@ from sqlalchemy import Row, bindparam, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.auth import provide_current_user, user_for_token
+from app.auth import provide_current_user, purge_expired_tickets, user_for_ticket
 from app.models import Auction, Bid, Outbox, User
 from app.schemas import AuctionResponse, BidRequest, CreateAuctionRequest
 
@@ -409,7 +409,9 @@ async def auction_ws(
 ) -> None:
     await socket.accept()
     try:
-        await user_for_token(db_session, socket.query_params.get("token", ""))
+        # A ticket, not the session token: the credential is in a URL, and a URL is
+        # logged. Spending the ticket here is what makes it single-use.
+        await user_for_ticket(db_session, socket.query_params.get("ticket", ""))
     except NotAuthorizedException:
         await socket.close(code=4401)
         return
@@ -538,6 +540,7 @@ async def run_closer(
             # Anything a previous process committed but never announced.
             await relay_pending(session_maker, channels)
             async with session_maker() as session:
+                await purge_expired_tickets(session)
                 await prune_outbox(session)
         except Exception:
             # Blind on purpose: a transient database error must not kill the loop. BLE001

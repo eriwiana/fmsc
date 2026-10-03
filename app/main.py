@@ -71,6 +71,7 @@ app = Litestar(
         health,
         auth.signup,
         auth.login,
+        auth.issue_ws_ticket,
         auctions.create_auction,
         auctions.list_auctions,
         auctions.get_auction,

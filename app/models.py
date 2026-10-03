@@ -34,6 +34,21 @@ class Session(BigIntBase):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
 
 
+class WsTicket(BigIntBase):
+    """A single-use, short-lived credential for opening a WebSocket.
+
+    A browser cannot set headers on a WebSocket handshake, so the credential has to travel
+    in the URL — where it lands in access logs, browser history and Referer headers. A
+    session token there is a long-lived secret in all three. This one is spent on first use
+    and dead within seconds.
+    """
+
+    __tablename__ = "ws_tickets"
+    token: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class Auction(BigIntAuditBase):
     __tablename__ = "auctions"
     title: Mapped[str] = mapped_column(String(200))
