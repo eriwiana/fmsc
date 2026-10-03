@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -225,10 +226,19 @@ async def test_the_tick_does_its_housekeeping(sm, channels):
 
     task = asyncio.create_task(run_closer(sm, channels, interval=0.01))
     try:
-        await asyncio.sleep(0.3)
-        async with sm() as s:
-            assert await s.scalar(text("SELECT count(*) FROM outbox")) == 0
-            assert await s.scalar(text("SELECT count(*) FROM ws_tickets")) == 0
+        # Polled, not slept at. A tick opens its own sessions, and on a machine where
+        # establishing a connection costs 100ms — a Docker network on macOS does — a fixed
+        # 0.3s is not one full pass. The assertion is that the tick gets there, not when.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            async with sm() as s:
+                leftover = await s.scalar(
+                    text("SELECT (SELECT count(*) FROM outbox) + (SELECT count(*) FROM ws_tickets)")
+                )
+            if leftover == 0:
+                break
+            await asyncio.sleep(0.05)
+        assert leftover == 0
     finally:
         # Never awaited: an uncancellable loop would hang the runner rather than fail.
         task.cancel()
