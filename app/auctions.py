@@ -205,6 +205,7 @@ async def place_bid(
         raise ClientException(
             await reject_reason(db_session, auction_id, current_user.id, data.amount)
         )
+    response = _to_response(auction)
     channels.publish(
         {
             "type": "bid",
@@ -212,10 +213,15 @@ async def place_bid(
             "amount": str(data.amount),
             "winner_id": current_user.id,
             "bid_count": auction.bid_count,
+            # A bid inside the window moves the deadline. Without it here, a watcher's
+            # countdown runs out on a deadline that no longer exists and they stop bidding,
+            # which is exactly what anti-snipe is meant to prevent. Rendered off the
+            # response so the socket and the HTTP reply cannot disagree.
+            "ends_at": response.ends_at.isoformat(),
         },
         _channel(auction_id),
     )
-    return _to_response(auction)
+    return response
 
 
 @websocket("/ws/auctions/{auction_id:int}")

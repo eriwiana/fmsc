@@ -20,12 +20,13 @@ from app.auctions import (
     SNIPE_WINDOW,
     _to_response,
     create_auction,
+    place_bid,
     place_bid_tx,
     reject_reason,
     resolve_deadline,
 )
 from app.models import Auction, User
-from app.schemas import CreateAuctionRequest
+from app.schemas import BidRequest, CreateAuctionRequest
 
 
 async def _seed(
@@ -262,6 +263,30 @@ async def test_bid_inside_the_final_minute_extends_the_deadline(sm):
     assert after > before
     # Measured from when the bid landed, not from the old deadline.
     assert after - datetime.now(timezone.utc) > SNIPE_WINDOW - timedelta(seconds=5)
+
+
+async def test_bid_event_tells_watchers_the_new_deadline(sm, channels):
+    """Anti-snipe is invisible without this. A watcher whose countdown still shows the old
+    deadline stops bidding at a deadline that has already moved, which is the behaviour the
+    extension exists to prevent."""
+    _, bidder, aid = await _seed(sm, ends_delta=timedelta(seconds=30))
+    before = await _deadline(sm, aid)
+    async with sm() as s:
+        user = await s.get(User, bidder)
+        response = await place_bid.fn(
+            auction_id=aid,
+            data=BidRequest(amount=Decimal("10.00")),
+            current_user=user,
+            db_session=s,
+            channels=channels,
+        )
+
+    ((channel, event),) = channels.published
+    assert channel == f"auction:{aid}"
+    assert event["type"] == "bid"
+    # The same rendering the response uses, so a client needs no second request.
+    assert event["ends_at"] == response.ends_at.isoformat()
+    assert datetime.fromisoformat(event["ends_at"]) > before
 
 
 async def test_bid_outside_the_window_leaves_the_deadline_alone(sm):

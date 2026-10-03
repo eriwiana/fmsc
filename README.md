@@ -32,6 +32,9 @@ lands, so a bid placed too late to be answered cannot win on timing alone. `hard
 fixed when the auction is created at `ends_at + 2h` (`MAX_EXTENSION`), caps the total so an
 auction cannot be extended forever. Both are global constants, not per-auction settings.
 
+Every `bid` event on the WebSocket carries the current `ends_at`, so a watcher's countdown
+follows the extension instead of expiring on a deadline that has already moved.
+
 ## Local dev
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
