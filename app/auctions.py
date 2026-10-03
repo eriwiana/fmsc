@@ -118,9 +118,19 @@ async def get_auction(auction_id: int, db_session: AsyncSession) -> AuctionRespo
 # clock_timestamp(), not now(): now() is transaction_timestamp(), and the auth dependency
 # has already opened the transaction by the time this runs, so now() reads a clock frozen
 # before the request arrived. Only clock_timestamp() advances inside a transaction.
+#
+# The extension rides inside this same UPDATE. A second statement would leave a gap for the
+# closer to fire in between, closing an auction the bid had just extended.
+#
+# GREATEST is outermost so the deadline is never pulled backwards; LEAST caps it at the
+# ceiling; outside the window ends_at already wins, so nothing moves.
+#
+# WHERE still reads the pre-update ends_at, so a bid that arrives after the deadline loses
+# rather than extending its way back in.
 _BID_SQL = text("""
     UPDATE auctions
-       SET current_bid = :amount, current_winner_id = :uid, bid_count = bid_count + 1
+       SET current_bid = :amount, current_winner_id = :uid, bid_count = bid_count + 1,
+           ends_at = GREATEST(ends_at, LEAST(hard_ends_at, clock_timestamp() + :window))
      WHERE id = :id AND status = 'open' AND ends_at > clock_timestamp()
        AND seller_id <> :uid
        AND :amount >= starting_bid
@@ -141,7 +151,10 @@ async def place_bid_tx(
         await session.rollback()
         return None
     row = (
-        await session.execute(_BID_SQL, {"amount": amount, "uid": user_id, "id": auction_id})
+        await session.execute(
+            _BID_SQL,
+            {"amount": amount, "uid": user_id, "id": auction_id, "window": SNIPE_WINDOW},
+        )
     ).first()
     if row is None:
         await session.rollback()

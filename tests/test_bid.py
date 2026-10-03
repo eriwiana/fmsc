@@ -17,6 +17,7 @@ from app.auctions import (
     APP_TZ,
     MAX_BID,
     MAX_EXTENSION,
+    SNIPE_WINDOW,
     create_auction,
     place_bid_tx,
     reject_reason,
@@ -239,6 +240,61 @@ async def test_highest_bid_survives_n_way_concurrency(sm):
     assert auction.current_winner_id == ids[amounts.index(max(amounts))]
     assert auction.bid_count == accepted
     assert await _bid_rows(sm, aid) == accepted
+
+
+async def _deadline(sm, aid: int) -> datetime:
+    async with sm() as s:
+        return (await s.get(Auction, aid)).ends_at
+
+
+async def test_bid_inside_the_final_minute_extends_the_deadline(sm):
+    """Anti-snipe. A bid with 30s left moves the deadline to SNIPE_WINDOW from now, so a
+    rival who was leading has the same window to answer that the sniper just used."""
+    _, bidder, aid = await _seed(sm, ends_delta=timedelta(seconds=30))
+    before = await _deadline(sm, aid)
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("10.00")) is not None
+    after = await _deadline(sm, aid)
+    assert after > before
+    # Measured from when the bid landed, not from the old deadline.
+    assert after - datetime.now(timezone.utc) > SNIPE_WINDOW - timedelta(seconds=5)
+
+
+async def test_bid_outside_the_window_leaves_the_deadline_alone(sm):
+    """An hour out, the same statement must not move the deadline at all — otherwise
+    every bid on a long auction would drag it in to a minute from now."""
+    _, bidder, aid = await _seed(sm, ends_delta=timedelta(hours=1))
+    before = await _deadline(sm, aid)
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("10.00")) is not None
+    assert await _deadline(sm, aid) == before
+
+
+async def test_extension_stops_at_the_hard_ceiling(sm):
+    """The ceiling is what makes the auction finite. The allowance has to run out inside
+    the window for the clamp to bind: 30s left plus 15s of allowance puts the ceiling 45s
+    out, so a bid asking for a 60s extension gets 45s and no more."""
+    _, bidder, aid = await _seed(
+        sm, ends_delta=timedelta(seconds=30), extension=timedelta(seconds=15)
+    )
+    async with sm() as s:
+        auction = await s.get(Auction, aid)
+        ceiling = auction.hard_ends_at
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("10.00")) is not None
+    assert await _deadline(sm, aid) == ceiling
+
+
+async def test_extension_never_pulls_a_deadline_backwards(sm):
+    """A row whose ceiling sits before its own deadline must keep the deadline it has.
+    Clamping to the ceiling unconditionally would end such an auction on the next bid."""
+    _, bidder, aid = await _seed(
+        sm, ends_delta=timedelta(seconds=30), extension=timedelta(seconds=-600)
+    )
+    before = await _deadline(sm, aid)
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("10.00")) is not None
+    assert await _deadline(sm, aid) == before
 
 
 async def _reason(sm, aid: int, uid: int, amount: str = "10.00") -> str:
