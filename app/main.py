@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 
 from advanced_alchemy.config import AsyncSessionConfig
@@ -42,6 +43,13 @@ async def _stop_closer(app: Litestar) -> None:
     task = getattr(app.state, "closer_task", None)
     if task:
         task.cancel()
+        # Awaited, not just cancelled. cancel() only requests it: the task may be inside a
+        # query, and letting the loop tear down underneath it leaves the connection half
+        # closed — which hung the suite intermittently once the tick grew from one
+        # statement to three. Suppressing CancelledError here is not the mistake M2 made;
+        # that was run_closer swallowing its own cancellation, which made it unstoppable.
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 app = Litestar(
