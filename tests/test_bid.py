@@ -235,7 +235,9 @@ async def test_highest_bid_survives_n_way_concurrency(sm):
         await s.commit()
         ids = [u.id for u in users]
     amounts = [Decimal(f"{11 + i}.00") for i in range(n)]
-    order = list(zip(ids, amounts))
+    # strict: the two lists are built from the same n, and a silent truncation here
+    # would quietly shrink the race this test exists to create.
+    order = list(zip(ids, amounts, strict=True))
     random.shuffle(order)  # so the race is not always "each bid beats the last"
 
     async def bid(uid: int, amount: Decimal):
