@@ -414,9 +414,6 @@ async def auction_ws(
         await socket.close(code=4401)
         return
 
-    async def send(event: bytes | str) -> None:
-        await socket.send_text(event.decode() if isinstance(event, bytes) else event)
-
     # Sending from a background task and then blocking on receive() is what makes a
     # disconnect observable: receive() raises the moment the client goes away. Iterating
     # the subscription in the foreground instead parks here until the next event fails to
@@ -443,6 +440,36 @@ async def auction_ws(
                 }
             ).decode()
         )
+        # The number the client has been brought up to. Every event is measured against
+        # it, which is what makes the sequence worth carrying.
+        last_seq = auction.event_seq
+
+        closed = False
+
+        async def send(event: bytes | str) -> None:
+            nonlocal last_seq, closed
+            if closed:
+                # A second dropped event would otherwise close an already closed socket.
+                # Litestar tolerates that today; saying so here does not rely on it.
+                return
+            payload = event.decode() if isinstance(event, bytes) else event
+            seq = msgspec.json.decode(payload)["seq"]
+            if seq <= last_seq:
+                # Already delivered. The outbox relays at-least-once, so a duplicate is
+                # expected rather than exceptional, and showing the same bid twice would
+                # make a watcher think the price moved when it did not.
+                return
+            if seq > last_seq + 1:
+                # Events were dropped from this socket's queue, so it cannot be made
+                # whole here. Closing sends the client back through the snapshot, which
+                # is the only path that restores correct state. Staying connected would
+                # show a price that silently skipped a bid.
+                closed = True
+                await socket.close(code=4408)
+                return
+            last_seq = seq
+            await socket.send_text(payload)
+
         async with subscriber.run_in_background(send):
             while True:
                 await socket.receive()

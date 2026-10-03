@@ -25,8 +25,21 @@ db_config = SQLAlchemyAsyncConfig(
     connection_string=DATABASE_URL,
     session_config=AsyncSessionConfig(expire_on_commit=False),
 )
+# Litestar's default is no bound and a "backoff" strategy, which means one consumer that
+# never reads grows this process's memory until it dies. Bounded and dropleft instead: the
+# queue is capped, the oldest events go first, and the hole that leaves in the per-auction
+# sequence is what tells auction_ws to drop the socket. The client then reconnects and the
+# snapshot puts it back on correct state, which is the only way back from a dropped event.
+SUBSCRIBER_MAX_BACKLOG = 64
+SUBSCRIBER_BACKLOG_STRATEGY = "dropleft"
+
 # Memory backend = single instance. Swap to RedisChannelsBackend before scaling out.
-channels = ChannelsPlugin(backend=MemoryChannelsBackend(), arbitrary_channels_allowed=True)
+channels = ChannelsPlugin(
+    backend=MemoryChannelsBackend(),
+    arbitrary_channels_allowed=True,
+    subscriber_max_backlog=SUBSCRIBER_MAX_BACKLOG,
+    subscriber_backlog_strategy=SUBSCRIBER_BACKLOG_STRATEGY,
+)
 
 
 @get("/health")

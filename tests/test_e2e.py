@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import datetime, timedelta, timezone
+from queue import Empty
 
 import pytest
 from litestar.exceptions import WebSocketDisconnect
@@ -28,7 +29,12 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-from app.main import app
+from app.main import (
+    SUBSCRIBER_BACKLOG_STRATEGY,
+    SUBSCRIBER_MAX_BACKLOG,
+    app,
+    channels,
+)
 
 PG_URL = os.environ.get(
     "DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/fmsc"
@@ -176,6 +182,69 @@ def test_a_retried_bid_replays_the_original_response(clean_db):
     # was handed the first time, key order and number formatting included.
     assert second.content == first.content
     assert first.json()["bid_count"] == 1
+
+
+def test_the_subscriber_backlog_is_bounded():
+    """M5 criterion 3, the memory half. Litestar defaults to no bound and a "backoff"
+    strategy, so one consumer that never reads grows the server's memory until the process
+    dies. Asserted against literals, not against the constants themselves — comparing a
+    constant with itself passes whatever value it holds."""
+    assert SUBSCRIBER_MAX_BACKLOG == 64
+    assert SUBSCRIBER_BACKLOG_STRATEGY == "dropleft"
+
+
+def test_a_socket_that_fell_behind_is_dropped(clean_db):
+    """M5 criterion 3, the client half. Once events have been dropped from its queue the
+    socket cannot be made whole, and staying connected would show a price that silently
+    skipped a bid. Dropping it sends the client back through the snapshot, which is the
+    one path that restores correct state.
+
+    The gap is published directly rather than by overflowing a 64-deep queue: the server's
+    reaction to a hole in the numbering is the behaviour under test, and a real overflow
+    produces exactly the same hole.
+    """
+    with TestClient(app=app) as client:
+        seller = _signup(client, "seller@x.com")
+        watcher = _signup(client, "watcher@x.com")
+        auction_id = _open_auction(client, seller)
+
+        with client.websocket_connect(f"/ws/auctions/{auction_id}?token={watcher}") as socket:
+            assert socket.receive_json(timeout=READ_TIMEOUT)["seq"] == 0
+            # Events 1 and 2 never arrive; 3 does.
+            channels.publish(
+                {"type": "bid", "auction_id": auction_id, "seq": 3}, f"auction:{auction_id}"
+            )
+            with pytest.raises(WebSocketDisconnect) as dropped:
+                socket.receive(timeout=READ_TIMEOUT)
+
+    assert dropped.value.code == 4408
+
+
+def test_a_relayed_duplicate_is_not_sent_twice(clean_db):
+    """The outbox delivers at-least-once, so a socket must drop an event it has already
+    seen rather than show the same bid twice."""
+    with TestClient(app=app) as client:
+        seller = _signup(client, "seller@x.com")
+        watcher = _signup(client, "watcher@x.com")
+        bidder = _signup(client, "bidder@x.com")
+        auction_id = _open_auction(client, seller)
+
+        with client.websocket_connect(f"/ws/auctions/{auction_id}?token={watcher}") as socket:
+            assert socket.receive_json(timeout=READ_TIMEOUT)["type"] == "snapshot"
+            placed = client.post(
+                f"/auctions/{auction_id}/bids",
+                headers={"Authorization": f"Bearer {bidder}"},
+                json={"amount": "12.00"},
+            )
+            assert placed.status_code == 201, placed.text
+            assert socket.receive_json(timeout=READ_TIMEOUT)["seq"] == 1
+
+            # What the relay would send after a crash between publish and mark-sent.
+            channels.publish(
+                {"type": "bid", "auction_id": auction_id, "seq": 1}, f"auction:{auction_id}"
+            )
+            with pytest.raises(Empty):
+                socket.receive(timeout=1.0)
 
 
 def test_a_socket_without_a_valid_token_is_closed(clean_db):
