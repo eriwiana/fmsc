@@ -239,9 +239,23 @@ async def auction_ws(
     except NotAuthorizedException:
         await socket.close(code=4401)
         return
-    async with channels.start_subscription(_channel(auction_id)) as subscriber:
-        async for event in subscriber.iter_events():
-            await socket.send_text(event.decode() if isinstance(event, bytes) else event)
+
+    async def send(event: bytes | str) -> None:
+        await socket.send_text(event.decode() if isinstance(event, bytes) else event)
+
+    # Sending from a background task and then blocking on receive() is what makes a
+    # disconnect observable: receive() raises the moment the client goes away. Iterating
+    # the subscription in the foreground instead parks here until the next event fails to
+    # send — and on a quiet auction there is no next event, so the subscription and this
+    # handler's database session are held for the life of the process.
+    #
+    # The client is not expected to send anything; whatever arrives is discarded.
+    async with (
+        channels.start_subscription(_channel(auction_id)) as subscriber,
+        subscriber.run_in_background(send),
+    ):
+        while True:
+            await socket.receive()
 
 
 # SKIP LOCKED so a second instance is not stuck behind the first. Without it the closers
