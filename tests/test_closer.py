@@ -194,6 +194,48 @@ async def test_two_closers_at_once_publish_once(sm, channels, other_channels):
     assert len(channels.published) + len(other_channels.published) == 1
 
 
+async def test_the_tick_does_its_housekeeping(sm, channels):
+    """Three jobs hang off the closer's tick — relay unsent events, purge spent tickets,
+    prune announced ones. Each is tested on its own; this is the only thing that proves the
+    loop actually calls them, and dropping any one call leaves a table growing forever."""
+    aid = await _seed(sm, ends_delta=timedelta(hours=1))
+    async with sm() as s:
+        await s.execute(
+            text(
+                "INSERT INTO outbox (auction_id, seq, payload, sent_at, created_at, updated_at)"
+                " VALUES (:aid, 99, '{}', clock_timestamp() - interval '2 days',"
+                " clock_timestamp(), clock_timestamp())"
+            ),
+            {"aid": aid},
+        )
+        await s.execute(
+            text(
+                "INSERT INTO users (email, pw_hash, created_at, updated_at)"
+                " VALUES ('ticket@x.com', 'x', now(), now())"
+            )
+        )
+        await s.execute(
+            text(
+                "INSERT INTO ws_tickets (token, user_id, expires_at)"
+                " SELECT 'dead', id, clock_timestamp() - interval '1 minute' FROM users"
+                " WHERE email = 'ticket@x.com'"
+            )
+        )
+        await s.commit()
+
+    task = asyncio.create_task(run_closer(sm, channels, interval=0.01))
+    try:
+        await asyncio.sleep(0.3)
+        async with sm() as s:
+            assert await s.scalar(text("SELECT count(*) FROM outbox")) == 0
+            assert await s.scalar(text("SELECT count(*) FROM ws_tickets")) == 0
+    finally:
+        # Never awaited: an uncancellable loop would hang the runner rather than fail.
+        task.cancel()
+    await asyncio.sleep(0.05)
+    assert task.cancelled()
+
+
 async def test_run_closer_stops_when_cancelled(sm, channels):
     """`_stop_closer` cancels this task on shutdown. Swallowing the CancelledError the
     sleep raises loses the cancellation for good: the loop keeps ticking, and anything

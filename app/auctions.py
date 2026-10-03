@@ -442,6 +442,12 @@ async def auction_ws(
                 }
             ).decode()
         )
+        # Nothing below touches the database, and the loop runs for as long as the client
+        # stays. Held open, this session is one Postgres connection per open socket —
+        # measured at 8 sockets, 7 connections — which would hit max_connections long
+        # before the 500 sockets M5 is meant to sustain.
+        await db_session.close()
+
         # The number the client has been brought up to. Every event is measured against
         # it, which is what makes the sequence worth carrying.
         last_seq = auction.event_seq

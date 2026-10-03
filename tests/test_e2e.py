@@ -18,6 +18,7 @@ the leak in auction_ws was found.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 from datetime import datetime, timedelta, timezone
 from queue import Empty
@@ -105,6 +106,46 @@ def _open_auction(client: TestClient, seller_token: str) -> int:
     )
     assert response.status_code == 201, response.text
     return response.json()["id"]
+
+
+def _connections() -> int:
+    """Backends on this database. The counting connection is itself included, which is
+    why only the difference between two readings means anything."""
+
+    async def run():
+        engine = create_async_engine(PG_URL, poolclass=NullPool)
+        async with engine.connect() as conn:
+            count = await conn.scalar(
+                text("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()")
+            )
+        await engine.dispose()
+        return count
+
+    return asyncio.run(run())
+
+
+def test_an_open_socket_holds_no_database_connection(clean_db):
+    """A socket lives as long as its watcher stays, and db_session is request-scoped, so
+    the session is held for all of it unless the handler lets go. Measured before the fix:
+    8 sockets, 7 connections. Postgres allows 100 by default, so 500 watchers on one
+    auction — which is what M5 is for — would run out long before reaching 500."""
+    with TestClient(app=app) as client:
+        seller = _signup(client, "seller@x.com")
+        auction_id = _open_auction(client, seller)
+        before = _connections()
+
+        with contextlib.ExitStack() as sockets:
+            for i in range(5):
+                watcher = _signup(client, f"watcher{i}@x.com")
+                socket = sockets.enter_context(
+                    client.websocket_connect(
+                        f"/ws/auctions/{auction_id}?ticket={_ticket(client, watcher)}"
+                    )
+                )
+                assert socket.receive_json(timeout=READ_TIMEOUT)["type"] == "snapshot"
+            held = _connections()
+
+    assert held == before
 
 
 def test_a_socket_receives_a_snapshot_before_any_event(clean_db):
