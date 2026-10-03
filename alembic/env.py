@@ -6,7 +6,7 @@ from logging.config import fileConfig
 
 from sqlalchemy.ext.asyncio import create_async_engine
 
-import app.models  # noqa: F401 — registers all tables on the shared metadata
+import app.models  # registers every table on the shared metadata
 from alembic import context
 
 config = context.config

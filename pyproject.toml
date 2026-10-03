@@ -18,16 +18,37 @@ dev = ["pytest", "pytest-asyncio", "pytest-cov"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 
-# Line length lives here, not only in the workflow, so a local `black .` and CI agree.
-[tool.isort]
-profile = "black"
-line_length = 100
-
-[tool.black]
+# One tool in place of isort + flake8 + three flake8 plugins + black. Settings live here,
+# not only in the workflow, so a local `ruff check` and CI agree.
+[tool.ruff]
 line-length = 100
-# Pin the target: without it black formats for the newest Python it knows and then
-# fails its own AST safety check when run on 3.12.
-target-version = ["py312"]
+# Pin the target: left to guess, a formatter targets the newest Python it knows.
+target-version = "py312"
+
+[tool.ruff.lint]
+# E/W pycodestyle, F pyflakes, I isort, B bugbear, C4 comprehensions, SIM simplify,
+# C901 mccabe — the same ground flake8 and its three plugins covered.
+#
+# Two beyond it. BLE: a swallowed exception is the bug class M2 hit, where the closer
+# caught its own cancellation and became uncancellable. RUF100: an inert `noqa` is worse
+# than none, because it claims a rule is firing when it is not — the F401 on alembic's
+# `import app.models` had been lying since M0, and this is what found it.
+select = ["E", "W", "F", "I", "B", "C4", "SIM", "C901", "BLE", "RUF100"]
+# The formatter owns line length; the lint rule would only duplicate it and disagree
+# about strings and comments it cannot wrap.
+ignore = ["E501"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.flake8-bugbear]
+# timedelta and similar are immutable, so calling them in a default is safe (B008).
+extend-immutable-calls = ["datetime.timedelta", "timedelta"]
+
+[tool.ruff.lint.per-file-ignores]
+# Alembic writes these; the revision identifiers are module-level assignments it formats
+# its own way, and E402 fires on the imports it puts after the docstring.
+"alembic/versions/*" = ["E402"]
 
 [tool.coverage.run]
 source = ["app"]
