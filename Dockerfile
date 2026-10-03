@@ -12,10 +12,10 @@ ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 # Dependencies before source: this layer is cached until uv.lock itself changes, so a
 # code-only deploy skips the install entirely.
 COPY pyproject.toml uv.lock .python-version ./
-RUN uv sync --locked --no-install-project --no-dev
+RUN uv sync --locked --no-install-project --no-dev --extra redis
 
 COPY . .
-RUN uv sync --locked --no-dev
+RUN uv sync --locked --no-dev --extra redis
 
 ENV PATH="/app/.venv/bin:$PATH"
 
