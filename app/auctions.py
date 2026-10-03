@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -45,6 +45,7 @@ def _to_response(a: Auction | Row) -> AuctionResponse:
         status=a.status,
         starts_at=a.starts_at.astimezone(APP_TZ),
         ends_at=a.ends_at.astimezone(APP_TZ),
+        hard_ends_at=a.hard_ends_at.astimezone(APP_TZ),
     )
 
 
@@ -52,6 +53,15 @@ def _to_response(a: Auction | Row) -> AuctionResponse:
 # which asyncpg surfaces as a 500, and it silently rounds a third decimal place — 10.005
 # becomes 10.01, so a bidder outbids by half a cent and is charged a whole one.
 MAX_BID = Decimal("9999999999.99")
+
+# Anti-snipe. A bid inside the last SNIPE_WINDOW pushes the deadline that far out from the
+# moment it lands, so a bid placed too late to be answered cannot win on timing alone.
+# MAX_EXTENSION caps the total, via each auction's hard_ends_at.
+#
+# ponytail: both are global, not per-auction. Three columns and create-time validation buy
+# nothing until a seller actually asks for a different window.
+SNIPE_WINDOW = timedelta(seconds=60)
+MAX_EXTENSION = timedelta(hours=2)
 
 
 def _is_valid_amount(amount: Decimal) -> bool:
@@ -80,6 +90,7 @@ async def create_auction(
         seller_id=current_user.id,
         starting_bid=data.starting_bid,
         ends_at=ends_at,
+        hard_ends_at=ends_at + MAX_EXTENSION,
     )
     db_session.add(auction)
     await db_session.commit()

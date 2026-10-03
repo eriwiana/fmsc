@@ -13,7 +13,7 @@ from decimal import Decimal
 
 from sqlalchemy import text
 
-from app.auctions import close_due, place_bid_tx, run_closer
+from app.auctions import MAX_EXTENSION, close_due, place_bid_tx, run_closer
 from app.models import Auction, User
 
 # Its own seeder rather than the bid suite's: these want an auction already past its
@@ -25,11 +25,13 @@ async def _seed(maker, ends_delta: timedelta = timedelta(seconds=-1)) -> int:
         seller = User(email="seller@x.com", pw_hash="x")
         s.add(seller)
         await s.flush()
+        ends_at = datetime.now(timezone.utc) + ends_delta
         auction = Auction(
             title="t",
             seller_id=seller.id,
             starting_bid=Decimal("10.00"),
-            ends_at=datetime.now(timezone.utc) + ends_delta,
+            ends_at=ends_at,
+            hard_ends_at=ends_at + MAX_EXTENSION,
         )
         s.add(auction)
         await s.commit()

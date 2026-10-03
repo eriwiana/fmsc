@@ -13,11 +13,22 @@ from decimal import Decimal
 
 from sqlalchemy import text
 
-from app.auctions import APP_TZ, MAX_BID, place_bid_tx, reject_reason, resolve_deadline
+from app.auctions import (
+    APP_TZ,
+    MAX_BID,
+    MAX_EXTENSION,
+    create_auction,
+    place_bid_tx,
+    reject_reason,
+    resolve_deadline,
+)
 from app.models import Auction, User
+from app.schemas import CreateAuctionRequest
 
 
-async def _seed(maker, starting="10.00", ends_delta=timedelta(hours=1)) -> tuple[int, int, int]:
+async def _seed(
+    maker, starting="10.00", ends_delta=timedelta(hours=1), extension=MAX_EXTENSION
+) -> tuple[int, int, int]:
     """One seller, one bidder, one auction. Seller and bidder are distinct on purpose:
     an auction whose seller is also its only bidder cannot exercise the real guards."""
     async with maker() as s:
@@ -25,11 +36,13 @@ async def _seed(maker, starting="10.00", ends_delta=timedelta(hours=1)) -> tuple
         bidder = User(email="bidder@x.com", pw_hash="x")
         s.add_all([seller, bidder])
         await s.flush()
+        ends_at = datetime.now(timezone.utc) + ends_delta
         auction = Auction(
             title="t",
             seller_id=seller.id,
             starting_bid=Decimal(starting),
-            ends_at=datetime.now(timezone.utc) + ends_delta,
+            ends_at=ends_at,
+            hard_ends_at=ends_at + extension,
         )
         s.add(auction)
         await s.commit()
@@ -61,6 +74,23 @@ def test_naive_deadline_is_jakarta():
     aware = datetime(2026, 6, 28, 17, 0, 0, tzinfo=timezone.utc)
     assert resolve_deadline(aware) is aware
     assert APP_TZ.key == "Asia/Jakarta"
+
+
+async def test_created_auction_records_its_extension_ceiling(sm):
+    """create_auction is the only place hard_ends_at is ever set, and nothing downstream
+    can repair a wrong ceiling: it is what stops an auction extending forever."""
+    async with sm() as s:
+        seller = User(email="seller@x.com", pw_hash="x")
+        s.add(seller)
+        await s.commit()
+    ends_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    async with sm() as s:
+        created = await create_auction.fn(
+            data=CreateAuctionRequest(title="t", starting_bid=Decimal("10.00"), ends_at=ends_at),
+            current_user=seller,
+            db_session=s,
+        )
+    assert created.hard_ends_at - created.ends_at == MAX_EXTENSION
 
 
 async def test_opening_bid_may_equal_starting_bid(sm):

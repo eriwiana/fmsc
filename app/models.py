@@ -35,6 +35,9 @@ class Auction(BigIntAuditBase):
     status: Mapped[str] = mapped_column(String(10), default="open")  # open | closed
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # The latest ends_at may ever be extended to. Fixed when the auction is created:
+    # without a ceiling, two bidders trading bids inside the window keep it open forever.
+    hard_ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (Index("ix_auctions_status_ends_at", "status", "ends_at"),)
 
