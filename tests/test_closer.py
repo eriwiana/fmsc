@@ -100,7 +100,10 @@ async def test_closer_does_not_fire_on_an_auction_a_late_bid_extended(sm, channe
         await asyncio.sleep(1.5)  # well past the deadline the auction had when it was seeded
         assert await _status(sm, aid) == "open"
         assert await _deadline(sm, aid) > original
-        assert channels.published == []
+        # One event, and it is the bid: place_bid_tx recorded it and never published it,
+        # so the relay in the same loop announced it. That is the outbox doing its job.
+        # What must not appear here is a close.
+        assert [event["type"] for _, event in channels.published] == ["bid"]
     finally:
         # Never awaited: an uncancellable loop would hang the runner rather than fail.
         task.cancel()
