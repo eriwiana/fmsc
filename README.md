@@ -23,10 +23,32 @@ Jakarta wall time, responses render `+07:00`. Process runs with `TZ=Asia/Jakarta
   deadline when it lands inside the anti-snipe window. A refused bid answers **400** with
   the guard that refused it in `detail` (too low, outbid, closed, ended, self-bid).
   Send `Idempotency-Key: <string>` to make a retry safe
-- `GET /ws/auctions/{id}?token=...` — live bid + close events
+- `POST /ws/tickets` (auth) → `{ticket, expires_at}` — single-use, 30s
+- `GET /ws/auctions/{id}?ticket=...` — snapshot, then live bid + close events
 - `GET /health`, `GET /schema` (OpenAPI/Swagger UI)
 
-Auth is `Authorization: Bearer <token>` (query `?token=` for the WebSocket).
+Auth is `Authorization: Bearer <token>`. The WebSocket takes a **ticket** instead, not the
+session token: a browser cannot set headers on a handshake, so the credential travels in the
+URL — where proxies log it, browsers keep it in history and Referer leaks it. A ticket is
+opaque, bound to one user, dead in 30 seconds and spent on first use.
+
+## Realtime
+A socket receives a `snapshot` of the auction as its first message, then live events. The
+subscription starts before the snapshot is read, so an event landing in between is queued
+rather than lost — which also makes the snapshot a handshake: once it arrives, the
+subscription is provably live.
+
+Every event carries a per-auction `seq`, bumped inside the same `UPDATE` that accepts the
+bid or closes the auction. It is what lets a client tell a dropped event from a quiet
+auction, and the server uses it too: a subscriber's queue is capped at 64 with `dropleft`,
+so a consumer that falls behind leaves a hole in the numbering and gets closed with **4408**
+rather than being shown a price that silently skipped a bid. Reconnecting replays the
+snapshot, which is the only way back to correct state.
+
+Events are published through an **outbox** row written in the transaction that caused them,
+so a process dying between the commit and the publish cannot lose one — the closer's tick
+relays anything left unsent, prunes announced rows after a day, and clears spent tickets. Delivery is therefore at-least-once, which is safe only because
+of `seq`: a duplicate is one the client has already seen, and the socket drops it.
 
 ## Anti-snipe
 A bid inside the last **60s** (`SNIPE_WINDOW`) moves the deadline to 60s from the moment it
