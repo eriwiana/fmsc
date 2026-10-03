@@ -47,7 +47,9 @@ async def signup(data: SignupRequest, db_session: AsyncSession) -> TokenResponse
         await db_session.flush()
     except IntegrityError:
         await db_session.rollback()
-        raise ClientException("email already registered")
+        # `from None`: the client is told the email is taken, not handed a chained
+        # traceback about a unique constraint it cannot act on.
+        raise ClientException("email already registered") from None
     return TokenResponse(token=await _issue_token(db_session, user.id))
 
 

@@ -408,6 +408,9 @@ async def run_closer(
     while True:
         try:
             await close_due(session_maker, channels)
-        except Exception:  # noqa: BLE001 — a transient DB error must not kill the loop
+        except Exception:
+            # Blind on purpose: a transient database error must not kill the loop. BLE001
+            # allows it because of the logger.exception call, which is what makes the
+            # swallowed error findable rather than silent.
             logger.exception("closer tick failed")
         await asyncio.sleep(interval)

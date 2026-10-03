@@ -18,25 +18,15 @@ repos:
         # Keep pytest's own convention (test_*.py), not the _test.py default.
         args: ['--pytest-test-first']
       - id: trailing-whitespace
-  - repo: 'https://github.com/PyCQA/isort'
-    rev: 9.0.1
+  - repo: 'https://github.com/astral-sh/ruff-pre-commit'
+    rev: v0.16.10
     hooks:
-      # isort, not reorder-python-imports: the latter strips the blank line after a
-      # module docstring that black then puts back, so the two never converge.
-      - id: isort
-  - repo: 'https://github.com/PyCQA/flake8'
-    rev: 7.3.0
-    hooks:
-      - id: flake8
-        additional_dependencies:
-          - flake8-bugbear
-          - flake8-comprehensions
-          - flake8-simplify
-  - repo: 'https://github.com/psf/black'
-    rev: 26.5.1
-    hooks:
-      # line-length comes from pyproject.toml so a local `black .` matches CI.
-      - id: black
+      # Lint and import order, replacing flake8 + bugbear + comprehensions + simplify
+      # and isort. Rules and settings come from pyproject.toml so a local `ruff check`
+      # matches CI.
+      - id: ruff-check
+        args: ['--fix']
+      - id: ruff-format
   - repo: local
     hooks:
       - id: pytest
