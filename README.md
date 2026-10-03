@@ -32,8 +32,24 @@ lands, so a bid placed too late to be answered cannot win on timing alone. `hard
 fixed when the auction is created at `ends_at + 2h` (`MAX_EXTENSION`), caps the total so an
 auction cannot be extended forever. Both are global constants, not per-auction settings.
 
-Every `bid` event on the WebSocket carries the current `ends_at`, so a watcher's countdown
-follows the extension instead of expiring on a deadline that has already moved.
+Every `bid` and `closed` event on the WebSocket carries the current `ends_at`, so a
+watcher's countdown follows the extension instead of expiring on a deadline that has
+already moved.
+
+## Guardrails
+The invariants the bid path assumes are enforced by the schema, not only by Python —
+`update`, a migration and psql all bypass the handlers:
+
+| Constraint | Rule |
+|---|---|
+| `ck_auctions_ceiling_after_deadline` | `hard_ends_at >= ends_at` |
+| `ck_auctions_status_known` | `status IN ('open', 'closed')` |
+| `ck_auctions_starting_bid_positive` | `starting_bid > 0` |
+| `ck_auctions_current_bid_at_least_starting` | `current_bid IS NULL OR current_bid >= starting_bid` |
+| `ck_bids_amount_positive` | `amount > 0` |
+
+Adding these to a table that already holds a violating row fails the migration, by design:
+a bad money row should be looked at, not silently rewritten.
 
 ## Local dev
 ```bash
@@ -80,6 +96,7 @@ alembic upgrade head
 
 ## Deferred (see plan)
 Redis fan-out (before multi-instance), idempotent retries, payments, reserve prices. Publishing
-is at-most-once: a process that dies between the commit and the channel publish closes an
-auction without telling its watchers, which needs an outbox.
+is at-most-once with no backlog: a process that dies between the commit and the channel publish
+closes an auction without telling its watchers, and a client that subscribes a moment late gets
+nothing. Both want an outbox plus a snapshot on subscribe.
 Each has a clean seam; the bid stays one atomic SQL statement.
