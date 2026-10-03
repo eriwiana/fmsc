@@ -143,6 +143,7 @@ async def get_auction(auction_id: int, db_session: AsyncSession) -> AuctionRespo
 _BID_SQL = text("""
     UPDATE auctions
        SET current_bid = :amount, current_winner_id = :uid, bid_count = bid_count + 1,
+           event_seq = event_seq + 1,
            ends_at = GREATEST(ends_at, LEAST(hard_ends_at, clock_timestamp() + :window))
      WHERE id = :id AND status = 'open' AND ends_at > clock_timestamp()
        AND seller_id <> :uid
@@ -310,6 +311,7 @@ async def place_bid(
             # which is exactly what anti-snipe is meant to prevent. Rendered off the
             # response so the socket and the HTTP reply cannot disagree.
             "ends_at": response.ends_at.isoformat(),
+            "seq": auction.event_seq,
         },
         _channel(auction_id),
     )
@@ -348,7 +350,13 @@ async def auction_ws(
         # lose any event that arrived in between — which is the gap a client reconnecting
         # after a dropout falls into.
         await socket.send_text(
-            msgspec.json.encode({"type": "snapshot", "auction": _to_response(auction)}).decode()
+            msgspec.json.encode(
+                {
+                    "type": "snapshot",
+                    "auction": _to_response(auction),
+                    "seq": auction.event_seq,
+                }
+            ).decode()
         )
         async with subscriber.run_in_background(send):
             while True:
@@ -372,10 +380,10 @@ _CLOSE_SQL = text("""
          WHERE status = 'open' AND ends_at <= clock_timestamp()
            FOR UPDATE SKIP LOCKED
     )
-    UPDATE auctions a SET status = 'closed'
+    UPDATE auctions a SET status = 'closed', event_seq = a.event_seq + 1
       FROM due
      WHERE a.id = due.id
-    RETURNING a.id, a.current_winner_id, a.current_bid, a.ends_at,
+    RETURNING a.id, a.current_winner_id, a.current_bid, a.ends_at, a.event_seq,
               clock_timestamp() - a.ends_at AS late_by
     """)
 
@@ -390,7 +398,7 @@ async def close_due(
     async with session_maker() as session:
         rows = (await session.execute(_CLOSE_SQL)).all()
         await session.commit()
-    for auction_id, winner_id, amount, ends_at, late_by in rows:
+    for auction_id, winner_id, amount, ends_at, seq, late_by in rows:
         # How far past its deadline an auction actually closed. The interval is measured
         # by Postgres, so it covers the poll interval and any time the tick spent queued.
         logger.info(
@@ -405,6 +413,7 @@ async def close_due(
                 # Same key and same rendering as the bid event, so the two events
                 # describing one auction do not disagree about its shape.
                 "ends_at": ends_at.astimezone(APP_TZ).isoformat(),
+                "seq": seq,
             },
             _channel(auction_id),
         )

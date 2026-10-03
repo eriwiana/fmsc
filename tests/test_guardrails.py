@@ -18,9 +18,9 @@ from sqlalchemy.exc import IntegrityError
 
 INSERT_AUCTION = text("""
     INSERT INTO auctions (title, seller_id, starting_bid, current_bid, bid_count, status,
-                          starts_at, ends_at, hard_ends_at, created_at, updated_at)
+                          starts_at, ends_at, hard_ends_at, event_seq, created_at, updated_at)
     VALUES ('t', :seller, :starting_bid, :current_bid, :bid_count, :status,
-            now(), :ends_at, :hard_ends_at, now(), now())
+            now(), :ends_at, :hard_ends_at, 0, now(), now())
     """)
 
 
@@ -99,8 +99,9 @@ async def test_a_non_positive_bid_amount_is_rejected(sm):
             await s.execute(
                 text(
                     "INSERT INTO auctions (title, seller_id, starting_bid, bid_count, status,"
-                    " starts_at, ends_at, hard_ends_at, created_at, updated_at)"
-                    " VALUES ('t', :seller, 10.00, 0, 'open', now(), :ends_at, :hard, now(), now())"
+                    " starts_at, ends_at, hard_ends_at, event_seq, created_at, updated_at)"
+                    " VALUES ('t', :seller, 10.00, 0, 'open', now(), :ends_at, :hard, 0,"
+                    " now(), now())"
                     " RETURNING id"
                 ),
                 {"seller": seller, "ends_at": ends_at, "hard": ends_at + timedelta(hours=2)},

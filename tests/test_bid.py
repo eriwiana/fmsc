@@ -304,6 +304,25 @@ async def _post_bid(sm, aid: int, uid: int, amount: str, key: str | None, channe
         )
 
 
+async def test_every_event_on_an_auction_is_numbered_in_order(sm, channels):
+    """M5 criterion 2. A client cannot tell a missed bid from a quiet auction unless the
+    events are numbered: three bids give three consecutive numbers, so dropping the middle
+    one leaves a hole visible from the numbers alone, with no other state to compare."""
+    _, bidder, aid = await _seed(sm)
+    second = await _add_bidder(sm, "second@x.com")
+    third = await _add_bidder(sm, "third@x.com")
+
+    for uid, amount in ((bidder, "10.00"), (second, "11.00"), (third, "12.00")):
+        await _post_bid(sm, aid, uid, amount, None, channels)
+
+    assert [event["seq"] for _, event in channels.published] == [1, 2, 3]
+
+    # What a client actually does with them: the middle event never arrives, and the jump
+    # from 1 to 3 is the whole signal that something was missed.
+    delivered = [channels.published[0][1]["seq"], channels.published[2][1]["seq"]]
+    assert delivered[1] - delivered[0] > 1
+
+
 async def test_a_retry_replays_rather_than_being_told_it_was_outbid(sm, channels):
     """M4 criterion 1 at the handler, sequentially — what a client does after a timeout.
 

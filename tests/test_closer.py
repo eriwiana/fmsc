@@ -67,6 +67,18 @@ async def _add_bidder(maker) -> int:
         return bidder.id
 
 
+async def test_the_close_event_continues_the_same_numbering(sm, channels):
+    """M5 criterion 2 across both publishers. The close is the last event a watcher sees;
+    numbered from a different counter it would read as a gap, or worse as a replay."""
+    aid, _ = await _seed_with_winner(sm)
+
+    assert await close_due(sm, channels) == 1
+
+    ((_, event),) = channels.published
+    # _seed_with_winner placed one bid, so that was seq 1 and the close is seq 2.
+    assert event["seq"] == 2
+
+
 async def test_closer_does_not_fire_on_an_auction_a_late_bid_extended(sm, channels):
     """M3's exit criterion, with the closer genuinely running.
 
@@ -130,6 +142,7 @@ async def test_publishes_the_winner_on_the_auction_channel(sm, channels):
                 "winner_id": uid,
                 "amount": "25.00",
                 "ends_at": ends_at.astimezone(APP_TZ).isoformat(),
+                "seq": 2,
             },
         )
     ]
@@ -150,6 +163,8 @@ async def test_publishes_a_close_with_no_bids(sm, channels):
                 "winner_id": None,
                 "amount": None,
                 "ends_at": ends_at.astimezone(APP_TZ).isoformat(),
+                # No bids, so the close is the auction's first event.
+                "seq": 1,
             },
         )
     ]

@@ -48,6 +48,11 @@ class Auction(BigIntAuditBase):
     # The latest ends_at may ever be extended to. Fixed when the auction is created:
     # without a ceiling, two bidders trading bids inside the window keep it open forever.
     hard_ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # Counts events published about this auction. Bumped inside the same UPDATE that
+    # accepts a bid or closes the auction, so the number cannot be handed out twice or
+    # skipped — a client that sees 1 then 3 knows it missed one, which is the only way to
+    # tell a dropped event from a quiet auction.
+    event_seq: Mapped[int] = mapped_column(default=0)
 
     # Guardrails, not belt-and-braces: `update`, a data migration and psql all bypass the
     # Python checks in create_auction and _BID_SQL. A bid is a money path, so the table
@@ -67,6 +72,7 @@ class Auction(BigIntAuditBase):
             "current_bid IS NULL OR current_bid >= starting_bid",
             name="current_bid_at_least_starting",
         ),
+        CheckConstraint("event_seq >= 0", name="event_seq_not_negative"),
     )
 
 

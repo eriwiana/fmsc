@@ -101,6 +101,9 @@ def test_a_socket_receives_a_snapshot_before_any_event(clean_db):
 
     assert snapshot["type"] == "snapshot"
     assert snapshot["auction"] == current
+    # The number the client resumes from: without it, the first live event's seq could be
+    # 1 or 500 and the client has no way to know whether it missed anything.
+    assert snapshot["seq"] == 1
 
 
 def test_a_watcher_receives_a_bid_over_a_real_socket(clean_db):
