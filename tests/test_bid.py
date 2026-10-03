@@ -177,7 +177,11 @@ async def test_bid_on_closed_auction_rejected(sm):
 
 
 async def test_bid_on_ended_auction_rejected(sm):
-    _, bidder, aid = await _seed(sm, ends_delta=timedelta(seconds=-1))  # already past deadline
+    # -5s, not -1s: ends_at is computed here and compared against Postgres'
+    # clock_timestamp(), so a one-second margin is close enough to the boundary for the
+    # two clocks to disagree and the bid to be accepted. That is the likeliest
+    # explanation for this test failing once, unreproducibly, during M4.
+    _, bidder, aid = await _seed(sm, ends_delta=timedelta(seconds=-5))
     async with sm() as s:
         assert await place_bid_tx(s, aid, bidder, Decimal("10.00")) is None
 
@@ -534,7 +538,7 @@ async def test_reason_names_a_closed_auction(sm):
 
 
 async def test_reason_names_an_ended_auction(sm):
-    _, bidder, aid = await _seed(sm, ends_delta=timedelta(seconds=-1))
+    _, bidder, aid = await _seed(sm, ends_delta=timedelta(seconds=-5))
     assert await _reason(sm, aid, bidder) == "auction has ended"
 
 

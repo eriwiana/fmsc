@@ -20,7 +20,10 @@ from app.models import Auction, User
 # deadline and no bidder, which is the opposite of what the bid tests need.
 
 
-async def _seed(maker, ends_delta: timedelta = timedelta(seconds=-1)) -> int:
+# -5s rather than -1s: the deadline is computed here and compared against Postgres'
+# clock_timestamp(), and a one-second margin is close enough to the boundary that the two
+# clocks can disagree about which side of it the auction is on.
+async def _seed(maker, ends_delta: timedelta = timedelta(seconds=-5)) -> int:
     async with maker() as s:
         seller = User(email="seller@x.com", pw_hash="x")
         s.add(seller)
@@ -47,7 +50,7 @@ async def _seed_with_winner(maker) -> tuple[int, int]:
         assert await place_bid_tx(s, aid, uid, Decimal("25.00")) is not None
     async with maker() as s:
         await s.execute(
-            text("UPDATE auctions SET ends_at = now() - interval '1 second' WHERE id = :id"),
+            text("UPDATE auctions SET ends_at = now() - interval '5 seconds' WHERE id = :id"),
             {"id": aid},
         )
         await s.commit()
@@ -244,7 +247,11 @@ async def test_logs_how_late_each_close_was(sm, channels, caplog):
         await close_due(sm, channels)
     record = next(r for r in caplog.records if r.msg.startswith("closed auction"))
     _, late = record.args
-    assert 5 <= late < 15  # it ended 5s ago; anything near zero means it is not measured
+    # It ended 5s ago. The margin is for clock precision, not for slack: ends_at is
+    # computed by Python and late_by is measured by Postgres, so a bound of exactly 5
+    # fails whenever the two clocks disagree by a hair. Anything near zero still means
+    # the interval is not being measured at all, which is what this guards.
+    assert 4.5 <= late < 15
 
 
 async def test_a_failing_tick_says_why(sm, channels, caplog):
