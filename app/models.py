@@ -4,7 +4,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from advanced_alchemy.base import BigIntAuditBase, BigIntBase
-from sqlalchemy import DateTime, ForeignKey, Index, Numeric, String, func
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Numeric, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 # Money is Numeric(12,2), never float. Max ~9.9 billion per bid, plenty.
@@ -39,7 +39,25 @@ class Auction(BigIntAuditBase):
     # without a ceiling, two bidders trading bids inside the window keep it open forever.
     hard_ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
-    __table_args__ = (Index("ix_auctions_status_ends_at", "status", "ends_at"),)
+    # Guardrails, not belt-and-braces: `update`, a data migration and psql all bypass the
+    # Python checks in create_auction and _BID_SQL. A bid is a money path, so the table
+    # refuses a bad row rather than trusting every writer to be careful.
+    __table_args__ = (
+        Index("ix_auctions_status_ends_at", "status", "ends_at"),
+        # The bid clamps ends_at to hard_ends_at. A ceiling before the deadline is the one
+        # shape where that clamp would shorten an auction instead of extending it. Equal is
+        # allowed: an auction that may not be extended at all is legitimate.
+        CheckConstraint("hard_ends_at >= ends_at", name="ceiling_after_deadline"),
+        # Both the bid guard and the closer read status. A typo'd value makes an auction
+        # unbiddable and uncloseable at once, and nothing would report it.
+        CheckConstraint("status IN ('open', 'closed')", name="status_known"),
+        CheckConstraint("starting_bid > 0", name="starting_bid_positive"),
+        # An accepted bid below the advertised price.
+        CheckConstraint(
+            "current_bid IS NULL OR current_bid >= starting_bid",
+            name="current_bid_at_least_starting",
+        ),
+    )
 
 
 class Bid(BigIntAuditBase):
@@ -47,3 +65,6 @@ class Bid(BigIntAuditBase):
     auction_id: Mapped[int] = mapped_column(ForeignKey("auctions.id"), index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     amount: Mapped[Decimal] = mapped_column(Money)
+
+    # The history row is what a settlement would be computed from.
+    __table_args__ = (CheckConstraint("amount > 0", name="amount_positive"),)

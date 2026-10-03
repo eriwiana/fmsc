@@ -125,6 +125,11 @@ async def get_auction(auction_id: int, db_session: AsyncSession) -> AuctionRespo
 # GREATEST is outermost so the deadline is never pulled backwards; LEAST caps it at the
 # ceiling; outside the window ends_at already wins, so nothing moves.
 #
+# ck_auctions_ceiling_after_deadline is what guarantees the first of those: with
+# hard_ends_at >= ends_at enforced, the two nestings are algebraically identical, so no
+# test can tell them apart. The ordering stays as written because it is still the correct
+# one if that constraint is ever dropped.
+#
 # WHERE still reads the pre-update ends_at, so a bid that arrives after the deadline loses
 # rather than extending its way back in.
 _BID_SQL = text("""

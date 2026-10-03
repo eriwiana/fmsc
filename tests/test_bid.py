@@ -317,18 +317,6 @@ async def test_extension_stops_at_the_hard_ceiling(sm):
     assert await _deadline(sm, aid) == ceiling
 
 
-async def test_extension_never_pulls_a_deadline_backwards(sm):
-    """A row whose ceiling sits before its own deadline must keep the deadline it has.
-    Clamping to the ceiling unconditionally would end such an auction on the next bid."""
-    _, bidder, aid = await _seed(
-        sm, ends_delta=timedelta(seconds=30), extension=timedelta(seconds=-600)
-    )
-    before = await _deadline(sm, aid)
-    async with sm() as s:
-        assert await place_bid_tx(s, aid, bidder, Decimal("10.00")) is not None
-    assert await _deadline(sm, aid) == before
-
-
 async def test_the_bid_and_its_extension_are_one_statement(sm):
     """The deadline has to move in the very UPDATE that accepts the bid.
 
