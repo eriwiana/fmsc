@@ -18,6 +18,7 @@ from app.auctions import (
     MAX_BID,
     MAX_EXTENSION,
     SNIPE_WINDOW,
+    _to_response,
     create_auction,
     place_bid_tx,
     reject_reason,
@@ -138,6 +139,9 @@ async def test_accepted_bid_returns_the_row_it_wrote(sm):
     assert row.current_bid == Decimal("12.50")
     assert row.current_winner_id == bidder
     assert row.bid_count == 1
+    # The handler renders this same row. hard_ends_at is read straight off it, so a
+    # RETURNING that stopped yielding the column would 500 every accepted bid.
+    assert _to_response(row).hard_ends_at == row.hard_ends_at.astimezone(APP_TZ)
 
 
 async def test_rejected_bid_writes_no_history_row(sm):
