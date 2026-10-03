@@ -337,12 +337,22 @@ async def auction_ws(
     # handler's database session are held for the life of the process.
     #
     # The client is not expected to send anything; whatever arrives is discarded.
-    async with (
-        channels.start_subscription(_channel(auction_id)) as subscriber,
-        subscriber.run_in_background(send),
-    ):
-        while True:
-            await socket.receive()
+    async with channels.start_subscription(_channel(auction_id)) as subscriber:
+        auction = await db_session.get(Auction, auction_id)
+        if auction is None:
+            await socket.close(code=4404)
+            return
+        # Order matters, and it is the whole point of the snapshot. The subscription is
+        # already live, so a bid landing from here on is queued; the snapshot goes out
+        # before anything drains that queue. Snapshot first and subscribe second would
+        # lose any event that arrived in between — which is the gap a client reconnecting
+        # after a dropout falls into.
+        await socket.send_text(
+            msgspec.json.encode({"type": "snapshot", "auction": _to_response(auction)}).decode()
+        )
+        async with subscriber.run_in_background(send):
+            while True:
+                await socket.receive()
 
 
 # SKIP LOCKED so a second instance is not stuck behind the first. Without it the closers

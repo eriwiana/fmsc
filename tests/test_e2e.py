@@ -1,5 +1,8 @@
 """End-to-end paths through the real app: signup, create, subscribe, bid, receive.
 
+Every socket read passes a timeout. Without one, a message the server never sends makes
+the test hang instead of fail, which costs a killed run to notice rather than a red line.
+
 Every other test calls the handlers directly. This is the only one that proves routing,
 bearer auth, the websocket's token check and the channels fan-out are wired to each other
 — and the only one where a real socket receives a real event.
@@ -16,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -35,6 +37,9 @@ if PG_URL.startswith("postgresql://"):
     PG_URL = PG_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
 PASSWORD = "correct horse battery staple"
+# Long enough for a real handler, short enough that a message that never arrives fails
+# the test rather than hanging the run.
+READ_TIMEOUT = 5.0
 
 
 @pytest.fixture
@@ -73,6 +78,31 @@ def _open_auction(client: TestClient, seller_token: str) -> int:
     return response.json()["id"]
 
 
+def test_a_socket_receives_a_snapshot_before_any_event(clean_db):
+    """M5 criterion 1. A client joining mid-auction currently gets nothing until the next
+    bid, so it cannot render a price at all. The snapshot has to arrive before live events
+    and has to agree with what the HTTP endpoint would have said."""
+    with TestClient(app=app) as client:
+        seller = _signup(client, "seller@x.com")
+        watcher = _signup(client, "watcher@x.com")
+        bidder = _signup(client, "bidder@x.com")
+        auction_id = _open_auction(client, seller)
+        placed = client.post(
+            f"/auctions/{auction_id}/bids",
+            headers={"Authorization": f"Bearer {bidder}"},
+            json={"amount": "12.00"},
+        )
+        assert placed.status_code == 201, placed.text
+
+        with client.websocket_connect(f"/ws/auctions/{auction_id}?token={watcher}") as socket:
+            snapshot = socket.receive_json(timeout=READ_TIMEOUT)
+
+        current = client.get(f"/auctions/{auction_id}").json()
+
+    assert snapshot["type"] == "snapshot"
+    assert snapshot["auction"] == current
+
+
 def test_a_watcher_receives_a_bid_over_a_real_socket(clean_db):
     with TestClient(app=app) as client:
         seller = _signup(client, "seller@x.com")
@@ -82,11 +112,10 @@ def test_a_watcher_receives_a_bid_over_a_real_socket(clean_db):
         auction_id = _open_auction(client, seller)
 
         with client.websocket_connect(f"/ws/auctions/{auction_id}?token={watcher}") as socket:
-            # The handler accepts, then checks the token, then subscribes. Publishing is
-            # at-most-once with no backlog, so a bid landing before that subscription is
-            # live is simply lost — the gap the README records under Deferred. Give the
-            # handler that moment rather than racing it.
-            time.sleep(0.3)
+            # The snapshot is the handshake: once it has arrived the subscription is live,
+            # so there is no window left to race and no sleep needed. Before the snapshot
+            # existed this test had to guess at 0.3s.
+            assert socket.receive_json(timeout=READ_TIMEOUT)["type"] == "snapshot"
 
             placed = client.post(
                 f"/auctions/{auction_id}/bids",
@@ -94,7 +123,7 @@ def test_a_watcher_receives_a_bid_over_a_real_socket(clean_db):
                 json={"amount": "12.00"},
             )
             assert placed.status_code == 201, placed.text
-            event = socket.receive_json()
+            event = socket.receive_json(timeout=READ_TIMEOUT)
 
     assert event["type"] == "bid"
     assert event["auction_id"] == auction_id
@@ -154,5 +183,5 @@ def test_a_socket_without_a_valid_token_is_closed(clean_db):
         client.websocket_connect("/ws/auctions/1?token=not-a-real-token") as socket,
         pytest.raises(WebSocketDisconnect) as closed,
     ):
-        socket.receive()
+        socket.receive(timeout=READ_TIMEOUT)
     assert closed.value.code == 4401
