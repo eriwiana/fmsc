@@ -13,7 +13,7 @@ from decimal import Decimal
 
 from sqlalchemy import text
 
-from app.auctions import MAX_EXTENSION, close_due, place_bid_tx, run_closer
+from app.auctions import APP_TZ, MAX_EXTENSION, close_due, place_bid_tx, run_closer
 from app.models import Auction, User
 
 # Its own seeder rather than the bid suite's: these want an auction already past its
@@ -115,12 +115,22 @@ async def test_leaves_an_auction_before_its_deadline_open(sm, channels):
 
 
 async def test_publishes_the_winner_on_the_auction_channel(sm, channels):
+    """Whole-dict equality on purpose: a key silently added or dropped from an event a
+    client parses should fail here. ends_at uses the same key and rendering as the bid
+    event, so the two events describing one auction agree about its shape."""
     aid, uid = await _seed_with_winner(sm)
+    ends_at = await _deadline(sm, aid)
     await close_due(sm, channels)
     assert channels.published == [
         (
             f"auction:{aid}",
-            {"type": "closed", "auction_id": aid, "winner_id": uid, "amount": "25.00"},
+            {
+                "type": "closed",
+                "auction_id": aid,
+                "winner_id": uid,
+                "amount": "25.00",
+                "ends_at": ends_at.astimezone(APP_TZ).isoformat(),
+            },
         )
     ]
 
@@ -129,9 +139,19 @@ async def test_publishes_a_close_with_no_bids(sm, channels):
     """Nobody bid. The auction still closes, and the event says so rather than
     carrying a zero that would read as a sale."""
     aid = await _seed(sm)
+    ends_at = await _deadline(sm, aid)
     await close_due(sm, channels)
     assert channels.published == [
-        (f"auction:{aid}", {"type": "closed", "auction_id": aid, "winner_id": None, "amount": None})
+        (
+            f"auction:{aid}",
+            {
+                "type": "closed",
+                "auction_id": aid,
+                "winner_id": None,
+                "amount": None,
+                "ends_at": ends_at.astimezone(APP_TZ).isoformat(),
+            },
+        )
     ]
 
 

@@ -264,7 +264,7 @@ _CLOSE_SQL = text("""
     UPDATE auctions a SET status = 'closed'
       FROM due
      WHERE a.id = due.id
-    RETURNING a.id, a.current_winner_id, a.current_bid,
+    RETURNING a.id, a.current_winner_id, a.current_bid, a.ends_at,
               clock_timestamp() - a.ends_at AS late_by
     """)
 
@@ -279,7 +279,7 @@ async def close_due(
     async with session_maker() as session:
         rows = (await session.execute(_CLOSE_SQL)).all()
         await session.commit()
-    for auction_id, winner_id, amount, late_by in rows:
+    for auction_id, winner_id, amount, ends_at, late_by in rows:
         # How far past its deadline an auction actually closed. The interval is measured
         # by Postgres, so it covers the poll interval and any time the tick spent queued.
         logger.info(
@@ -291,6 +291,9 @@ async def close_due(
                 "auction_id": auction_id,
                 "winner_id": winner_id,
                 "amount": str(amount) if amount is not None else None,
+                # Same key and same rendering as the bid event, so the two events
+                # describing one auction do not disagree about its shape.
+                "ends_at": ends_at.astimezone(APP_TZ).isoformat(),
             },
             _channel(auction_id),
         )
