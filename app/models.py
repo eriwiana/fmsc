@@ -4,7 +4,17 @@ from datetime import datetime
 from decimal import Decimal
 
 from advanced_alchemy.base import BigIntAuditBase, BigIntBase
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Numeric, String, func
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 # Money is Numeric(12,2), never float. Max ~9.9 billion per bid, plenty.
@@ -65,6 +75,29 @@ class Bid(BigIntAuditBase):
     auction_id: Mapped[int] = mapped_column(ForeignKey("auctions.id"), index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     amount: Mapped[Decimal] = mapped_column(Money)
+    # Idempotency. The key is the client's; `response` is the body the first attempt
+    # returned, so a retry replays it instead of being told it outbid itself.
+    #
+    # ponytail: both live on the bid row rather than in their own table, because the row is
+    # already keyed by (auction_id, user_id) and is written in the same transaction as the
+    # money. Give them a table of their own when a second endpoint needs keys.
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    response: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # The history row is what a settlement would be computed from.
-    __table_args__ = (CheckConstraint("amount > 0", name="amount_positive"),)
+    __table_args__ = (
+        # The history row is what a settlement would be computed from.
+        CheckConstraint("amount > 0", name="amount_positive"),
+        # The whole dedupe. No application-level "have I seen this key" test, which would
+        # lose the race between two retries arriving together. NULLs are not equal in
+        # Postgres, so bids without a key are unaffected. Name spelled in full because the
+        # uq convention does not prefix an explicit one; `alembic check` catches that.
+        UniqueConstraint(
+            "auction_id",
+            "user_id",
+            "idempotency_key",
+            name="uq_bids_auction_user_idempotency_key",
+        ),
+        CheckConstraint(
+            "(idempotency_key IS NULL) = (response IS NULL)", name="key_and_response_together"
+        ),
+    )
