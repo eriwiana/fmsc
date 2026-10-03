@@ -1,4 +1,4 @@
-"""One end-to-end path through the real app: signup, create, subscribe, bid, receive.
+"""End-to-end paths through the real app: signup, create, subscribe, bid, receive.
 
 Every other test calls the handlers directly. This is the only one that proves routing,
 bearer auth, the websocket's token check and the channels fan-out are wired to each other
@@ -97,6 +97,35 @@ def test_a_watcher_receives_a_bid_over_a_real_socket(clean_db):
     assert event["amount"] == "12.00"
     # The socket and the HTTP reply agree, which is what lets a watcher trust the deadline.
     assert event["ends_at"] == placed.json()["ends_at"]
+
+
+def test_a_rejected_bid_answers_400_with_the_reason(clean_db):
+    """Through the real app, because this is where it broke. place_bid_tx rolls back on
+    rejection, which expires current_user, so the handler's own read of current_user.id
+    attempted a lazy reload and every rejected bid answered 500 with no reason in it —
+    outbid, too low, closed, self-bid, all of them. No unit test could see it: the fixture
+    session and the request session expire alike, but only a real request shows the status
+    code the bidder is actually handed."""
+    with TestClient(app=app) as client:
+        seller = _signup(client, "seller@x.com")
+        bidder = _signup(client, "bidder@x.com")
+        created = client.post(
+            "/auctions",
+            headers={"Authorization": f"Bearer {seller}"},
+            json={
+                "title": "t",
+                "starting_bid": "10.00",
+                "ends_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+            },
+        )
+        rejected = client.post(
+            f"/auctions/{created.json()['id']}/bids",
+            headers={"Authorization": f"Bearer {bidder}"},
+            json={"amount": "9.99"},
+        )
+
+    assert rejected.status_code == 400, rejected.text
+    assert rejected.json()["detail"] == "bid must be at least 10.00"
 
 
 def test_a_socket_without_a_valid_token_is_closed(clean_db):

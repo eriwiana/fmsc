@@ -205,18 +205,21 @@ async def place_bid(
     db_session: AsyncSession,
     channels: ChannelsPlugin,
 ) -> AuctionResponse:
-    auction = await place_bid_tx(db_session, auction_id, current_user.id, data.amount)
+    # Read the id before the bid runs. place_bid_tx rolls back on rejection, and a rollback
+    # expires every instance in the session regardless of expire_on_commit — so touching
+    # current_user afterwards attempts a lazy reload, which raises MissingGreenlet inside an
+    # async session and turns every rejected bid into a 500 with no reason in it.
+    user_id = current_user.id
+    auction = await place_bid_tx(db_session, auction_id, user_id, data.amount)
     if auction is None:
-        raise ClientException(
-            await reject_reason(db_session, auction_id, current_user.id, data.amount)
-        )
+        raise ClientException(await reject_reason(db_session, auction_id, user_id, data.amount))
     response = _to_response(auction)
     channels.publish(
         {
             "type": "bid",
             "auction_id": auction_id,
             "amount": str(data.amount),
-            "winner_id": current_user.id,
+            "winner_id": user_id,
             "bid_count": auction.bid_count,
             # A bid inside the window moves the deadline. Without it here, a watcher's
             # countdown runs out on a deadline that no longer exists and they stop bidding,

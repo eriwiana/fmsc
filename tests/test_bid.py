@@ -11,6 +11,8 @@ import random
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+import pytest
+from litestar.exceptions import ClientException
 from sqlalchemy import event, text
 
 from app.auctions import (
@@ -290,6 +292,30 @@ async def test_bid_event_tells_watchers_the_new_deadline(sm, channels):
     # The same rendering the response uses, so a client needs no second request.
     assert event["ends_at"] == response.ends_at.isoformat()
     assert datetime.fromisoformat(event["ends_at"]) > before
+
+
+async def test_a_rejected_bid_says_why_and_publishes_nothing(sm, channels):
+    """The handler's reject path. The bidder is told which guard refused the bid, and no
+    event goes out — a rejected bid that published would move every watcher's countdown
+    and show a leader who does not exist."""
+    _, bidder, aid = await _seed(sm, ends_delta=timedelta(seconds=30))
+    before = await _deadline(sm, aid)
+
+    async with sm() as s:
+        user = await s.get(User, bidder)
+        with pytest.raises(ClientException) as rejected:
+            await place_bid.fn(
+                auction_id=aid,
+                data=BidRequest(amount=Decimal("9.99")),
+                current_user=user,
+                db_session=s,
+                channels=channels,
+            )
+
+    assert rejected.value.detail == "bid must be at least 10.00"
+    assert channels.published == []
+    # The deadline is untouched too: a refused bid must not buy the bidder more time.
+    assert await _deadline(sm, aid) == before
 
 
 async def test_bid_outside_the_window_leaves_the_deadline_alone(sm):

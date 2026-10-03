@@ -20,7 +20,8 @@ Jakarta wall time, responses render `+07:00`. Process runs with `TZ=Asia/Jakarta
   latest the auction can possibly end once anti-snipe extensions are accounted for
 - `GET /auctions`, `GET /auctions/{id}`
 - `POST /auctions/{id}/bids` (auth) — `{amount}`; atomic, highest-wins, extends the
-  deadline when it lands inside the anti-snipe window
+  deadline when it lands inside the anti-snipe window. A refused bid answers **400** with
+  the guard that refused it in `detail` (too low, outbid, closed, ended, self-bid)
 - `GET /ws/auctions/{id}?token=...` — live bid + close events
 - `GET /health`, `GET /schema` (OpenAPI/Swagger UI)
 
