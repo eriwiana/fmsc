@@ -59,23 +59,27 @@ def _signup(client: TestClient, email: str) -> str:
     return response.json()["token"]
 
 
+def _open_auction(client: TestClient, seller_token: str) -> int:
+    response = client.post(
+        "/auctions",
+        headers={"Authorization": f"Bearer {seller_token}"},
+        json={
+            "title": "t",
+            "starting_bid": "10.00",
+            "ends_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        },
+    )
+    assert response.status_code == 201, response.text
+    return response.json()["id"]
+
+
 def test_a_watcher_receives_a_bid_over_a_real_socket(clean_db):
     with TestClient(app=app) as client:
         seller = _signup(client, "seller@x.com")
         watcher = _signup(client, "watcher@x.com")
         bidder = _signup(client, "bidder@x.com")
 
-        created = client.post(
-            "/auctions",
-            headers={"Authorization": f"Bearer {seller}"},
-            json={
-                "title": "t",
-                "starting_bid": "10.00",
-                "ends_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
-            },
-        )
-        assert created.status_code == 201, created.text
-        auction_id = created.json()["id"]
+        auction_id = _open_auction(client, seller)
 
         with client.websocket_connect(f"/ws/auctions/{auction_id}?token={watcher}") as socket:
             # The handler accepts, then checks the token, then subscribes. Publishing is
@@ -109,23 +113,37 @@ def test_a_rejected_bid_answers_400_with_the_reason(clean_db):
     with TestClient(app=app) as client:
         seller = _signup(client, "seller@x.com")
         bidder = _signup(client, "bidder@x.com")
-        created = client.post(
-            "/auctions",
-            headers={"Authorization": f"Bearer {seller}"},
-            json={
-                "title": "t",
-                "starting_bid": "10.00",
-                "ends_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
-            },
-        )
+        auction_id = _open_auction(client, seller)
         rejected = client.post(
-            f"/auctions/{created.json()['id']}/bids",
+            f"/auctions/{auction_id}/bids",
             headers={"Authorization": f"Bearer {bidder}"},
             json={"amount": "9.99"},
         )
 
     assert rejected.status_code == 400, rejected.text
     assert rejected.json()["detail"] == "bid must be at least 10.00"
+
+
+def test_a_retried_bid_replays_the_original_response(clean_db):
+    """M4 criterion 1. A client whose connection drops after the bid landed retries it.
+    The second request must not place a second bid, and must hand back what the first one
+    returned rather than a 400 saying the bidder has been outbid by themselves."""
+    with TestClient(app=app) as client:
+        seller = _signup(client, "seller@x.com")
+        bidder = _signup(client, "bidder@x.com")
+        auction_id = _open_auction(client, seller)
+        headers = {"Authorization": f"Bearer {bidder}", "Idempotency-Key": "retry-me"}
+        body = {"amount": "12.00"}
+
+        first = client.post(f"/auctions/{auction_id}/bids", headers=headers, json=body)
+        second = client.post(f"/auctions/{auction_id}/bids", headers=headers, json=body)
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+    # Bytes, not parsed JSON: the criterion is that the client is handed exactly what it
+    # was handed the first time, key order and number formatting included.
+    assert second.content == first.content
+    assert first.json()["bid_count"] == 1
 
 
 def test_a_socket_without_a_valid_token_is_closed(clean_db):
