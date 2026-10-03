@@ -47,7 +47,45 @@ snapshot, which is the only way back to correct state.
 
 Events are published through an **outbox** row written in the transaction that caused them,
 so a process dying between the commit and the publish cannot lose one — the closer's tick
-relays anything left unsent, prunes announced rows after a day, and clears spent tickets. Delivery is therefore at-least-once, which is safe only because
+relays anything left unsent, prunes announced rows after a day, and clears spent tickets.
+
+### Scaling out
+`CHANNELS_URL` picks the fan-out backend, and it is the only change needed to run more than
+one process. Unset, the backend is in-memory and a bid accepted by one process reaches only
+the sockets that process holds.
+
+| `CHANNELS_URL` | Backend |
+|---|---|
+| unset | in-memory, single instance |
+| `redis://…` | Redis pub/sub |
+| `postgresql://…` | Postgres `LISTEN`/`NOTIFY`, no extra service |
+
+The Postgres option needs nothing you are not already running. `NOTIFY` caps a payload at
+8000 bytes; these events are a few hundred. An unsupported scheme fails at startup rather
+than falling back to memory, because a typo there would leave every instance announcing
+only to its own sockets — which looks exactly like a quiet auction.
+
+Measured on one machine, 500 sockets on one auction, five bids each. Every backend
+delivered 2500 of 2500 events with no watcher failing. Timings are from the bid being sent
+to a watcher seeing it:
+
+| Backend | p50 | p95 | max | vs the bidder's own reply | DB connections |
+|---|---|---|---|---|---|
+| memory | 55 ms | 66 ms | 70 ms | −8 ms | 2 → 6 |
+| Redis | 49 ms | 78 ms | 81 ms | −6 ms | 2 → 6 |
+| Postgres | 75 ms | 90 ms | 93 ms | **+44 ms** | 3 → 7 |
+
+The last column is the interesting one. On memory and Redis the watchers see the bid
+*before* the bidder gets their own 201, because the handler publishes before it serialises
+the reply. On `LISTEN`/`NOTIFY` they see it after, because NOTIFY only fires when the
+transaction commits and the listening connection then has to be woken. Either is fine for
+an auction; neither is obvious until measured.
+
+500 sockets add four connections, not five hundred — the handler releases its session once
+the snapshot is sent.
+
+Re-run it with `uv run python scripts/load_sockets.py --sockets 500`. It is not part of the
+test suite: 500 sockets on a shared CI runner measures the runner. Delivery is therefore at-least-once, which is safe only because
 of `seq`: a duplicate is one the client has already seen, and the socket drops it.
 
 ## Anti-snipe
