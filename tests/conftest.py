@@ -30,7 +30,11 @@ async def sm():
     engine = create_async_engine(PG_URL, poolclass=NullPool)
     maker = async_sessionmaker(engine, expire_on_commit=False)
     async with maker() as s:
-        await s.execute(text("TRUNCATE bids, auctions, sessions, users RESTART IDENTITY CASCADE"))
+        await s.execute(
+            text(
+                "TRUNCATE outbox, bids, auctions, ws_tickets, sessions, users RESTART IDENTITY CASCADE"
+            )
+        )
         await s.commit()
     yield maker
     await engine.dispose()

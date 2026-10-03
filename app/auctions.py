@@ -17,12 +17,12 @@ from litestar.exceptions import (
     NotFoundException,
 )
 from litestar.status_codes import HTTP_409_CONFLICT
-from sqlalchemy import Row, select, text
+from sqlalchemy import Row, bindparam, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.auth import provide_current_user, user_for_token
-from app.models import Auction, Bid, User
+from app.auth import provide_current_user, purge_expired_tickets, user_for_ticket
+from app.models import Auction, Bid, Outbox, User
 from app.schemas import AuctionResponse, BidRequest, CreateAuctionRequest
 
 _authed = {"current_user": Provide(provide_current_user)}
@@ -143,6 +143,7 @@ async def get_auction(auction_id: int, db_session: AsyncSession) -> AuctionRespo
 _BID_SQL = text("""
     UPDATE auctions
        SET current_bid = :amount, current_winner_id = :uid, bid_count = bid_count + 1,
+           event_seq = event_seq + 1,
            ends_at = GREATEST(ends_at, LEAST(hard_ends_at, clock_timestamp() + :window))
      WHERE id = :id AND status = 'open' AND ends_at > clock_timestamp()
        AND seller_id <> :uid
@@ -157,6 +158,99 @@ _BID_SQL = text("""
 IDEMPOTENCY_HEADER = "Idempotency-Key"
 MAX_IDEMPOTENCY_KEY = 128
 _IDEMPOTENCY_CONSTRAINT = "uq_bids_auction_user_idempotency_key"
+
+
+def _bid_event(row: Row, amount: Decimal) -> dict:
+    """Built from the row the bid wrote, so the stored copy and the live one cannot drift."""
+    return {
+        "type": "bid",
+        "auction_id": row.id,
+        "amount": str(amount),
+        "winner_id": row.current_winner_id,
+        "bid_count": row.bid_count,
+        "ends_at": row.ends_at.astimezone(APP_TZ).isoformat(),
+        "seq": row.event_seq,
+    }
+
+
+def _closed_event(row: Row) -> dict:
+    return {
+        "type": "closed",
+        "auction_id": row.id,
+        "winner_id": row.current_winner_id,
+        "amount": str(row.current_bid) if row.current_bid is not None else None,
+        "ends_at": row.ends_at.astimezone(APP_TZ).isoformat(),
+        "seq": row.event_seq,
+    }
+
+
+def _owed(row: Row, event: dict) -> Outbox:
+    return Outbox(auction_id=row.id, seq=row.event_seq, payload=msgspec.json.encode(event).decode())
+
+
+_MARK_SENT_SQL = text(
+    "UPDATE outbox SET sent_at = clock_timestamp() WHERE auction_id = :aid AND seq = :seq"
+)
+
+
+async def mark_sent(session: AsyncSession, auction_id: int, seq: int) -> None:
+    """Records that this event reached the channel, so the relay does not repeat it."""
+    await session.execute(_MARK_SENT_SQL, {"aid": auction_id, "seq": seq})
+    await session.commit()
+
+
+# Publish happens while the row lock is held, and sent_at is set after. The other order
+# would lose an event to a crash in between; this one repeats it, which the sequence
+# number makes harmless. SKIP LOCKED so a second instance works the rest of the queue
+# instead of waiting behind this one.
+_RELAY_SQL = text("""
+    SELECT id, auction_id, payload FROM outbox
+     WHERE sent_at IS NULL
+     ORDER BY auction_id, seq
+       FOR UPDATE SKIP LOCKED
+     LIMIT :limit
+    """)
+
+
+# Long enough that a problem can be investigated against the rows that caused it, short
+# enough that the table does not grow for the life of the service. Sent rows are never
+# read again by the relay.
+OUTBOX_RETENTION = timedelta(days=1)
+
+_MARK_BATCH_SENT_SQL = text(
+    "UPDATE outbox SET sent_at = clock_timestamp() WHERE id IN :ids"
+).bindparams(bindparam("ids", expanding=True))
+
+# CAST, because inside a comparison Postgres cannot infer the parameter's type and
+# answers "operator does not exist: timestamp with time zone < interval".
+_PRUNE_OUTBOX_SQL = text(
+    "DELETE FROM outbox WHERE sent_at IS NOT NULL"
+    " AND sent_at < clock_timestamp() - CAST(:window AS interval)"
+)
+
+
+async def prune_outbox(session: AsyncSession, window: timedelta = OUTBOX_RETENTION) -> int:
+    """Drop announced events past the retention window. Returns how many went."""
+    result = await session.execute(_PRUNE_OUTBOX_SQL, {"window": window})
+    await session.commit()
+    return result.rowcount
+
+
+async def relay_pending(
+    session_maker: async_sessionmaker[AsyncSession], channels: ChannelsPlugin, limit: int = 100
+) -> int:
+    """Publish whatever a dead process left unannounced. Returns how many it sent."""
+    async with session_maker() as session:
+        rows = (await session.execute(_RELAY_SQL, {"limit": limit})).all()
+        for _, auction_id, payload in rows:
+            channels.publish(msgspec.json.decode(payload), _channel(auction_id))
+        if rows:
+            # One statement for the batch rather than one per row: a full tick was 100
+            # round trips. Marked after publishing, so a crash in between repeats the
+            # event rather than losing it.
+            await session.execute(_MARK_BATCH_SENT_SQL, {"ids": [row[0] for row in rows]})
+        await session.commit()
+    return len(rows)
 
 
 async def first_attempt(
@@ -206,6 +300,8 @@ async def place_bid_tx(
         bid.idempotency_key = idempotency_key
         bid.response = msgspec.json.encode(_to_response(row)).decode()
     session.add(bid)
+    # The obligation to announce this bid commits with the money or not at all.
+    session.add(_owed(row, _bid_event(row, amount)))
     try:
         await session.commit()
     except IntegrityError as exc:
@@ -297,23 +393,14 @@ async def place_bid(
                 # litestar used the first time and the two bodies are identical.
                 return msgspec.json.decode(first.response, type=AuctionResponse)
         raise ClientException(await reject_reason(db_session, auction_id, user_id, data.amount))
-    response = _to_response(auction)
-    channels.publish(
-        {
-            "type": "bid",
-            "auction_id": auction_id,
-            "amount": str(data.amount),
-            "winner_id": user_id,
-            "bid_count": auction.bid_count,
-            # A bid inside the window moves the deadline. Without it here, a watcher's
-            # countdown runs out on a deadline that no longer exists and they stop bidding,
-            # which is exactly what anti-snipe is meant to prevent. Rendered off the
-            # response so the socket and the HTTP reply cannot disagree.
-            "ends_at": response.ends_at.isoformat(),
-        },
-        _channel(auction_id),
-    )
-    return response
+    # Published here rather than left to the relay: a bid that waited for the next tick
+    # would reach watchers a second late. The outbox row is the safety net, not the path.
+    #
+    # The event carries ends_at because a bid inside the window moves the deadline —
+    # without it a watcher's countdown runs out on a deadline that no longer exists.
+    channels.publish(_bid_event(auction, data.amount), _channel(auction_id))
+    await mark_sent(db_session, auction_id, auction.event_seq)
+    return _to_response(auction)
 
 
 @websocket("/ws/auctions/{auction_id:int}")
@@ -322,13 +409,12 @@ async def auction_ws(
 ) -> None:
     await socket.accept()
     try:
-        await user_for_token(db_session, socket.query_params.get("token", ""))
+        # A ticket, not the session token: the credential is in a URL, and a URL is
+        # logged. Spending the ticket here is what makes it single-use.
+        await user_for_ticket(db_session, socket.query_params.get("ticket", ""))
     except NotAuthorizedException:
         await socket.close(code=4401)
         return
-
-    async def send(event: bytes | str) -> None:
-        await socket.send_text(event.decode() if isinstance(event, bytes) else event)
 
     # Sending from a background task and then blocking on receive() is what makes a
     # disconnect observable: receive() raises the moment the client goes away. Iterating
@@ -337,12 +423,64 @@ async def auction_ws(
     # handler's database session are held for the life of the process.
     #
     # The client is not expected to send anything; whatever arrives is discarded.
-    async with (
-        channels.start_subscription(_channel(auction_id)) as subscriber,
-        subscriber.run_in_background(send),
-    ):
-        while True:
-            await socket.receive()
+    async with channels.start_subscription(_channel(auction_id)) as subscriber:
+        auction = await db_session.get(Auction, auction_id)
+        if auction is None:
+            await socket.close(code=4404)
+            return
+        # Order matters, and it is the whole point of the snapshot. The subscription is
+        # already live, so a bid landing from here on is queued; the snapshot goes out
+        # before anything drains that queue. Snapshot first and subscribe second would
+        # lose any event that arrived in between — which is the gap a client reconnecting
+        # after a dropout falls into.
+        await socket.send_text(
+            msgspec.json.encode(
+                {
+                    "type": "snapshot",
+                    "auction": _to_response(auction),
+                    "seq": auction.event_seq,
+                }
+            ).decode()
+        )
+        # Nothing below touches the database, and the loop runs for as long as the client
+        # stays. Held open, this session is one Postgres connection per open socket —
+        # measured at 8 sockets, 7 connections — which would hit max_connections long
+        # before the 500 sockets M5 is meant to sustain.
+        await db_session.close()
+
+        # The number the client has been brought up to. Every event is measured against
+        # it, which is what makes the sequence worth carrying.
+        last_seq = auction.event_seq
+
+        closed = False
+
+        async def send(event: bytes | str) -> None:
+            nonlocal last_seq, closed
+            if closed:
+                # A second dropped event would otherwise close an already closed socket.
+                # Litestar tolerates that today; saying so here does not rely on it.
+                return
+            payload = event.decode() if isinstance(event, bytes) else event
+            seq = msgspec.json.decode(payload)["seq"]
+            if seq <= last_seq:
+                # Already delivered. The outbox relays at-least-once, so a duplicate is
+                # expected rather than exceptional, and showing the same bid twice would
+                # make a watcher think the price moved when it did not.
+                return
+            if seq > last_seq + 1:
+                # Events were dropped from this socket's queue, so it cannot be made
+                # whole here. Closing sends the client back through the snapshot, which
+                # is the only path that restores correct state. Staying connected would
+                # show a price that silently skipped a bid.
+                closed = True
+                await socket.close(code=4408)
+                return
+            last_seq = seq
+            await socket.send_text(payload)
+
+        async with subscriber.run_in_background(send):
+            while True:
+                await socket.receive()
 
 
 # SKIP LOCKED so a second instance is not stuck behind the first. Without it the closers
@@ -362,10 +500,10 @@ _CLOSE_SQL = text("""
          WHERE status = 'open' AND ends_at <= clock_timestamp()
            FOR UPDATE SKIP LOCKED
     )
-    UPDATE auctions a SET status = 'closed'
+    UPDATE auctions a SET status = 'closed', event_seq = a.event_seq + 1
       FROM due
      WHERE a.id = due.id
-    RETURNING a.id, a.current_winner_id, a.current_bid, a.ends_at,
+    RETURNING a.id, a.current_winner_id, a.current_bid, a.ends_at, a.event_seq,
               clock_timestamp() - a.ends_at AS late_by
     """)
 
@@ -379,25 +517,22 @@ async def close_due(
     """
     async with session_maker() as session:
         rows = (await session.execute(_CLOSE_SQL)).all()
+        events = [_closed_event(row) for row in rows]
+        # Same transaction as the status flip: a crash here shuts an auction for good with
+        # nobody told, and the auction cannot be reopened to try again.
+        session.add_all([_owed(row, event) for row, event in zip(rows, events, strict=True)])
         await session.commit()
-    for auction_id, winner_id, amount, ends_at, late_by in rows:
+    for row, event in zip(rows, events, strict=True):
         # How far past its deadline an auction actually closed. The interval is measured
         # by Postgres, so it covers the poll interval and any time the tick spent queued.
         logger.info(
-            "closed auction %s %.3fs after its deadline", auction_id, late_by.total_seconds()
+            "closed auction %s %.3fs after its deadline", row.id, row.late_by.total_seconds()
         )
-        channels.publish(
-            {
-                "type": "closed",
-                "auction_id": auction_id,
-                "winner_id": winner_id,
-                "amount": str(amount) if amount is not None else None,
-                # Same key and same rendering as the bid event, so the two events
-                # describing one auction do not disagree about its shape.
-                "ends_at": ends_at.astimezone(APP_TZ).isoformat(),
-            },
-            _channel(auction_id),
-        )
+        channels.publish(event, _channel(row.id))
+    if rows:
+        async with session_maker() as session:
+            for row in rows:
+                await mark_sent(session, row.id, row.event_seq)
     return len(rows)
 
 
@@ -408,6 +543,11 @@ async def run_closer(
     while True:
         try:
             await close_due(session_maker, channels)
+            # Anything a previous process committed but never announced.
+            await relay_pending(session_maker, channels)
+            async with session_maker() as session:
+                await purge_expired_tickets(session)
+                await prune_outbox(session)
         except Exception:
             # Blind on purpose: a transient database error must not kill the loop. BLE001
             # allows it because of the logger.exception call, which is what makes the

@@ -20,7 +20,10 @@ from app.models import Auction, User
 # deadline and no bidder, which is the opposite of what the bid tests need.
 
 
-async def _seed(maker, ends_delta: timedelta = timedelta(seconds=-1)) -> int:
+# -5s rather than -1s: the deadline is computed here and compared against Postgres'
+# clock_timestamp(), and a one-second margin is close enough to the boundary that the two
+# clocks can disagree about which side of it the auction is on.
+async def _seed(maker, ends_delta: timedelta = timedelta(seconds=-5)) -> int:
     async with maker() as s:
         seller = User(email="seller@x.com", pw_hash="x")
         s.add(seller)
@@ -47,7 +50,7 @@ async def _seed_with_winner(maker) -> tuple[int, int]:
         assert await place_bid_tx(s, aid, uid, Decimal("25.00")) is not None
     async with maker() as s:
         await s.execute(
-            text("UPDATE auctions SET ends_at = now() - interval '1 second' WHERE id = :id"),
+            text("UPDATE auctions SET ends_at = now() - interval '5 seconds' WHERE id = :id"),
             {"id": aid},
         )
         await s.commit()
@@ -65,6 +68,18 @@ async def _add_bidder(maker) -> int:
         s.add(bidder)
         await s.commit()
         return bidder.id
+
+
+async def test_the_close_event_continues_the_same_numbering(sm, channels):
+    """M5 criterion 2 across both publishers. The close is the last event a watcher sees;
+    numbered from a different counter it would read as a gap, or worse as a replay."""
+    aid, _ = await _seed_with_winner(sm)
+
+    assert await close_due(sm, channels) == 1
+
+    ((_, event),) = channels.published
+    # _seed_with_winner placed one bid, so that was seq 1 and the close is seq 2.
+    assert event["seq"] == 2
 
 
 async def test_closer_does_not_fire_on_an_auction_a_late_bid_extended(sm, channels):
@@ -88,7 +103,10 @@ async def test_closer_does_not_fire_on_an_auction_a_late_bid_extended(sm, channe
         await asyncio.sleep(1.5)  # well past the deadline the auction had when it was seeded
         assert await _status(sm, aid) == "open"
         assert await _deadline(sm, aid) > original
-        assert channels.published == []
+        # One event, and it is the bid: place_bid_tx recorded it and never published it,
+        # so the relay in the same loop announced it. That is the outbox doing its job.
+        # What must not appear here is a close.
+        assert [event["type"] for _, event in channels.published] == ["bid"]
     finally:
         # Never awaited: an uncancellable loop would hang the runner rather than fail.
         task.cancel()
@@ -130,6 +148,7 @@ async def test_publishes_the_winner_on_the_auction_channel(sm, channels):
                 "winner_id": uid,
                 "amount": "25.00",
                 "ends_at": ends_at.astimezone(APP_TZ).isoformat(),
+                "seq": 2,
             },
         )
     ]
@@ -150,6 +169,8 @@ async def test_publishes_a_close_with_no_bids(sm, channels):
                 "winner_id": None,
                 "amount": None,
                 "ends_at": ends_at.astimezone(APP_TZ).isoformat(),
+                # No bids, so the close is the auction's first event.
+                "seq": 1,
             },
         )
     ]
@@ -171,6 +192,48 @@ async def test_two_closers_at_once_publish_once(sm, channels, other_channels):
     counts = await asyncio.gather(close_due(sm, channels), close_due(sm, other_channels))
     assert sorted(counts) == [0, 1]
     assert len(channels.published) + len(other_channels.published) == 1
+
+
+async def test_the_tick_does_its_housekeeping(sm, channels):
+    """Three jobs hang off the closer's tick — relay unsent events, purge spent tickets,
+    prune announced ones. Each is tested on its own; this is the only thing that proves the
+    loop actually calls them, and dropping any one call leaves a table growing forever."""
+    aid = await _seed(sm, ends_delta=timedelta(hours=1))
+    async with sm() as s:
+        await s.execute(
+            text(
+                "INSERT INTO outbox (auction_id, seq, payload, sent_at, created_at, updated_at)"
+                " VALUES (:aid, 99, '{}', clock_timestamp() - interval '2 days',"
+                " clock_timestamp(), clock_timestamp())"
+            ),
+            {"aid": aid},
+        )
+        await s.execute(
+            text(
+                "INSERT INTO users (email, pw_hash, created_at, updated_at)"
+                " VALUES ('ticket@x.com', 'x', now(), now())"
+            )
+        )
+        await s.execute(
+            text(
+                "INSERT INTO ws_tickets (token, user_id, expires_at)"
+                " SELECT 'dead', id, clock_timestamp() - interval '1 minute' FROM users"
+                " WHERE email = 'ticket@x.com'"
+            )
+        )
+        await s.commit()
+
+    task = asyncio.create_task(run_closer(sm, channels, interval=0.01))
+    try:
+        await asyncio.sleep(0.3)
+        async with sm() as s:
+            assert await s.scalar(text("SELECT count(*) FROM outbox")) == 0
+            assert await s.scalar(text("SELECT count(*) FROM ws_tickets")) == 0
+    finally:
+        # Never awaited: an uncancellable loop would hang the runner rather than fail.
+        task.cancel()
+    await asyncio.sleep(0.05)
+    assert task.cancelled()
 
 
 async def test_run_closer_stops_when_cancelled(sm, channels):
@@ -226,7 +289,11 @@ async def test_logs_how_late_each_close_was(sm, channels, caplog):
         await close_due(sm, channels)
     record = next(r for r in caplog.records if r.msg.startswith("closed auction"))
     _, late = record.args
-    assert 5 <= late < 15  # it ended 5s ago; anything near zero means it is not measured
+    # It ended 5s ago. The margin is for clock precision, not for slack: ends_at is
+    # computed by Python and late_by is measured by Postgres, so a bound of exactly 5
+    # fails whenever the two clocks disagree by a hair. Anything near zero still means
+    # the interval is not being measured at all, which is what this guards.
+    assert 4.5 <= late < 15
 
 
 async def test_a_failing_tick_says_why(sm, channels, caplog):

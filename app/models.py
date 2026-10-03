@@ -14,6 +14,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -33,6 +34,21 @@ class Session(BigIntBase):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
 
 
+class WsTicket(BigIntBase):
+    """A single-use, short-lived credential for opening a WebSocket.
+
+    A browser cannot set headers on a WebSocket handshake, so the credential has to travel
+    in the URL — where it lands in access logs, browser history and Referer headers. A
+    session token there is a long-lived secret in all three. This one is spent on first use
+    and dead within seconds.
+    """
+
+    __tablename__ = "ws_tickets"
+    token: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class Auction(BigIntAuditBase):
     __tablename__ = "auctions"
     title: Mapped[str] = mapped_column(String(200))
@@ -48,6 +64,11 @@ class Auction(BigIntAuditBase):
     # The latest ends_at may ever be extended to. Fixed when the auction is created:
     # without a ceiling, two bidders trading bids inside the window keep it open forever.
     hard_ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # Counts events published about this auction. Bumped inside the same UPDATE that
+    # accepts a bid or closes the auction, so the number cannot be handed out twice or
+    # skipped — a client that sees 1 then 3 knows it missed one, which is the only way to
+    # tell a dropped event from a quiet auction.
+    event_seq: Mapped[int] = mapped_column(default=0)
 
     # Guardrails, not belt-and-braces: `update`, a data migration and psql all bypass the
     # Python checks in create_auction and _BID_SQL. A bid is a money path, so the table
@@ -66,6 +87,40 @@ class Auction(BigIntAuditBase):
         CheckConstraint(
             "current_bid IS NULL OR current_bid >= starting_bid",
             name="current_bid_at_least_starting",
+        ),
+        CheckConstraint("event_seq >= 0", name="event_seq_not_negative"),
+    )
+
+
+class Outbox(BigIntAuditBase):
+    """An event that must be announced, written in the transaction that caused it.
+
+    Without this, publishing is at-most-once: the bid commits, the process dies, and no
+    watcher is ever told. The row is the obligation, and it commits or rolls back with the
+    money that created it.
+
+    Delivery is at-least-once — a crash after publishing but before sent_at is set makes
+    the relay publish again — which is safe only because every event carries its auction's
+    sequence number, so a duplicate is one the client has already seen.
+    """
+
+    __tablename__ = "outbox"
+    auction_id: Mapped[int] = mapped_column(ForeignKey("auctions.id"), index=True)
+    seq: Mapped[int]
+    payload: Mapped[str] = mapped_column(Text)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        # One row per event. The auction's own counter supplies the number, so a retried
+        # write cannot invent a second announcement of the same thing.
+        UniqueConstraint("auction_id", "seq", name="uq_outbox_auction_seq"),
+        # What the relay reads. Unsent rows are a short queue at the head of a table that
+        # only grows, so a partial index stays small while the table does not.
+        Index(
+            "ix_outbox_unsent",
+            "auction_id",
+            "seq",
+            postgresql_where=text("sent_at IS NULL"),
         ),
     )
 

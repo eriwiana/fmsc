@@ -4,15 +4,21 @@ import hashlib
 import hmac
 import os
 import secrets
+from datetime import datetime, timedelta, timezone
 
 from litestar import Request, post
+from litestar.di import Provide
 from litestar.exceptions import ClientException, NotAuthorizedException
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Session, User
-from app.schemas import SignupRequest, TokenResponse
+from app.models import Session, User, WsTicket
+from app.schemas import SignupRequest, TicketResponse, TokenResponse
+
+# Long enough to open a socket on a slow connection, short enough that one captured from
+# a log or a Referer header is already dead.
+TICKET_TTL = timedelta(seconds=30)
 
 # scrypt params: stdlib, no dependency. n=2**14 is a sane interactive cost.
 _SCRYPT = {"n": 2**14, "r": 8, "p": 1}
@@ -76,3 +82,54 @@ async def user_for_token(db_session: AsyncSession, token: str) -> User:
     if user is None:
         raise NotAuthorizedException("invalid token")
     return user
+
+
+_authed = {"current_user": Provide(provide_current_user)}
+
+# DELETE ... RETURNING is the check: the row is gone whether or not it turns out to be
+# valid, so a ticket cannot be presented twice even by two sockets arriving together.
+# `expires_at > clock_timestamp()` is evaluated by Postgres, not compared against this
+# process's clock afterwards. The two disagree by enough to matter — it is the same class
+# of bug as M1's now() and as the boundary flakes in this branch's test suite.
+_CONSUME_TICKET_SQL = text(
+    "DELETE FROM ws_tickets WHERE token = :token"
+    " RETURNING user_id, expires_at > clock_timestamp() AS live"
+)
+
+
+@post("/ws/tickets", dependencies=_authed)
+async def issue_ws_ticket(current_user: User, db_session: AsyncSession) -> TicketResponse:
+    """Trade a session token for a credential that is safe to put in a URL."""
+    ticket = WsTicket(
+        token=secrets.token_urlsafe(32),
+        user_id=current_user.id,
+        expires_at=datetime.now(timezone.utc) + TICKET_TTL,
+    )
+    db_session.add(ticket)
+    await db_session.commit()
+    return TicketResponse(ticket=ticket.token, expires_at=ticket.expires_at)
+
+
+async def user_for_ticket(db_session: AsyncSession, ticket: str) -> User:
+    """Spend a ticket and return whose it was. Raises if it is unknown or expired."""
+    row = (await db_session.execute(_CONSUME_TICKET_SQL, {"token": ticket})).first()
+    await db_session.commit()
+    # One message for every failure: unknown, already spent and expired are the same
+    # answer to a caller, and telling them apart would say which tickets once existed.
+    if row is None or not row.live:
+        raise NotAuthorizedException("invalid or expired ticket")
+    user = await db_session.get(User, row.user_id)
+    if user is None:
+        raise NotAuthorizedException("invalid or expired ticket")
+    return user
+
+
+async def purge_expired_tickets(db_session: AsyncSession) -> int:
+    """Expired tickets are never read again and nothing else deletes them."""
+    # clock_timestamp(), not now(): now() is transaction time, which is the bug M1 spent a
+    # milestone on. Harmless in a transaction this short, wrong the moment it is not.
+    result = await db_session.execute(
+        text("DELETE FROM ws_tickets WHERE expires_at <= clock_timestamp()")
+    )
+    await db_session.commit()
+    return result.rowcount
