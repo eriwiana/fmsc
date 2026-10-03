@@ -11,13 +11,28 @@ import random
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from sqlalchemy import text
+import pytest
+from litestar.exceptions import ClientException
+from sqlalchemy import event, text
 
-from app.auctions import APP_TZ, MAX_BID, place_bid_tx, reject_reason, resolve_deadline
+from app.auctions import (
+    APP_TZ,
+    MAX_BID,
+    MAX_EXTENSION,
+    _to_response,
+    create_auction,
+    place_bid,
+    place_bid_tx,
+    reject_reason,
+    resolve_deadline,
+)
 from app.models import Auction, User
+from app.schemas import BidRequest, CreateAuctionRequest
 
 
-async def _seed(maker, starting="10.00", ends_delta=timedelta(hours=1)) -> tuple[int, int, int]:
+async def _seed(
+    maker, starting="10.00", ends_delta=timedelta(hours=1), extension=MAX_EXTENSION
+) -> tuple[int, int, int]:
     """One seller, one bidder, one auction. Seller and bidder are distinct on purpose:
     an auction whose seller is also its only bidder cannot exercise the real guards."""
     async with maker() as s:
@@ -25,11 +40,13 @@ async def _seed(maker, starting="10.00", ends_delta=timedelta(hours=1)) -> tuple
         bidder = User(email="bidder@x.com", pw_hash="x")
         s.add_all([seller, bidder])
         await s.flush()
+        ends_at = datetime.now(timezone.utc) + ends_delta
         auction = Auction(
             title="t",
             seller_id=seller.id,
             starting_bid=Decimal(starting),
-            ends_at=datetime.now(timezone.utc) + ends_delta,
+            ends_at=ends_at,
+            hard_ends_at=ends_at + extension,
         )
         s.add(auction)
         await s.commit()
@@ -61,6 +78,25 @@ def test_naive_deadline_is_jakarta():
     aware = datetime(2026, 6, 28, 17, 0, 0, tzinfo=timezone.utc)
     assert resolve_deadline(aware) is aware
     assert APP_TZ.key == "Asia/Jakarta"
+
+
+async def test_created_auction_records_its_extension_ceiling(sm):
+    """create_auction is the only place hard_ends_at is ever set, and nothing downstream
+    can repair a wrong ceiling: it is what stops an auction extending forever."""
+    async with sm() as s:
+        seller = User(email="seller@x.com", pw_hash="x")
+        s.add(seller)
+        await s.commit()
+    ends_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    async with sm() as s:
+        created = await create_auction.fn(
+            data=CreateAuctionRequest(title="t", starting_bid=Decimal("10.00"), ends_at=ends_at),
+            current_user=seller,
+            db_session=s,
+        )
+    # The literal 2h, not MAX_EXTENSION: comparing the constant with itself passes for any
+    # value, so a ceiling quietly widened to 48h would go unnoticed.
+    assert created.hard_ends_at - created.ends_at == timedelta(hours=2)
 
 
 async def test_opening_bid_may_equal_starting_bid(sm):
@@ -107,6 +143,9 @@ async def test_accepted_bid_returns_the_row_it_wrote(sm):
     assert row.current_bid == Decimal("12.50")
     assert row.current_winner_id == bidder
     assert row.bid_count == 1
+    # The handler renders this same row. hard_ends_at is read straight off it, so a
+    # RETURNING that stopped yielding the column would 500 every accepted bid.
+    assert _to_response(row).hard_ends_at == row.hard_ends_at.astimezone(APP_TZ)
 
 
 async def test_rejected_bid_writes_no_history_row(sm):
@@ -209,6 +248,125 @@ async def test_highest_bid_survives_n_way_concurrency(sm):
     assert auction.current_winner_id == ids[amounts.index(max(amounts))]
     assert auction.bid_count == accepted
     assert await _bid_rows(sm, aid) == accepted
+
+
+async def _deadline(sm, aid: int) -> datetime:
+    async with sm() as s:
+        return (await s.get(Auction, aid)).ends_at
+
+
+async def test_bid_inside_the_final_minute_extends_the_deadline(sm):
+    """Anti-snipe. A bid with 30s left moves the deadline to SNIPE_WINDOW from now, so a
+    rival who was leading has the same window to answer that the sniper just used."""
+    _, bidder, aid = await _seed(sm, ends_delta=timedelta(seconds=30))
+    before = await _deadline(sm, aid)
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("10.00")) is not None
+    after = await _deadline(sm, aid)
+    assert after > before
+    # Literal bounds, not SNIPE_WINDOW: asserting against the constant compares it with
+    # itself, so any value it held would pass. Measured from when the bid landed, not from
+    # the old deadline. Both sides matter — a lower bound alone accepts a 10-minute window.
+    assert timedelta(seconds=55) < after - datetime.now(timezone.utc) < timedelta(seconds=65)
+
+
+async def test_bid_event_tells_watchers_the_new_deadline(sm, channels):
+    """Anti-snipe is invisible without this. A watcher whose countdown still shows the old
+    deadline stops bidding at a deadline that has already moved, which is the behaviour the
+    extension exists to prevent."""
+    _, bidder, aid = await _seed(sm, ends_delta=timedelta(seconds=30))
+    before = await _deadline(sm, aid)
+    async with sm() as s:
+        user = await s.get(User, bidder)
+        response = await place_bid.fn(
+            auction_id=aid,
+            data=BidRequest(amount=Decimal("10.00")),
+            current_user=user,
+            db_session=s,
+            channels=channels,
+        )
+
+    ((channel, event),) = channels.published
+    assert channel == f"auction:{aid}"
+    assert event["type"] == "bid"
+    # The same rendering the response uses, so a client needs no second request.
+    assert event["ends_at"] == response.ends_at.isoformat()
+    assert datetime.fromisoformat(event["ends_at"]) > before
+
+
+async def test_a_rejected_bid_says_why_and_publishes_nothing(sm, channels):
+    """The handler's reject path. The bidder is told which guard refused the bid, and no
+    event goes out — a rejected bid that published would move every watcher's countdown
+    and show a leader who does not exist."""
+    _, bidder, aid = await _seed(sm, ends_delta=timedelta(seconds=30))
+    before = await _deadline(sm, aid)
+
+    async with sm() as s:
+        user = await s.get(User, bidder)
+        with pytest.raises(ClientException) as rejected:
+            await place_bid.fn(
+                auction_id=aid,
+                data=BidRequest(amount=Decimal("9.99")),
+                current_user=user,
+                db_session=s,
+                channels=channels,
+            )
+
+    assert rejected.value.detail == "bid must be at least 10.00"
+    assert channels.published == []
+    # The deadline is untouched too: a refused bid must not buy the bidder more time.
+    assert await _deadline(sm, aid) == before
+
+
+async def test_bid_outside_the_window_leaves_the_deadline_alone(sm):
+    """An hour out, the same statement must not move the deadline at all — otherwise
+    every bid on a long auction would drag it in to a minute from now."""
+    _, bidder, aid = await _seed(sm, ends_delta=timedelta(hours=1))
+    before = await _deadline(sm, aid)
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("10.00")) is not None
+    assert await _deadline(sm, aid) == before
+
+
+async def test_extension_stops_at_the_hard_ceiling(sm):
+    """The ceiling is what makes the auction finite. The allowance has to run out inside
+    the window for the clamp to bind: 30s left plus 15s of allowance puts the ceiling 45s
+    out, so a bid asking for a 60s extension gets 45s and no more."""
+    _, bidder, aid = await _seed(
+        sm, ends_delta=timedelta(seconds=30), extension=timedelta(seconds=15)
+    )
+    async with sm() as s:
+        auction = await s.get(Auction, aid)
+        ceiling = auction.hard_ends_at
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("10.00")) is not None
+    assert await _deadline(sm, aid) == ceiling
+
+
+async def test_the_bid_and_its_extension_are_one_statement(sm):
+    """The deadline has to move in the very UPDATE that accepts the bid.
+
+    Splitting them leaves a window in which the row is bid-on but still due, and the
+    closer can fire inside it. That window is too narrow to catch by racing — a
+    deliberately split implementation went undetected in 20 out of 20 raced runs — so
+    the property is pinned by counting the UPDATEs instead of trying to lose the race.
+    """
+    updates = []
+    engine = sm.kw["bind"].sync_engine
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def record(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("UPDATE AUCTIONS"):
+            updates.append(statement)
+
+    try:
+        _, bidder, aid = await _seed(sm, ends_delta=timedelta(seconds=30))
+        async with sm() as s:
+            assert await place_bid_tx(s, aid, bidder, Decimal("10.00")) is not None
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    assert len(updates) == 1, f"the bid path issued {len(updates)} UPDATEs on auctions"
 
 
 async def _reason(sm, aid: int, uid: int, amount: str = "10.00") -> str:

@@ -13,7 +13,7 @@ from decimal import Decimal
 
 from sqlalchemy import text
 
-from app.auctions import close_due, place_bid_tx, run_closer
+from app.auctions import APP_TZ, MAX_EXTENSION, close_due, place_bid_tx, run_closer
 from app.models import Auction, User
 
 # Its own seeder rather than the bid suite's: these want an auction already past its
@@ -25,11 +25,13 @@ async def _seed(maker, ends_delta: timedelta = timedelta(seconds=-1)) -> int:
         seller = User(email="seller@x.com", pw_hash="x")
         s.add(seller)
         await s.flush()
+        ends_at = datetime.now(timezone.utc) + ends_delta
         auction = Auction(
             title="t",
             seller_id=seller.id,
             starting_bid=Decimal("10.00"),
-            ends_at=datetime.now(timezone.utc) + ends_delta,
+            ends_at=ends_at,
+            hard_ends_at=ends_at + MAX_EXTENSION,
         )
         s.add(auction)
         await s.commit()
@@ -40,11 +42,7 @@ async def _seed_with_winner(maker) -> tuple[int, int]:
     """Bid while the auction is open, then move the deadline into the past — the only
     way to end up with a won auction that is also due to close."""
     aid = await _seed(maker, ends_delta=timedelta(hours=1))
-    async with maker() as s:
-        bidder = User(email="bidder@x.com", pw_hash="x")
-        s.add(bidder)
-        await s.commit()
-        uid = bidder.id
+    uid = await _add_bidder(maker)
     async with maker() as s:
         assert await place_bid_tx(s, aid, uid, Decimal("25.00")) is not None
     async with maker() as s:
@@ -54,6 +52,48 @@ async def _seed_with_winner(maker) -> tuple[int, int]:
         )
         await s.commit()
     return aid, uid
+
+
+async def _deadline(maker, aid: int) -> datetime:
+    async with maker() as s:
+        return (await s.get(Auction, aid)).ends_at
+
+
+async def _add_bidder(maker) -> int:
+    async with maker() as s:
+        bidder = User(email="bidder@x.com", pw_hash="x")
+        s.add(bidder)
+        await s.commit()
+        return bidder.id
+
+
+async def test_closer_does_not_fire_on_an_auction_a_late_bid_extended(sm, channels):
+    """M3's exit criterion, with the closer genuinely running.
+
+    A bid lands a second before the deadline while the loop is ticking every 20ms. Past
+    the deadline it was seeded with, the auction is still open and nothing was announced.
+
+    This proves the closer stays off an extended auction. It does not prove the extension
+    is atomic with the bid: a split implementation survives this race. That property is
+    pinned by test_the_bid_and_its_extension_are_one_statement instead.
+    """
+    aid = await _seed(sm, ends_delta=timedelta(seconds=1))
+    uid = await _add_bidder(sm)
+    original = await _deadline(sm, aid)
+
+    task = asyncio.create_task(run_closer(sm, channels, interval=0.02))
+    try:
+        async with sm() as s:
+            assert await place_bid_tx(s, aid, uid, Decimal("30.00")) is not None
+        await asyncio.sleep(1.5)  # well past the deadline the auction had when it was seeded
+        assert await _status(sm, aid) == "open"
+        assert await _deadline(sm, aid) > original
+        assert channels.published == []
+    finally:
+        # Never awaited: an uncancellable loop would hang the runner rather than fail.
+        task.cancel()
+    await asyncio.sleep(0.05)
+    assert task.cancelled()
 
 
 async def _status(maker, aid: int) -> str:
@@ -75,12 +115,22 @@ async def test_leaves_an_auction_before_its_deadline_open(sm, channels):
 
 
 async def test_publishes_the_winner_on_the_auction_channel(sm, channels):
+    """Whole-dict equality on purpose: a key silently added or dropped from an event a
+    client parses should fail here. ends_at uses the same key and rendering as the bid
+    event, so the two events describing one auction agree about its shape."""
     aid, uid = await _seed_with_winner(sm)
+    ends_at = await _deadline(sm, aid)
     await close_due(sm, channels)
     assert channels.published == [
         (
             f"auction:{aid}",
-            {"type": "closed", "auction_id": aid, "winner_id": uid, "amount": "25.00"},
+            {
+                "type": "closed",
+                "auction_id": aid,
+                "winner_id": uid,
+                "amount": "25.00",
+                "ends_at": ends_at.astimezone(APP_TZ).isoformat(),
+            },
         )
     ]
 
@@ -89,9 +139,19 @@ async def test_publishes_a_close_with_no_bids(sm, channels):
     """Nobody bid. The auction still closes, and the event says so rather than
     carrying a zero that would read as a sale."""
     aid = await _seed(sm)
+    ends_at = await _deadline(sm, aid)
     await close_due(sm, channels)
     assert channels.published == [
-        (f"auction:{aid}", {"type": "closed", "auction_id": aid, "winner_id": None, "amount": None})
+        (
+            f"auction:{aid}",
+            {
+                "type": "closed",
+                "auction_id": aid,
+                "winner_id": None,
+                "amount": None,
+                "ends_at": ends_at.astimezone(APP_TZ).isoformat(),
+            },
+        )
     ]
 
 

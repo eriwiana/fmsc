@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -45,6 +45,7 @@ def _to_response(a: Auction | Row) -> AuctionResponse:
         status=a.status,
         starts_at=a.starts_at.astimezone(APP_TZ),
         ends_at=a.ends_at.astimezone(APP_TZ),
+        hard_ends_at=a.hard_ends_at.astimezone(APP_TZ),
     )
 
 
@@ -52,6 +53,15 @@ def _to_response(a: Auction | Row) -> AuctionResponse:
 # which asyncpg surfaces as a 500, and it silently rounds a third decimal place — 10.005
 # becomes 10.01, so a bidder outbids by half a cent and is charged a whole one.
 MAX_BID = Decimal("9999999999.99")
+
+# Anti-snipe. A bid inside the last SNIPE_WINDOW pushes the deadline that far out from the
+# moment it lands, so a bid placed too late to be answered cannot win on timing alone.
+# MAX_EXTENSION caps the total, via each auction's hard_ends_at.
+#
+# ponytail: both are global, not per-auction. Three columns and create-time validation buy
+# nothing until a seller actually asks for a different window.
+SNIPE_WINDOW = timedelta(seconds=60)
+MAX_EXTENSION = timedelta(hours=2)
 
 
 def _is_valid_amount(amount: Decimal) -> bool:
@@ -80,6 +90,7 @@ async def create_auction(
         seller_id=current_user.id,
         starting_bid=data.starting_bid,
         ends_at=ends_at,
+        hard_ends_at=ends_at + MAX_EXTENSION,
     )
     db_session.add(auction)
     await db_session.commit()
@@ -107,9 +118,24 @@ async def get_auction(auction_id: int, db_session: AsyncSession) -> AuctionRespo
 # clock_timestamp(), not now(): now() is transaction_timestamp(), and the auth dependency
 # has already opened the transaction by the time this runs, so now() reads a clock frozen
 # before the request arrived. Only clock_timestamp() advances inside a transaction.
+#
+# The extension rides inside this same UPDATE. A second statement would leave a gap for the
+# closer to fire in between, closing an auction the bid had just extended.
+#
+# GREATEST is outermost so the deadline is never pulled backwards; LEAST caps it at the
+# ceiling; outside the window ends_at already wins, so nothing moves.
+#
+# ck_auctions_ceiling_after_deadline is what guarantees the first of those: with
+# hard_ends_at >= ends_at enforced, the two nestings are algebraically identical, so no
+# test can tell them apart. The ordering stays as written because it is still the correct
+# one if that constraint is ever dropped.
+#
+# WHERE still reads the pre-update ends_at, so a bid that arrives after the deadline loses
+# rather than extending its way back in.
 _BID_SQL = text("""
     UPDATE auctions
-       SET current_bid = :amount, current_winner_id = :uid, bid_count = bid_count + 1
+       SET current_bid = :amount, current_winner_id = :uid, bid_count = bid_count + 1,
+           ends_at = GREATEST(ends_at, LEAST(hard_ends_at, clock_timestamp() + :window))
      WHERE id = :id AND status = 'open' AND ends_at > clock_timestamp()
        AND seller_id <> :uid
        AND :amount >= starting_bid
@@ -130,7 +156,10 @@ async def place_bid_tx(
         await session.rollback()
         return None
     row = (
-        await session.execute(_BID_SQL, {"amount": amount, "uid": user_id, "id": auction_id})
+        await session.execute(
+            _BID_SQL,
+            {"amount": amount, "uid": user_id, "id": auction_id, "window": SNIPE_WINDOW},
+        )
     ).first()
     if row is None:
         await session.rollback()
@@ -176,22 +205,31 @@ async def place_bid(
     db_session: AsyncSession,
     channels: ChannelsPlugin,
 ) -> AuctionResponse:
-    auction = await place_bid_tx(db_session, auction_id, current_user.id, data.amount)
+    # Read the id before the bid runs. place_bid_tx rolls back on rejection, and a rollback
+    # expires every instance in the session regardless of expire_on_commit — so touching
+    # current_user afterwards attempts a lazy reload, which raises MissingGreenlet inside an
+    # async session and turns every rejected bid into a 500 with no reason in it.
+    user_id = current_user.id
+    auction = await place_bid_tx(db_session, auction_id, user_id, data.amount)
     if auction is None:
-        raise ClientException(
-            await reject_reason(db_session, auction_id, current_user.id, data.amount)
-        )
+        raise ClientException(await reject_reason(db_session, auction_id, user_id, data.amount))
+    response = _to_response(auction)
     channels.publish(
         {
             "type": "bid",
             "auction_id": auction_id,
             "amount": str(data.amount),
-            "winner_id": current_user.id,
+            "winner_id": user_id,
             "bid_count": auction.bid_count,
+            # A bid inside the window moves the deadline. Without it here, a watcher's
+            # countdown runs out on a deadline that no longer exists and they stop bidding,
+            # which is exactly what anti-snipe is meant to prevent. Rendered off the
+            # response so the socket and the HTTP reply cannot disagree.
+            "ends_at": response.ends_at.isoformat(),
         },
         _channel(auction_id),
     )
-    return _to_response(auction)
+    return response
 
 
 @websocket("/ws/auctions/{auction_id:int}")
@@ -204,9 +242,23 @@ async def auction_ws(
     except NotAuthorizedException:
         await socket.close(code=4401)
         return
-    async with channels.start_subscription(_channel(auction_id)) as subscriber:
-        async for event in subscriber.iter_events():
-            await socket.send_text(event.decode() if isinstance(event, bytes) else event)
+
+    async def send(event: bytes | str) -> None:
+        await socket.send_text(event.decode() if isinstance(event, bytes) else event)
+
+    # Sending from a background task and then blocking on receive() is what makes a
+    # disconnect observable: receive() raises the moment the client goes away. Iterating
+    # the subscription in the foreground instead parks here until the next event fails to
+    # send — and on a quiet auction there is no next event, so the subscription and this
+    # handler's database session are held for the life of the process.
+    #
+    # The client is not expected to send anything; whatever arrives is discarded.
+    async with (
+        channels.start_subscription(_channel(auction_id)) as subscriber,
+        subscriber.run_in_background(send),
+    ):
+        while True:
+            await socket.receive()
 
 
 # SKIP LOCKED so a second instance is not stuck behind the first. Without it the closers
@@ -229,7 +281,7 @@ _CLOSE_SQL = text("""
     UPDATE auctions a SET status = 'closed'
       FROM due
      WHERE a.id = due.id
-    RETURNING a.id, a.current_winner_id, a.current_bid,
+    RETURNING a.id, a.current_winner_id, a.current_bid, a.ends_at,
               clock_timestamp() - a.ends_at AS late_by
     """)
 
@@ -244,7 +296,7 @@ async def close_due(
     async with session_maker() as session:
         rows = (await session.execute(_CLOSE_SQL)).all()
         await session.commit()
-    for auction_id, winner_id, amount, late_by in rows:
+    for auction_id, winner_id, amount, ends_at, late_by in rows:
         # How far past its deadline an auction actually closed. The interval is measured
         # by Postgres, so it covers the poll interval and any time the tick spent queued.
         logger.info(
@@ -256,6 +308,9 @@ async def close_due(
                 "auction_id": auction_id,
                 "winner_id": winner_id,
                 "amount": str(amount) if amount is not None else None,
+                # Same key and same rendering as the bid event, so the two events
+                # describing one auction do not disagree about its shape.
+                "ends_at": ends_at.astimezone(APP_TZ).isoformat(),
             },
             _channel(auction_id),
         )
@@ -265,11 +320,7 @@ async def close_due(
 async def run_closer(
     session_maker: async_sessionmaker[AsyncSession], channels: ChannelsPlugin, interval: float = 1.0
 ) -> None:
-    """Hard-deadline closer. Flips expired auctions to 'closed' and announces the winner.
-
-    ponytail: in-process loop assumes a single instance; for multi-instance switch the
-    UPDATE to `... FOR UPDATE SKIP LOCKED` semantics or a leader-elected ticker.
-    """
+    """Hard-deadline closer. Flips expired auctions to 'closed' and announces the winner."""
     while True:
         try:
             await close_due(session_maker, channels)

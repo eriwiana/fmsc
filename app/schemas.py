@@ -36,3 +36,4 @@ class AuctionResponse(msgspec.Struct):
     status: str
     starts_at: datetime
     ends_at: datetime
+    hard_ends_at: datetime

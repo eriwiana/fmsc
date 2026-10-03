@@ -37,13 +37,21 @@ source = ["app"]
 # flatters the number without testing anything.
 omit = ["alembic/*", "app/main.py"]
 exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:"]
-# Measured baseline, not an aspiration. The target is 90%; what is left uncovered is
-# the auth handlers and the websocket, which M3 covers.
+# Measured baseline, not an aspiration. 89.87%, flat across 10 runs, against a 90% target.
 #
-# The 65.93/66.37 wobble that forced the previous floor down is gone: it was a line in
-# run_closer, which no test called, and four consecutive runs now measure 72.37%.
-# Ratchet it up as tests land, never down to make a change pass.
-fail_under = 72
+# Every wobble in this project has been the same thing: a line no test called, which
+# coverage credited some of the time. 65.93/66.37 in M1 was a line in run_closer;
+# 79.40/79.83 and 89.41/89.83 here were auction_ws and then the bid handler's reject
+# branch. Each stopped moving the moment a test called it deliberately, so treat an
+# unstable number as a missing test rather than something to average out.
+#
+# The socket's 4401 close is exercised by a passing test but never credited: litestar's
+# test client runs the app in a portal thread that coverage does not trace. Not a gap in
+# the tests, so do not go looking for one.
+#
+# What remains genuinely uncovered is most of app/auth.py's error paths, which M7 covers,
+# and create_auction's two validation branches. Ratchet up as tests land, never down.
+fail_under = 89
 
 [build-system]
 requires = ["setuptools>=61"]
