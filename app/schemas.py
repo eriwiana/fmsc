@@ -24,6 +24,7 @@ class CreateAuctionRequest(msgspec.Struct):
     title: str
     starting_bid: Decimal
     ends_at: datetime  # must be timezone-aware, in the future
+    currency: str = "IDR"  # ISO 4217; normalised and checked in create_auction
 
 
 class BidRequest(msgspec.Struct):
@@ -38,6 +39,7 @@ class AuctionResponse(msgspec.Struct):
     current_bid: Decimal | None
     current_winner_id: int | None
     bid_count: int
+    currency: str
     status: str
     starts_at: datetime
     ends_at: datetime

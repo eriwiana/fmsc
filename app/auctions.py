@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -50,6 +51,7 @@ def _to_response(a: Auction | Row) -> AuctionResponse:
         current_bid=a.current_bid,
         current_winner_id=a.current_winner_id,
         bid_count=a.bid_count,
+        currency=a.currency,
         status=a.status,
         starts_at=a.starts_at.astimezone(APP_TZ),
         ends_at=a.ends_at.astimezone(APP_TZ),
@@ -57,10 +59,15 @@ def _to_response(a: Auction | Row) -> AuctionResponse:
     )
 
 
-# The Money column is Numeric(12,2). Postgres raises NumericValueOutOfRange above this,
-# which asyncpg surfaces as a 500, and it silently rounds a third decimal place — 10.005
-# becomes 10.01, so a bidder outbids by half a cent and is charged a whole one.
-MAX_BID = Decimal("9999999999.99")
+# The Money column is Numeric(18,2), and this is exactly what it holds. Postgres raises
+# NumericValueOutOfRange above it, which asyncpg surfaces as a 500, and it silently rounds
+# a third decimal place — 10.005 becomes 10.01, so a bidder outbids by half a cent and is
+# charged a whole one.
+MAX_BID = Decimal("9999999999999999.99")
+
+# What the table's own check constraint accepts, spelled the same way. Validated here so
+# the refusal is a 400 naming the field, not the 500 an IntegrityError becomes.
+CURRENCY_CODE = re.compile(r"[A-Z]{3}")
 
 # Anti-snipe. A bid inside the last SNIPE_WINDOW pushes the deadline that far out from the
 # moment it lands, so a bid placed too late to be answered cannot win on timing alone.
@@ -93,10 +100,16 @@ async def create_auction(
         raise ClientException("ends_at must be in the future")
     if data.starting_bid <= 0:
         raise ClientException("starting_bid must be positive")
+    # Normalised here rather than relied on from the client: the table refuses anything
+    # that is not three uppercase letters, and that refusal would arrive as a 500.
+    currency = data.currency.strip().upper()
+    if not CURRENCY_CODE.fullmatch(currency):
+        raise ClientException("currency must be a three-letter ISO 4217 code")
     auction = Auction(
         title=data.title,
         seller_id=current_user.id,
         starting_bid=data.starting_bid,
+        currency=currency,
         ends_at=ends_at,
         hard_ends_at=ends_at + MAX_EXTENSION,
     )
@@ -292,8 +305,9 @@ async def place_bid_tx(
     if row is None:
         await session.rollback()
         return None
-    # history row, same transaction as the accepted bid
-    bid = Bid(auction_id=auction_id, user_id=user_id, amount=amount)
+    # history row, same transaction as the accepted bid. The currency is copied off the
+    # row the statement returned, so it is the auction's own and not the client's.
+    bid = Bid(auction_id=auction_id, user_id=user_id, amount=amount, currency=row.currency)
     if idempotency_key is not None:
         # The key and the response it is replaying are written with the money, not after
         # it. A crash between the two would leave a bid whose retry places a second one.

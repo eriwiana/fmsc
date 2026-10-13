@@ -22,10 +22,13 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from litestar.exceptions import ClientException
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
-from app.auctions import MAX_BID, place_bid_tx
+from app.auctions import MAX_BID, create_auction, place_bid_tx
+from app.models import User
+from app.schemas import CreateAuctionRequest
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -160,11 +163,54 @@ async def test_a_bid_in_another_currency_is_rejected(sm):
 
 
 async def test_a_currency_that_is_not_a_three_letter_code_is_rejected(sm):
-    """'idr' and 'Rp' both read as a currency to a human and neither matches 'IDR' to the
-    composite foreign key, so the mismatch guard above would pass them through."""
+    """'idr' and 'Rp' both read as a currency to a human, and an auction holding either is
+    one nothing can ever bid on: the composite foreign key below needs an exact match.
+
+    DBAPIError, not IntegrityError, because two different mechanisms refuse these: the
+    check constraint for the case and the non-letter, varchar(3) for the overflow. The
+    second arrives as a bare DBAPIError — the asyncpg dialect does not map
+    StringDataRightTruncation onto DataError, so IntegrityError would miss it entirely.
+    Same lesson as the over-long Idempotency-Key in M4: a column's own length limit is
+    not an integrity error, and the handler has to catch it before the statement.
+    """
     for bad in ("idr", "Rp", "IDRX"):
-        with pytest.raises(IntegrityError):
+        with pytest.raises(DBAPIError):
             await _seed_auction_and_bid(sm, currency=bad)
+
+
+async def test_a_malformed_currency_is_a_400_and_not_a_500(sm):
+    """The DBAPIError above is the backstop. A client that sends one has asked for a
+    bad request, and `IDRX` would otherwise come back as the 500 a DataError becomes."""
+    seller = await _user(sm, "s@x.com")
+    ends_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    for bad in ("rupiah", "", "ID1"):
+        with pytest.raises(ClientException):
+            async with sm() as s:
+                await create_auction.fn(
+                    data=CreateAuctionRequest(
+                        title="t",
+                        starting_bid=Decimal("10.00"),
+                        ends_at=ends_at,
+                        currency=bad,
+                    ),
+                    current_user=seller,
+                    db_session=s,
+                )
+
+
+async def test_a_lowercase_currency_is_accepted_and_stored_uppercase(sm):
+    """`idr` from a client is a spelling, not a different currency."""
+    seller = await _user(sm, "s@x.com")
+    ends_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    async with sm() as s:
+        created = await create_auction.fn(
+            data=CreateAuctionRequest(
+                title="t", starting_bid=Decimal("10.00"), ends_at=ends_at, currency=" idr "
+            ),
+            current_user=seller,
+            db_session=s,
+        )
+    assert created.currency == "IDR"
 
 
 async def test_a_bid_takes_its_currency_from_the_auction(sm):

@@ -5,9 +5,11 @@ from decimal import Decimal
 
 from advanced_alchemy.base import BigIntAuditBase, BigIntBase
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Numeric,
     String,
@@ -18,8 +20,16 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
-# Money is Numeric(12,2), never float. Max ~9.9 billion per bid, plenty.
-Money = Numeric(12, 2)
+# Money is Numeric(18,2), never float. Numeric(12,2) stopped just under 10 miliar IDR,
+# which a single lot can exceed. Postgres stores numeric as variable-length digits, so the
+# wider type costs nothing per row until the values themselves are larger.
+Money = Numeric(18, 2)
+
+# ISO 4217, stored as the three-letter code rather than an enum, so a second currency
+# needs no migration. The format is checked on both tables, because a lowercase 'idr'
+# reads as a currency to a human while matching nothing to the foreign key below.
+Currency = String(3)
+CURRENCY_IS_A_CODE = "currency ~ '^[A-Z]{3}$'"
 
 
 class User(BigIntAuditBase):
@@ -56,6 +66,10 @@ class Auction(BigIntAuditBase):
     starting_bid: Mapped[Decimal] = mapped_column(Money)
     # NULL current_bid = no bids yet, so the opening bid may equal starting_bid.
     current_bid: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
+    # What every amount on this auction is denominated in. Explicit even though one
+    # currency is in use: an amount without its unit is not a price, and the cost of
+    # adding the column later is a money migration over live bids.
+    currency: Mapped[str] = mapped_column(Currency)
     current_winner_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     bid_count: Mapped[int] = mapped_column(default=0)
     status: Mapped[str] = mapped_column(String(10), default="open")  # open | closed
@@ -89,6 +103,11 @@ class Auction(BigIntAuditBase):
             name="current_bid_at_least_starting",
         ),
         CheckConstraint("event_seq >= 0", name="event_seq_not_negative"),
+        CheckConstraint(CURRENCY_IS_A_CODE, name="currency_is_a_code"),
+        # What the bid's composite foreign key points at. Postgres requires a unique
+        # constraint on the referenced columns, and this one also means an auction cannot
+        # be redenominated while bids reference the pair.
+        UniqueConstraint("id", "currency", name="uq_auctions_id_currency"),
     )
 
 
@@ -127,9 +146,15 @@ class Outbox(BigIntAuditBase):
 
 class Bid(BigIntAuditBase):
     __tablename__ = "bids"
-    auction_id: Mapped[int] = mapped_column(ForeignKey("auctions.id"), index=True)
+    # BigInteger spelled out: the type came free from ForeignKey("auctions.id") until the
+    # composite constraint below replaced it, and Mapped[int] alone is a 32-bit column.
+    auction_id: Mapped[int] = mapped_column(BigInteger, index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     amount: Mapped[Decimal] = mapped_column(Money)
+    # Copied from the auction by the bid statement, not supplied by the client. It is here
+    # so the pair below can be a foreign key: settling an IDR auction against a bid read
+    # as USD is a four-order-of-magnitude error in the amount owed.
+    currency: Mapped[str] = mapped_column(Currency)
     # Idempotency. The key is the client's; `response` is the body the first attempt
     # returned, so a retry replays it instead of being told it outbid itself.
     #
@@ -142,6 +167,16 @@ class Bid(BigIntAuditBase):
     __table_args__ = (
         # The history row is what a settlement would be computed from.
         CheckConstraint("amount > 0", name="amount_positive"),
+        CheckConstraint(CURRENCY_IS_A_CODE, name="currency_is_a_code"),
+        # Referential integrity for the auction and the currency match in one constraint,
+        # replacing the plain auction_id foreign key. A row whose currency disagrees with
+        # its auction's has no referent, so the table refuses it — `update`, a data
+        # migration and psql all bypass the statement that copies the currency across.
+        ForeignKeyConstraint(
+            ["auction_id", "currency"],
+            ["auctions.id", "auctions.currency"],
+            name="fk_bids_auction_id_auctions",
+        ),
         # The whole dedupe. No application-level "have I seen this key" test, which would
         # lose the race between two retries arriving together. NULLs are not equal in
         # Postgres, so bids without a key are unaffected. Name spelled in full because the

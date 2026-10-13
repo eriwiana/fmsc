@@ -17,9 +17,10 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 INSERT_AUCTION = text("""
-    INSERT INTO auctions (title, seller_id, starting_bid, current_bid, bid_count, status,
-                          starts_at, ends_at, hard_ends_at, event_seq, created_at, updated_at)
-    VALUES ('t', :seller, :starting_bid, :current_bid, :bid_count, :status,
+    INSERT INTO auctions (title, seller_id, starting_bid, current_bid, currency, bid_count,
+                          status, starts_at, ends_at, hard_ends_at, event_seq,
+                          created_at, updated_at)
+    VALUES ('t', :seller, :starting_bid, :current_bid, 'IDR', :bid_count, :status,
             now(), :ends_at, :hard_ends_at, 0, now(), now())
     """)
 
@@ -98,9 +99,10 @@ async def test_a_non_positive_bid_amount_is_rejected(sm):
         aid = (
             await s.execute(
                 text(
-                    "INSERT INTO auctions (title, seller_id, starting_bid, bid_count, status,"
-                    " starts_at, ends_at, hard_ends_at, event_seq, created_at, updated_at)"
-                    " VALUES ('t', :seller, 10.00, 0, 'open', now(), :ends_at, :hard, 0,"
+                    "INSERT INTO auctions (title, seller_id, starting_bid, currency,"
+                    " bid_count, status, starts_at, ends_at, hard_ends_at, event_seq,"
+                    " created_at, updated_at)"
+                    " VALUES ('t', :seller, 10.00, 'IDR', 0, 'open', now(), :ends_at, :hard, 0,"
                     " now(), now())"
                     " RETURNING id"
                 ),
@@ -112,8 +114,9 @@ async def test_a_non_positive_bid_amount_is_rejected(sm):
         async with sm() as s:
             await s.execute(
                 text(
-                    "INSERT INTO bids (auction_id, user_id, amount, created_at, updated_at)"
-                    " VALUES (:aid, :uid, 0, now(), now())"
+                    "INSERT INTO bids (auction_id, user_id, amount, currency,"
+                    " created_at, updated_at)"
+                    " VALUES (:aid, :uid, 0, 'IDR', now(), now())"
                 ),
                 {"aid": aid, "uid": seller},
             )
