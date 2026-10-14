@@ -114,7 +114,9 @@ class Auction(BigIntAuditBase):
     currency: Mapped[str] = mapped_column(Currency)
     current_winner_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     bid_count: Mapped[int] = mapped_column(default=0)
-    status: Mapped[str] = mapped_column(String(10), default="open")  # open | closed
+    # draft | open | closed | cancelled. A draft is unannounced, cancelled is withdrawn
+    # before anybody committed. The legal edges between them live in app.auctions.
+    status: Mapped[str] = mapped_column(String(10), default="open")
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     # The latest ends_at may ever be extended to. Fixed when the auction is created:
@@ -137,7 +139,7 @@ class Auction(BigIntAuditBase):
         CheckConstraint("hard_ends_at >= ends_at", name="ceiling_after_deadline"),
         # Both the bid guard and the closer read status. A typo'd value makes an auction
         # unbiddable and uncloseable at once, and nothing would report it.
-        CheckConstraint("status IN ('open', 'closed')", name="status_known"),
+        CheckConstraint("status IN ('draft', 'open', 'closed', 'cancelled')", name="status_known"),
         CheckConstraint("starting_bid > 0", name="starting_bid_positive"),
         # An accepted bid below the advertised price.
         CheckConstraint(

@@ -66,6 +66,91 @@ def _to_response(a: Auction | Row) -> AuctionResponse:
     )
 
 
+# The lifecycle, as a table of edges rather than a tree of ifs. A draft is a listing the
+# seller has not announced yet; cancelled is one withdrawn before anybody committed to it;
+# closed is what the deadline does.
+#
+# Keyed by destination, because that is what a caller asks for — "publish this" — and the
+# question the statement has to answer is whether the row is in a state that may go there.
+# An empty tuple means nothing may reach that state: nothing re-drafts an auction once it
+# has been announced, since the draft is the state before anyone has seen it.
+#
+# The table is the only place the machine is written down. _TRANSITION_SQL reads it as a
+# parameter, so a new edge is one entry here and no new SQL.
+#
+# `closed` is in the table because it is an edge of the machine, but nothing calls
+# transition() with it: the closer owns that edge and has to, because it closes every due
+# auction in one statement and writes an event per row. Its own WHERE carries the same
+# guard, and there is a test that it leaves a draft and a cancelled auction alone.
+LEGAL_FROM: dict[str, tuple[str, ...]] = {
+    "draft": (),
+    "open": ("draft",),
+    "closed": ("open",),
+    "cancelled": ("draft", "open"),
+}
+STATUSES = tuple(LEGAL_FROM)
+
+# One guarded UPDATE. The legality, the ownership and the bid check are all in the WHERE,
+# so there is no window between deciding and moving: two statements would let a bid land
+# between the check and the cancel, and the cancel would still go through.
+#
+# `status = ANY(...)` with an empty array matches nothing, which is how a
+# destination no edge reaches refuses itself without a special case. A same-state request
+# is refused for free: a state is never listed among the ones that may reach it. The CAST
+# is what asyncpg needs to type the list; without it the parameter arrives as a scalar and
+# every transition is refused.
+#
+# Two of the conditions are per destination. bid_count is only consulted for a cancel:
+# closing an auction that has bids is the point of closing it, and publishing one cannot
+# have any. The deadline is only consulted for a publish, because a draft sat on past its
+# own ends_at would open and then be closed by the very next closer tick — an auction that
+# was never biddable, announced to everyone watching.
+_TRANSITION_SQL = text("""
+    UPDATE auctions
+       SET status = :to, event_seq = event_seq + 1
+     WHERE id = :id
+       AND seller_id = :seller_id
+       AND status = ANY(CAST(:from_states AS varchar[]))
+       AND (:to <> 'cancelled' OR bid_count = 0)
+       AND (:to <> 'open' OR ends_at > clock_timestamp())
+    RETURNING *
+    """)
+
+
+async def transition(
+    session: AsyncSession, auction_id: int, to: str, *, seller_id: int
+) -> Row | None:
+    """Move an auction to `to`, or return None because the edge was not available.
+
+    None covers every refusal — illegal edge, wrong owner, bids already placed, no such
+    auction — on purpose. The caller cannot act on the difference, and spelling it out
+    would tell a stranger which auctions exist and how many bids they have.
+    """
+    row = (
+        await session.execute(
+            _TRANSITION_SQL,
+            {
+                "id": auction_id,
+                "to": to,
+                "seller_id": seller_id,
+                "from_states": list(LEGAL_FROM.get(to, ())),
+            },
+        )
+    ).first()
+    if row is None:
+        await session.rollback()
+        return None
+    # The event rides in the same transaction as the move, for the same reason a bid's
+    # does. event_seq counts events *published* about an auction, and the socket closes a
+    # subscriber that sees a number skipped — so a bump with no event would tell a watcher
+    # it had missed something that never existed. It is also the only way a watcher hears
+    # that the lot was withdrawn: the closer skips a cancelled auction, so no later event
+    # ever arrives.
+    session.add(_owed(row, _status_event(row)))
+    await session.commit()
+    return row
+
+
 # The Money column is Numeric(18,2), and this is exactly what it holds. Postgres raises
 # NumericValueOutOfRange above it, which asyncpg surfaces as a 500, and it silently rounds
 # a third decimal place — 10.005 becomes 10.01, so a bidder outbids by half a cent and is
@@ -121,11 +206,16 @@ async def create_auction(
     currency = data.currency.strip().upper()
     if not CURRENCY_CODE.fullmatch(currency):
         raise ClientException("currency must be a three-letter ISO 4217 code")
+    # Opt-in, and only these two: a client asking to be created closed or cancelled is
+    # asking for a state the machine reaches by an edge, not by a POST.
+    if data.status not in ("open", "draft"):
+        raise ClientException("status must be open or draft")
     auction = Auction(
         title=data.title,
         seller_id=current_user.id,
         starting_bid=data.starting_bid,
         currency=currency,
+        status=data.status,
         ends_at=ends_at,
         hard_ends_at=ends_at + MAX_EXTENSION,
     )
@@ -137,16 +227,71 @@ async def create_auction(
 
 @get("/auctions")
 async def list_auctions(db_session: AsyncSession) -> list[AuctionResponse]:
-    rows = await db_session.scalars(select(Auction).order_by(Auction.ends_at))
+    """Everything but the drafts.
+
+    A draft is the state before anyone has seen the listing, so publishing it here would
+    make the draft pointless. Cancelled and closed auctions stay: a bidder who was
+    watching needs to see why bidding stopped, and the results are the archive.
+    """
+    rows = await db_session.scalars(
+        select(Auction).where(Auction.status != "draft").order_by(Auction.ends_at)
+    )
     return [_to_response(a) for a in rows]
 
 
 @get("/auctions/{auction_id:int}")
 async def get_auction(auction_id: int, db_session: AsyncSession) -> AuctionResponse:
     auction = await db_session.get(Auction, auction_id)
-    if auction is None:
+    # A draft answers 404 rather than 403: this route takes no credentials, and a 403
+    # would confirm the id belongs to something. The seller reads their drafts from
+    # /auctions/mine.
+    if auction is None or auction.status == "draft":
         raise NotFoundException("auction not found")
     return _to_response(auction)
+
+
+async def _announce(db_session: AsyncSession, channels: ChannelsPlugin, row: Row) -> None:
+    """Publish the move the transition wrote, then mark it sent. Same shape as the bid
+    path: published here rather than left to the relay so a watcher hears it now, with
+    the outbox row as the safety net rather than the route.
+
+    An unsent row is picked up by the next relay tick and the watcher still hears it, just
+    a tick late — which is why the test asserts sent_at as well as the published event.
+    """
+    channels.publish(_status_event(row), _channel(row.id))
+    await mark_sent(db_session, row.id, row.event_seq)
+
+
+@post("/auctions/{auction_id:int}/publish", dependencies=_authed)
+async def publish_auction(
+    auction_id: int, current_user: User, db_session: AsyncSession, channels: ChannelsPlugin
+) -> AuctionResponse:
+    """Announce a draft. The only edge into open."""
+    row = await transition(db_session, auction_id, "open", seller_id=current_user.id)
+    if row is None:
+        raise HTTPException(
+            status_code=HTTP_409_CONFLICT,
+            detail="only the seller can publish their own auction, and only while it is a"
+            " draft whose deadline is still ahead",
+        )
+    await _announce(db_session, channels, row)
+    return _to_response(row)
+
+
+@post("/auctions/{auction_id:int}/cancel", dependencies=_authed)
+async def cancel_auction(
+    auction_id: int, current_user: User, db_session: AsyncSession, channels: ChannelsPlugin
+) -> AuctionResponse:
+    """Withdraw a listing nobody has bid on. 409 once a bid exists, because by then the
+    lot is somebody else's commitment and not only the seller's to withdraw."""
+    row = await transition(db_session, auction_id, "cancelled", seller_id=current_user.id)
+    if row is None:
+        raise HTTPException(
+            status_code=HTTP_409_CONFLICT,
+            detail="an auction can only be cancelled by its seller, before its first bid",
+        )
+    await _announce(db_session, channels, row)
+    return _to_response(row)
 
 
 # The entire correctness of an absolute auction: one conditional UPDATE. Postgres MVCC
@@ -208,6 +353,21 @@ def _closed_event(row: Row) -> dict:
         "auction_id": row.id,
         "winner_id": row.current_winner_id,
         "amount": str(row.current_bid) if row.current_bid is not None else None,
+        "ends_at": row.ends_at.astimezone(APP_TZ).isoformat(),
+        "seq": row.event_seq,
+    }
+
+
+def _status_event(row: Row) -> dict:
+    """A lifecycle move, announced like a bid or a close.
+
+    One type for all of them rather than one per status: a client switches on `type` and
+    `status` carries which way it went, so a state added later needs no new event type.
+    """
+    return {
+        "type": "status",
+        "auction_id": row.id,
+        "status": row.status,
         "ends_at": row.ends_at.astimezone(APP_TZ).isoformat(),
         "seq": row.event_seq,
     }
@@ -455,7 +615,11 @@ async def auction_ws(
     # The client is not expected to send anything; whatever arrives is discarded.
     async with channels.start_subscription(_channel(auction_id)) as subscriber:
         auction = await db_session.get(Auction, auction_id)
-        if auction is None:
+        # A draft is refused here and not only by the HTTP route. GET /auctions/{id}
+        # answers 404 for one, and a socket that handed the same row over would be the
+        # back door to a locked front one: the snapshot carries the whole auction, and a
+        # ticket is something any signed-up account can mint for any id.
+        if auction is None or auction.status == "draft":
             await socket.close(code=4404)
             return
         # Order matters, and it is the whole point of the snapshot. The subscription is

@@ -14,17 +14,26 @@ Criteria 1 and 2:
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 import pytest
+from litestar.exceptions import ClientException, HTTPException, NotFoundException
 from sqlalchemy import text
 
 from app.auctions import (
     LEGAL_FROM,
     STATUSES,
+    cancel_auction,
+    create_auction,
+    get_auction,
+    list_auctions,
+    publish_auction,
     transition,
 )
 from app.models import User
+from app.schemas import CreateAuctionRequest
 
 
 async def _seller(maker, email: str = "seller@x.com") -> User:
@@ -35,11 +44,17 @@ async def _seller(maker, email: str = "seller@x.com") -> User:
         return user
 
 
-async def _auction(maker, seller_id: int, status: str, bid_count: int = 0) -> int:
+async def _auction(
+    maker,
+    seller_id: int,
+    status: str,
+    bid_count: int = 0,
+    ends_delta: timedelta = timedelta(hours=1),
+) -> int:
     """Raw INSERT, naming every column, because the ORM would supply the very defaults
     under test — and because a draft is not reachable through create_auction's own path
     once the status is anything but open."""
-    ends_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    ends_at = datetime.now(timezone.utc) + ends_delta
     async with maker() as s:
         auction_id = (
             await s.execute(
@@ -148,3 +163,179 @@ async def test_cancel_is_allowed_while_no_bid_exists(sm):
     async with sm() as s:
         assert await transition(s, auction_id, "cancelled", seller_id=seller.id) is not None
     assert await _status(sm, auction_id) == "cancelled"
+
+
+async def test_a_draft_is_absent_from_the_public_list_and_by_id(sm):
+    """A draft is the state before anybody has seen the listing, so a public endpoint
+    showing one makes the draft pointless. 404 and not 403 by id: that route takes no
+    credentials, and a 403 would confirm the id belongs to something."""
+    seller = await _seller(sm)
+    draft = await _auction(sm, seller.id, "draft")
+    public = await _auction(sm, seller.id, "open")
+
+    async with sm() as s:
+        assert [a.id for a in await list_auctions.fn(db_session=s)] == [public]
+
+    async with sm() as s:
+        with pytest.raises(NotFoundException):
+            await get_auction.fn(auction_id=draft, db_session=s)
+    async with sm() as s:
+        assert (await get_auction.fn(auction_id=public, db_session=s)).id == public
+
+
+async def test_a_cancelled_auction_stays_public(sm):
+    """Deliberately not hidden. Somebody was watching it; they need to see why bidding
+    stopped, and a listing that vanishes looks like a bug or like a sale behind their
+    back."""
+    seller = await _seller(sm)
+    cancelled = await _auction(sm, seller.id, "cancelled")
+    async with sm() as s:
+        assert [a.id for a in await list_auctions.fn(db_session=s)] == [cancelled]
+    async with sm() as s:
+        assert (await get_auction.fn(auction_id=cancelled, db_session=s)).status == "cancelled"
+
+
+async def test_an_auction_cannot_be_created_into_a_state_an_edge_leads_to(sm):
+    """open and draft and nothing else. closed and cancelled are states the machine
+    reaches by an edge, and a POST that landed straight in one would be an auction with a
+    result nobody bid on."""
+    seller = await _seller(sm)
+    ends_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    for bad in ("closed", "cancelled", "scheduled", ""):
+        with pytest.raises(ClientException):
+            async with sm() as s:
+                await create_auction.fn(
+                    data=CreateAuctionRequest(
+                        title="t", starting_bid=Decimal("10.00"), ends_at=ends_at, status=bad
+                    ),
+                    current_user=seller,
+                    db_session=s,
+                )
+
+
+async def test_publish_and_cancel_answer_409_when_the_edge_is_not_available(sm, channels):
+    """The handlers' own refusal, not the statement's. 409 rather than 404 or 403: all
+    three reasons — not yours, wrong state, already has bids — answer the same, because a
+    caller cannot act on the difference and telling them apart says which auctions exist.
+    """
+    seller = await _seller(sm)
+    published = await _auction(sm, seller.id, "open")
+    with_bids = await _auction(sm, seller.id, "open", bid_count=1)
+
+    async with sm() as s:
+        with pytest.raises(HTTPException) as refused:
+            await publish_auction.fn(
+                auction_id=published, current_user=seller, db_session=s, channels=channels
+            )
+    assert refused.value.status_code == 409
+
+    async with sm() as s:
+        with pytest.raises(HTTPException) as refused:
+            await cancel_auction.fn(
+                auction_id=with_bids, current_user=seller, db_session=s, channels=channels
+            )
+    assert refused.value.status_code == 409
+
+
+async def test_publish_and_cancel_hand_back_the_auction_they_moved(sm, channels):
+    """The controls. A handler that raised on every call would pass the test above, and
+    the response is what tells a client the new status without a second request."""
+    seller = await _seller(sm)
+    draft = await _auction(sm, seller.id, "draft")
+    async with sm() as s:
+        assert (
+            await publish_auction.fn(
+                auction_id=draft, current_user=seller, db_session=s, channels=channels
+            )
+        ).status == "open"
+    async with sm() as s:
+        assert (
+            await cancel_auction.fn(
+                auction_id=draft, current_user=seller, db_session=s, channels=channels
+            )
+        ).status == "cancelled"
+
+
+async def test_a_stale_draft_cannot_be_published(sm):
+    """A draft sat on past its own deadline would open and then be closed by the very
+    next closer tick — an auction that was never biddable, announced to everyone watching
+    and then immediately resolved. The deadline is in the same WHERE as the edge."""
+    seller = await _seller(sm)
+    stale = await _auction(sm, seller.id, "draft", ends_delta=timedelta(seconds=-1))
+    async with sm() as s:
+        assert await transition(s, stale, "open", seller_id=seller.id) is None
+    assert await _status(sm, stale) == "draft"
+
+    # The control: the same edge on a draft whose deadline is still ahead.
+    fresh = await _auction(sm, seller.id, "draft")
+    async with sm() as s:
+        assert await transition(s, fresh, "open", seller_id=seller.id) is not None
+
+
+async def test_a_move_is_announced_with_the_sequence_number_it_consumed(sm):
+    """event_seq counts events *published* about an auction, and the socket closes a
+    subscriber that sees a number skipped. A bump with no event would tell a watcher it
+    had missed something that never existed — and cancelling would tell nobody at all,
+    since the closer skips a cancelled auction and no later event ever arrives.
+    """
+    seller = await _seller(sm)
+    auction_id = await _auction(sm, seller.id, "draft")
+
+    async with sm() as s:
+        await transition(s, auction_id, "open", seller_id=seller.id)
+    async with sm() as s:
+        await transition(s, auction_id, "cancelled", seller_id=seller.id)
+
+    async with sm() as s:
+        rows = (
+            await s.execute(
+                text("SELECT seq, payload FROM outbox WHERE auction_id = :id ORDER BY seq"),
+                {"id": auction_id},
+            )
+        ).all()
+    assert [r.seq for r in rows] == [1, 2]
+    assert [json.loads(r.payload)["status"] for r in rows] == ["open", "cancelled"]
+    assert [json.loads(r.payload)["type"] for r in rows] == ["status", "status"]
+    # One event per bump, so there is no hole for a watcher to trip over.
+    async with sm() as s:
+        assert await s.scalar(
+            text("SELECT event_seq FROM auctions WHERE id = :id"), {"id": auction_id}
+        ) == len(rows)
+
+
+async def test_a_refused_move_announces_nothing(sm):
+    """The rollback has to take the outbox row with it, or a refused cancel would still
+    tell every watcher the lot was withdrawn."""
+    seller = await _seller(sm)
+    auction_id = await _auction(sm, seller.id, "open", bid_count=1)
+    async with sm() as s:
+        assert await transition(s, auction_id, "cancelled", seller_id=seller.id) is None
+    async with sm() as s:
+        assert (
+            await s.scalar(
+                text("SELECT count(*) FROM outbox WHERE auction_id = :id"), {"id": auction_id}
+            )
+            == 0
+        )
+
+
+async def test_a_move_is_published_and_not_left_to_the_relay(sm, channels):
+    """The handler announces the move itself and marks the row sent; the relay is the
+    safety net, not the route.
+
+    Without this the suite cannot tell the two apart. An unsent outbox row is picked up by
+    the next relay tick and the watcher still hears it, just a tick late — which is how a
+    rebase quietly dropped both publish call sites with the whole suite green.
+    """
+    seller = await _seller(sm)
+    draft = await _auction(sm, seller.id, "draft")
+    async with sm() as s:
+        await publish_auction.fn(
+            auction_id=draft, current_user=seller, db_session=s, channels=channels
+        )
+    assert [channel for channel, _ in channels.published] == [f"auction:{draft}"]
+    assert [event["status"] for _, event in channels.published] == ["open"]
+    async with sm() as s:
+        assert await s.scalar(
+            text("SELECT sent_at IS NOT NULL FROM outbox WHERE auction_id = :id"), {"id": draft}
+        )
