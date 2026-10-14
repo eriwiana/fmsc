@@ -22,7 +22,12 @@ from sqlalchemy import Row, bindparam, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.auth import provide_current_user, purge_expired_tickets, user_for_ticket
+from app.auth import (
+    provide_current_user,
+    purge_expired_sessions,
+    purge_expired_tickets,
+    user_for_ticket,
+)
 from app.models import Auction, Bid, Outbox, User
 from app.schemas import AuctionResponse, BidRequest, CreateAuctionRequest
 
@@ -561,6 +566,7 @@ async def run_closer(
             await relay_pending(session_maker, channels)
             async with session_maker() as session:
                 await purge_expired_tickets(session)
+                await purge_expired_sessions(session)
                 await prune_outbox(session)
         except Exception:
             # Blind on purpose: a transient database error must not kill the loop. BLE001

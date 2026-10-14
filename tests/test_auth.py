@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 from litestar.exceptions import NotAuthorizedException
@@ -21,6 +22,8 @@ from sqlalchemy import text
 
 from app.auth import (
     SESSION_TTL,
+    provide_token,
+    purge_expired_sessions,
     revoke_all_sessions,
     revoke_session,
     user_for_token,
@@ -144,3 +147,28 @@ async def test_revoke_all_revokes_every_session(sm):
     async with sm() as s:
         assert (await user_for_token(s, bystander)).email == "bystander@x.com"
 
+
+async def test_an_expired_session_is_purged_and_a_live_one_is_kept(sm):
+    """Beyond the criteria, and needed by them: once sessions expire, nothing else deletes
+    the dead rows, so the table would grow by one row per login forever. Same sweeper slot
+    in the closer's tick as the tickets.
+    """
+    user = await _user(sm, "sweep@x.com")
+    await _session(sm, user.id, "dead", timedelta(seconds=-1))
+    live = await _session(sm, user.id, "alive", SESSION_TTL)
+
+    async with sm() as s:
+        assert await purge_expired_sessions(s) == 1
+    async with sm() as s:
+        assert (await user_for_token(s, live)).email == "sweep@x.com"
+
+
+async def test_logout_without_a_token_is_refused(sm):
+    """A 204 would tell a client whose Authorization header never got built that it had
+    signed out. An unknown or expired token still gets the 204 — that one is already
+    true — so this is about the absent header, not about which tokens exist."""
+    with pytest.raises(NotAuthorizedException):
+        await provide_token(SimpleNamespace(headers={}))
+    with pytest.raises(NotAuthorizedException):
+        await provide_token(SimpleNamespace(headers={"Authorization": "Bearer "}))
+    assert await provide_token(SimpleNamespace(headers={"Authorization": "Bearer abc"})) == "abc"

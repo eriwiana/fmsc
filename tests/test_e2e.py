@@ -394,3 +394,31 @@ def test_an_expired_ticket_is_rejected(client, clean_db):
     ):
         socket.receive(timeout=READ_TIMEOUT)
     assert closed.value.code == 4401
+
+
+def test_logout_revokes_the_token_it_was_given(client, clean_db):
+    """Routing for criterion 2. Every other session test calls the functions directly, so
+    without this the endpoints could be unregistered and the suite would not notice."""
+    first = _signup(client, "logout@x.com")
+    second = client.post(
+        "/auth/login", json={"email": "logout@x.com", "password": PASSWORD}
+    ).json()["token"]
+
+    assert (
+        client.post("/auth/logout", headers={"Authorization": f"Bearer {first}"}).status_code == 204
+    )
+    assert (
+        client.post("/ws/tickets", headers={"Authorization": f"Bearer {first}"}).status_code == 401
+    )
+    # The second session is untouched: logging out of one device is not logging out of all.
+    assert (
+        client.post("/ws/tickets", headers={"Authorization": f"Bearer {second}"}).status_code == 201
+    )
+
+    assert (
+        client.post("/auth/logout-all", headers={"Authorization": f"Bearer {second}"}).status_code
+        == 204
+    )
+    assert (
+        client.post("/ws/tickets", headers={"Authorization": f"Bearer {second}"}).status_code == 401
+    )

@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from litestar import Request, post
 from litestar.di import Provide
 from litestar.exceptions import ClientException, NotAuthorizedException
-from sqlalchemy import select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,6 +19,12 @@ from app.schemas import SignupRequest, TicketResponse, TokenResponse
 # Long enough to open a socket on a slow connection, short enough that one captured from
 # a log or a Referer header is already dead.
 TICKET_TTL = timedelta(seconds=30)
+
+# How long a login lasts. Chosen, not measured: long enough that bidders are not asked to
+# sign in mid-auction, short enough that a token leaked today is useless next month.
+# Logout and revoke-all are what handle a token known to have leaked; this is the backstop
+# for the ones nobody notices.
+SESSION_TTL = timedelta(days=7)
 
 # scrypt params: stdlib, no dependency. n=2**14 is a sane interactive cost.
 _SCRYPT = {"n": 2**14, "r": 8, "p": 1}
@@ -38,7 +44,13 @@ def verify_password(password: str, stored: str) -> bool:
 
 async def _issue_token(db_session: AsyncSession, user_id: int) -> str:
     token = secrets.token_urlsafe(32)
-    db_session.add(Session(token=token, user_id=user_id))
+    db_session.add(
+        Session(
+            token=token,
+            user_id=user_id,
+            expires_at=datetime.now(timezone.utc) + SESSION_TTL,
+        )
+    )
     await db_session.commit()
     return token
 
@@ -67,24 +79,93 @@ async def login(data: SignupRequest, db_session: AsyncSession) -> TokenResponse:
     return TokenResponse(token=await _issue_token(db_session, user.id))
 
 
+def bearer_token(request: Request) -> str:
+    return request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+
+
 async def provide_current_user(request: Request, db_session: AsyncSession) -> User:
     """HTTP auth dependency: resolve `Authorization: Bearer <token>` to a User."""
-    token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    return await user_for_token(db_session, token)
+    return await user_for_token(db_session, bearer_token(request))
+
+
+async def provide_token(request: Request) -> str:
+    """For logout, which revokes the presented token rather than resolving it to a user.
+
+    Presenting the token is the authorisation: it deletes its own row and nothing else,
+    so an already-expired token can still clean up after itself.
+
+    An empty header is refused rather than answered 204, because there is no token for
+    that answer to be true of: a client whose header never got built would otherwise be
+    told it had signed out. An unknown or expired token still gets the 204 — that one is
+    already true, and telling the two apart would say which tokens exist.
+    """
+    token = bearer_token(request)
+    if not token:
+        raise NotAuthorizedException("missing token")
+    return token
 
 
 async def user_for_token(db_session: AsyncSession, token: str) -> User:
     if not token:
         raise NotAuthorizedException("missing token")
     user = await db_session.scalar(
-        select(User).join(Session, Session.user_id == User.id).where(Session.token == token)
+        select(User)
+        .join(Session, Session.user_id == User.id)
+        .where(Session.token == token, Session.expires_at > func.clock_timestamp())
     )
+    # One message for an unknown token and an expired one: the difference is not the
+    # caller's business, and spelling it out says which tokens once existed.
     if user is None:
-        raise NotAuthorizedException("invalid token")
+        raise NotAuthorizedException("invalid or expired token")
     return user
 
 
+async def revoke_session(db_session: AsyncSession, token: str) -> int:
+    """Log out one session. Returns how many rows went, which is 0 or 1.
+
+    A logout with an unknown token is not an error — it is already true — and answering
+    the same either way keeps it from being a way to probe which tokens exist.
+    """
+    result = await db_session.execute(delete(Session).where(Session.token == token))
+    await db_session.commit()
+    return result.rowcount
+
+
+async def revoke_all_sessions(db_session: AsyncSession, user_id: int) -> int:
+    """Log out everywhere. The answer to a token that has already leaked, and the reason
+    expiry alone is not enough: seven days is a long time to wait for a stolen laptop."""
+    result = await db_session.execute(delete(Session).where(Session.user_id == user_id))
+    await db_session.commit()
+    return result.rowcount
+
+
+async def purge_expired_sessions(db_session: AsyncSession) -> int:
+    """Expired sessions authenticate nothing and are never read again.
+
+    clock_timestamp(), not now(), for the same reason as the tickets below.
+    """
+    result = await db_session.execute(
+        text("DELETE FROM sessions WHERE expires_at <= clock_timestamp()")
+    )
+    await db_session.commit()
+    return result.rowcount
+
+
 _authed = {"current_user": Provide(provide_current_user)}
+
+
+@post("/auth/logout", dependencies={"token": Provide(provide_token)}, status_code=204)
+async def logout(token: str, db_session: AsyncSession) -> None:
+    """Revoke the presented session and nothing else: signing out of a laptop leaves the
+    phone signed in, or nobody uses it, and a revocation nobody uses protects nothing."""
+    await revoke_session(db_session, token)
+
+
+@post("/auth/logout-all", dependencies=_authed, status_code=204)
+async def logout_all(current_user: User, db_session: AsyncSession) -> None:
+    """Revoke every session this user has, including the one making the request."""
+    await revoke_all_sessions(db_session, current_user.id)
+
 
 # DELETE ... RETURNING is the check: the row is gone whether or not it turns out to be
 # valid, so a ticket cannot be presented twice even by two sockets arriving together.

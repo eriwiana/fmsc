@@ -39,9 +39,21 @@ class User(BigIntAuditBase):
 
 
 class Session(BigIntBase):
+    """An HTTP session token. Expires, and can be revoked one at a time or all at once.
+
+    A token with no expiry is a password that cannot be changed: one copied out of a log,
+    a backup or a browser on a shared laptop is a permanent key to the account, and the
+    only remedy is to delete the user.
+    """
+
     __tablename__ = "sessions"
     token: Mapped[str] = mapped_column(String(64), unique=True, index=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    # Judged by Postgres against clock_timestamp(), never compared in Python. See
+    # user_for_token. Indexed for the sweeper, which is the only thing that reads sessions
+    # by expiry rather than by token: one row arrives per login and the sweep runs every
+    # tick, so an unindexed scan grows with every account that has ever signed in.
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class WsTicket(BigIntBase):
