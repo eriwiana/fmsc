@@ -112,6 +112,10 @@ class Auction(BigIntAuditBase):
     # currency is in use: an amount without its unit is not a price, and the cost of
     # adding the column later is a money migration over live bids.
     currency: Mapped[str] = mapped_column(Currency)
+    # The price below which the seller will not sell, and nobody else is told what it is.
+    # NULL means there is none, which is what an absolute auction is: starting_bid is then
+    # the only floor. Evaluated inside the bid statement, never in the handler.
+    reserve: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
     current_winner_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     bid_count: Mapped[int] = mapped_column(default=0)
     # draft | open | closed | cancelled. A draft is unannounced, cancelled is withdrawn
@@ -145,6 +149,12 @@ class Auction(BigIntAuditBase):
         CheckConstraint(
             "current_bid IS NULL OR current_bid >= starting_bid",
             name="current_bid_at_least_starting",
+        ),
+        # A reserve under the advertised starting price is not a reserve; it would also
+        # make the bid statement's COALESCE floor lower than starting_bid, so the two
+        # guards there would disagree about what the minimum is.
+        CheckConstraint(
+            "reserve IS NULL OR reserve >= starting_bid", name="reserve_at_least_starting"
         ),
         CheckConstraint("event_seq >= 0", name="event_seq_not_negative"),
         CheckConstraint(CURRENCY_IS_A_CODE, name="currency_is_a_code"),

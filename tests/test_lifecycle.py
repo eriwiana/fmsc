@@ -462,6 +462,58 @@ async def test_a_refused_move_announces_nothing(sm):
         )
 
 
+async def test_a_reserve_under_the_starting_bid_is_a_400_and_not_a_500(sm):
+    """ck_auctions_reserve_at_least_starting refuses the pair, and an IntegrityError
+    reaching the client is a 500 with nothing in it they can act on. Three ways in: at
+    creation, by raising the starting bid, and by lowering the reserve."""
+    seller = await _seller(sm)
+    ends_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    with pytest.raises(ClientException):
+        async with sm() as s:
+            await create_auction.fn(
+                data=CreateAuctionRequest(
+                    title="t",
+                    starting_bid=Decimal("100.00"),
+                    ends_at=ends_at,
+                    reserve=Decimal("50.00"),
+                ),
+                current_user=seller,
+                db_session=s,
+            )
+
+    async with sm() as s:
+        created = await create_auction.fn(
+            data=CreateAuctionRequest(
+                title="t",
+                starting_bid=Decimal("10.00"),
+                ends_at=ends_at,
+                reserve=Decimal("100.00"),
+            ),
+            current_user=seller,
+            db_session=s,
+        )
+    for bad in (
+        EditAuctionRequest(starting_bid=Decimal("500.00")),
+        EditAuctionRequest(reserve=Decimal("1.00")),
+    ):
+        async with sm() as s:
+            with pytest.raises(ClientException):
+                await edit_auction.fn(
+                    auction_id=created.id, data=bad, current_user=seller, db_session=s
+                )
+
+    # The pair moved together is fine, which is what makes the refusals above about the
+    # combination rather than about either field.
+    async with sm() as s:
+        edited = await edit_auction.fn(
+            auction_id=created.id,
+            data=EditAuctionRequest(starting_bid=Decimal("500.00"), reserve=Decimal("600.00")),
+            current_user=seller,
+            db_session=s,
+        )
+    assert edited.reserve == Decimal("600.00")
+
+
 async def test_a_move_is_published_and_not_left_to_the_relay(sm, channels):
     """The handler announces the move itself and marks the row sent; the relay is the
     safety net, not the route.

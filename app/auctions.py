@@ -52,9 +52,15 @@ def resolve_deadline(dt: datetime) -> datetime:
     return dt.replace(tzinfo=APP_TZ) if dt.tzinfo is None else dt
 
 
-def _to_response(a: Auction | Row) -> AuctionResponse:
+def _to_response(a: Auction | Row, *, reveal_reserve: bool = False) -> AuctionResponse:
     """Works off either the ORM object or a raw RETURNING row — both expose the columns
-    by name, and the bid path has only the row."""
+    by name, and the bid path has only the row.
+
+    The reserve is the seller's own number and is withheld by default: a bidder who can
+    read it can bid exactly it, which turns the seller's floor into their ceiling. The
+    seller's own routes pass reveal_reserve, because a seller who cannot read back what
+    they set cannot tell a typo from a decision.
+    """
     return AuctionResponse(
         id=a.id,
         title=a.title,
@@ -64,6 +70,7 @@ def _to_response(a: Auction | Row) -> AuctionResponse:
         current_winner_id=a.current_winner_id,
         bid_count=a.bid_count,
         currency=a.currency,
+        reserve=a.reserve if reveal_reserve else None,
         status=a.status,
         starts_at=a.starts_at.astimezone(APP_TZ),
         ends_at=a.ends_at.astimezone(APP_TZ),
@@ -206,6 +213,10 @@ async def create_auction(
         raise ClientException("ends_at must be in the future")
     if data.starting_bid <= 0:
         raise ClientException("starting_bid must be positive")
+    # ck_auctions_reserve_at_least_starting enforces this too. Checked here so the refusal
+    # is a 400 naming the field rather than the 500 an IntegrityError becomes.
+    if data.reserve is not None and data.reserve < data.starting_bid:
+        raise ClientException("reserve must be at least the starting bid")
     # Normalised here rather than relied on from the client: the table refuses anything
     # that is not three uppercase letters, and that refusal would arrive as a 500.
     currency = data.currency.strip().upper()
@@ -220,6 +231,7 @@ async def create_auction(
         seller_id=current_user.id,
         starting_bid=data.starting_bid,
         currency=currency,
+        reserve=data.reserve,
         status=data.status,
         ends_at=ends_at,
         hard_ends_at=ends_at + MAX_EXTENSION,
@@ -227,7 +239,7 @@ async def create_auction(
     db_session.add(auction)
     await db_session.commit()
     await db_session.refresh(auction)
-    return _to_response(auction)
+    return _to_response(auction, reveal_reserve=True)
 
 
 @get("/auctions")
@@ -269,16 +281,27 @@ async def get_auction(auction_id: int, db_session: AsyncSession) -> AuctionRespo
 #
 # status IN ('draft', 'open') and not just a bid count: a closed auction has a result and a
 # cancelled one is withdrawn, and editing the description of either rewrites history.
+#
+# The last condition pairs whichever of the two numbers the request carries with whichever
+# it leaves alone, and refuses the combination the table would refuse anyway. In the WHERE
+# rather than read and then checked, because a read would be a second statement and the
+# window between them is where the 500 lives.
+#
+# The IS NULL arm is not decoration: without it an auction with no reserve compares NULL
+# against its starting bid, which is NULL rather than true, and every edit is refused.
 _EDIT_SQL = text("""
     UPDATE auctions
        SET title = COALESCE(:title, title),
            starting_bid = COALESCE(:starting_bid, starting_bid),
+           reserve = COALESCE(:reserve, reserve),
            ends_at = COALESCE(:ends_at, ends_at),
            hard_ends_at = COALESCE(:ends_at + :extension, hard_ends_at)
      WHERE id = :id
        AND seller_id = :seller_id
        AND bid_count = 0
        AND status IN ('draft', 'open')
+       AND (COALESCE(:reserve, reserve) IS NULL
+            OR COALESCE(:reserve, reserve) >= COALESCE(:starting_bid, starting_bid))
     RETURNING *
     """)
 
@@ -309,6 +332,7 @@ async def edit_auction(
                 "seller_id": current_user.id,
                 "title": data.title,
                 "starting_bid": data.starting_bid,
+                "reserve": data.reserve,
                 "ends_at": ends_at,
                 "extension": MAX_EXTENSION,
             },
@@ -316,12 +340,21 @@ async def edit_auction(
     ).first()
     await db_session.commit()
     if row is None:
+        # One read, on the refusal path only, to tell "you may not edit this" from "these
+        # two numbers do not go together" — the second is a 400 the seller can act on, and
+        # answering 409 for it would send them looking for a bid that is not there.
+        auction = await db_session.get(Auction, auction_id)
+        if auction is not None and auction.seller_id == current_user.id:
+            reserve = data.reserve if data.reserve is not None else auction.reserve
+            floor = data.starting_bid if data.starting_bid is not None else auction.starting_bid
+            if reserve is not None and reserve < floor:
+                raise ClientException("reserve must be at least the starting bid")
         raise HTTPException(
             status_code=HTTP_409_CONFLICT,
             detail="an auction can only be edited by its seller, before its first bid,"
             " and only while it is a draft or open",
         )
-    return _to_response(row)
+    return _to_response(row, reveal_reserve=True)
 
 
 async def _announce(db_session: AsyncSession, channels: ChannelsPlugin, row: Row) -> None:
@@ -349,7 +382,7 @@ async def publish_auction(
             " draft whose deadline is still ahead",
         )
     await _announce(db_session, channels, row)
-    return _to_response(row)
+    return _to_response(row, reveal_reserve=True)
 
 
 @post("/auctions/{auction_id:int}/cancel", dependencies=_authed)
@@ -365,7 +398,7 @@ async def cancel_auction(
             detail="an auction can only be cancelled by its seller, before its first bid",
         )
     await _announce(db_session, channels, row)
-    return _to_response(row)
+    return _to_response(row, reveal_reserve=True)
 
 
 # The entire correctness of an absolute auction: one conditional UPDATE. Postgres MVCC
@@ -388,6 +421,13 @@ async def cancel_auction(
 #
 # WHERE still reads the pre-update ends_at, so a bid that arrives after the deadline loses
 # rather than extending its way back in.
+#
+# The reserve is a floor in this same WHERE, which is the whole of criterion 3: a handler
+# that read the reserve and then decided would be two statements, and the reserve could be
+# edited between them. COALESCE(reserve, starting_bid) means no reserve is not a special
+# case. The starting_bid guard above is kept even though the constraint
+# reserve >= starting_bid makes it redundant: if that constraint is ever dropped, a reserve
+# set below the advertised price must not become a way under the advertised price.
 _BID_SQL = text("""
     UPDATE auctions
        SET current_bid = :amount, current_winner_id = :uid, bid_count = bid_count + 1,
@@ -396,6 +436,7 @@ _BID_SQL = text("""
      WHERE id = :id AND status = 'open' AND ends_at > clock_timestamp()
        AND seller_id <> :uid
        AND :amount >= starting_bid
+       AND :amount >= COALESCE(reserve, starting_bid)
        AND (current_bid IS NULL OR :amount > current_bid)
     RETURNING *
     """)
@@ -604,6 +645,10 @@ async def reject_reason(
         return "a seller cannot bid on their own auction"
     if amount < auction.starting_bid:
         return f"bid must be at least {auction.starting_bid}"
+    if auction.reserve is not None and amount < auction.reserve:
+        # The number is not in the message. A reserve a bidder can read is a reserve they
+        # can bid exactly, which is the seller's floor turned into the seller's ceiling.
+        return "the seller's reserve has not been met"
     if auction.current_bid is not None and amount <= auction.current_bid:
         return f"bid must be above {auction.current_bid}"
     return "outbid while the bid was in flight"

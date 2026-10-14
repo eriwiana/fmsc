@@ -38,7 +38,11 @@ PASSWORD = "correct horse battery staple"
 
 
 async def _seed(
-    maker, starting="10.00", ends_delta=timedelta(hours=1), extension=MAX_EXTENSION
+    maker,
+    starting="10.00",
+    ends_delta=timedelta(hours=1),
+    extension=MAX_EXTENSION,
+    reserve=None,
 ) -> tuple[int, int, int]:
     """One seller, one bidder, one auction. Seller and bidder are distinct on purpose:
     an auction whose seller is also its only bidder cannot exercise the real guards."""
@@ -53,6 +57,7 @@ async def _seed(
             seller_id=seller.id,
             currency="IDR",
             starting_bid=Decimal(starting),
+            reserve=None if reserve is None else Decimal(reserve),
             ends_at=ends_at,
             hard_ends_at=ends_at + extension,
         )
@@ -646,3 +651,86 @@ async def test_reason_names_an_out_of_range_amount(sm):
     assert (
         reason == "amount must be between 0.01 and 9999999999999999.99, to at most 2 decimal places"
     )
+
+
+async def test_a_bid_below_the_reserve_does_not_win(sm):
+    """Criterion 3 of M8. The reserve is the price below which the seller will not sell,
+    and it is a floor in the bid statement's own WHERE — not a number the handler reads
+    and then decides on. Two statements could have the reserve edited between them.
+    """
+    _, bidder, aid = await _seed(sm, starting="10.00", reserve="100.00")
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("50.00")) is None
+    async with sm() as s:
+        row = (
+            await s.execute(
+                text(
+                    "SELECT current_bid, current_winner_id, bid_count FROM auctions WHERE id = :id"
+                ),
+                {"id": aid},
+            )
+        ).one()
+    # Not merely "did not win": nothing about the auction moved, so there is no half-bid
+    # for the closer or a watcher to see.
+    assert row.current_bid is None
+    assert row.current_winner_id is None
+    assert row.bid_count == 0
+
+
+async def test_a_bid_at_the_reserve_wins(sm):
+    """The control. A floor that refused everything would pass the test above, and the
+    reserve is a minimum rather than something to be beaten."""
+    _, bidder, aid = await _seed(sm, starting="10.00", reserve="100.00")
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("100.00")) is not None
+
+
+async def test_an_auction_with_no_reserve_only_has_its_starting_bid_as_a_floor(sm):
+    """NULL is not a special case anywhere: COALESCE(reserve, starting_bid) is the floor,
+    so an absolute auction behaves exactly as it did before the column existed."""
+    _, bidder, aid = await _seed(sm, starting="10.00")
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("10.00")) is not None
+
+
+async def test_the_reserve_is_not_named_in_the_refusal(sm):
+    """A reserve a bidder can read is a reserve they can bid exactly, which turns the
+    seller's floor into the seller's ceiling."""
+    seller, bidder, aid = await _seed(sm, starting="10.00", reserve="100.00")
+    reason = await _reason(sm, aid, bidder, "50.00")
+    assert reason == "the seller's reserve has not been met"
+    assert "100" not in reason
+
+
+async def test_the_reserve_is_withheld_from_everyone_but_the_seller(sm):
+    """It reaches the seller, because a seller who cannot read back what they set cannot
+    tell a typo from a decision, and nobody else."""
+    _, _, aid = await _seed(sm, starting="10.00", reserve="100.00")
+    async with sm() as s:
+        auction = await s.get(Auction, aid)
+    assert _to_response(auction).reserve is None
+    assert _to_response(auction, reveal_reserve=True).reserve == Decimal("100.00")
+
+
+async def test_the_reserve_check_rides_in_the_one_bid_update(sm):
+    """Criterion 3's second half. The reserve must not have cost a second statement: the
+    window between two of them is where the closer fires, which is the same reasoning as
+    the extension above.
+    """
+    updates = []
+    engine = sm.kw["bind"].sync_engine
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def record(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("UPDATE AUCTIONS"):
+            updates.append(statement)
+
+    try:
+        _, bidder, aid = await _seed(sm, starting="10.00", reserve="100.00")
+        async with sm() as s:
+            assert await place_bid_tx(s, aid, bidder, Decimal("100.00")) is not None
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    assert len(updates) == 1, f"the bid path issued {len(updates)} UPDATEs on auctions"
+    assert "reserve" in updates[0].lower()

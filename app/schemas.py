@@ -26,6 +26,7 @@ class CreateAuctionRequest(msgspec.Struct):
     ends_at: datetime  # must be timezone-aware, in the future
     currency: str = "IDR"  # ISO 4217; normalised and checked in create_auction
     status: str = "open"  # "draft" to keep it unannounced; nothing else is accepted
+    reserve: Decimal | None = None  # the seller's floor, never echoed to a bidder
 
 
 class EditAuctionRequest(msgspec.Struct):
@@ -34,6 +35,7 @@ class EditAuctionRequest(msgspec.Struct):
 
     title: str | None = None
     starting_bid: Decimal | None = None
+    reserve: Decimal | None = None
     ends_at: datetime | None = None
 
 
@@ -50,6 +52,8 @@ class AuctionResponse(msgspec.Struct):
     current_winner_id: int | None
     bid_count: int
     currency: str
+    # NULL for everyone but the seller, whether or not one is set. See _to_response.
+    reserve: Decimal | None
     status: str
     starts_at: datetime
     ends_at: datetime

@@ -618,3 +618,40 @@ def test_a_watcher_is_told_when_the_lot_is_withdrawn(client, clean_db):
         event = json.loads(socket.receive(timeout=READ_TIMEOUT)["text"])
     assert event["type"] == "status"
     assert event["status"] == "cancelled"
+
+
+def test_a_reserve_under_the_starting_bid_answers_400(client, clean_db):
+    """ck_auctions_reserve_at_least_starting refuses the pair, and nothing on the app maps
+    an IntegrityError — so without the guards all three of these were 500s."""
+    seller = _seller(client, "seller@x.com")
+    headers = {"Authorization": f"Bearer {seller}"}
+    ends_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+
+    assert (
+        client.post(
+            "/auctions",
+            headers=headers,
+            json={"title": "t", "starting_bid": "100.00", "reserve": "50.00", "ends_at": ends_at},
+        ).status_code
+        == 400
+    )
+
+    created = client.post(
+        "/auctions",
+        headers=headers,
+        json={"title": "t", "starting_bid": "10.00", "reserve": "100.00", "ends_at": ends_at},
+    )
+    assert created.status_code == 201
+    auction_id = created.json()["id"]
+    assert (
+        client.patch(
+            f"/auctions/{auction_id}", headers=headers, json={"starting_bid": "500.00"}
+        ).status_code
+        == 400
+    )
+    assert (
+        client.patch(
+            f"/auctions/{auction_id}", headers=headers, json={"reserve": "1.00"}
+        ).status_code
+        == 400
+    )
