@@ -101,6 +101,66 @@ class LoginAttempt(BigIntBase):
     )
 
 
+class Community(BigIntAuditBase):
+    """A group whose auctions only its members may bid on.
+
+    Owner rights come from owner_id and never from a membership row. Deriving them from
+    a membership would mean remove-all locks the owner out of their own community, which
+    is the one action they can take to recover from a leaked code.
+    """
+
+    __tablename__ = "communities"
+    name: Mapped[str] = mapped_column(String(100))
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    # Bumped by remove-all instead of deleting membership rows, so the audit trail
+    # survives the action that ends every membership. A membership counts only while its
+    # generation matches this one.
+    membership_generation: Mapped[int] = mapped_column(default=0)
+
+    __table_args__ = (
+        CheckConstraint("membership_generation >= 0", name="generation_not_negative"),
+    )
+
+
+class CommunityMembership(BigIntAuditBase):
+    """One person's membership of one community, in one generation.
+
+    Rows are never deleted. A kick sets revoked_at, a remove-all bumps the community's
+    generation and leaves every row where it is, so "who was in this community when that
+    lot sold" stays answerable.
+    """
+
+    __tablename__ = "community_memberships"
+    community_id: Mapped[int] = mapped_column(ForeignKey("communities.id"))
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    # The community's generation at the time this membership was granted. Compared against
+    # the community's current one by the bid statement.
+    generation: Mapped[int]
+    # NULL while the membership stands. A kick sets it, and the bid guard compares it with
+    # the auction's start so a kick cannot reach back into an auction already open.
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        # One *live* membership per person per generation. A second live row would be a
+        # duplicate join, and the bid guard's EXISTS would not notice.
+        #
+        # Partial, on revoked_at IS NULL, because a revoked row must not block a rejoin:
+        # a kick leaves the row at the current generation, so a plain constraint makes a
+        # mistaken kick permanent — the only remedy being remove-all, which ends everyone
+        # else's membership too. The revoked rows stay as the record of the kick.
+        Index(
+            "uq_memberships_community_user_generation",
+            "community_id",
+            "user_id",
+            "generation",
+            unique=True,
+            postgresql_where=text("revoked_at IS NULL"),
+        ),
+        # What the bid guard's EXISTS reads: a membership for this community and user.
+        Index("ix_memberships_community_user", "community_id", "user_id"),
+    )
+
+
 class Auction(BigIntAuditBase):
     __tablename__ = "auctions"
     title: Mapped[str] = mapped_column(String(200))
@@ -108,6 +168,11 @@ class Auction(BigIntAuditBase):
     # foreign key for you — without this, reading one seller's listings scans every auction
     # on the service.
     seller_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    # NULL means a public auction, which is every auction that existed before communities
+    # did. Not NULL gates bidding on membership — viewing stays public either way.
+    community_id: Mapped[int | None] = mapped_column(
+        ForeignKey("communities.id"), nullable=True, index=True
+    )
     starting_bid: Mapped[Decimal] = mapped_column(Money)
     # NULL current_bid = no bids yet, so the opening bid may equal starting_bid.
     current_bid: Mapped[Decimal | None] = mapped_column(Money, nullable=True)

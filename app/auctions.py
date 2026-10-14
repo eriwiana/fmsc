@@ -479,6 +479,17 @@ async def cancel_auction(
 # test can tell them apart. The ordering stays as written because it is still the correct
 # one if that constraint is ever dropped.
 #
+# Membership rides in the same WHERE as everything else, which is the whole of criterion
+# 1. A handler that read the membership and then bid would be two statements, and a
+# revocation landing in the gap between them would still see the bid accepted; this EXISTS
+# is re-read by the UPDATE under its own row lock, so a committed removal is seen. The
+# generation comparison is what makes remove-all work: it bumps the community's counter
+# rather than deleting rows, so every membership from the generation before it stops
+# counting at once while the audit trail survives.
+#
+# community_id IS NULL first, so a public auction is not a special case and costs no
+# subquery. Viewing is public either way — only bidding is gated.
+#
 # The increment rides in the same WHERE for the same reason as the reserve, and it only
 # applies once there is a leader: an opening bid has nothing to beat, so it may still equal
 # starting_bid.
@@ -502,6 +513,13 @@ _BID_SQL = text(
        AND seller_id <> :uid
        AND :amount >= starting_bid
        AND :amount >= COALESCE(reserve, starting_bid)
+       AND (community_id IS NULL OR EXISTS (
+                SELECT 1
+                  FROM community_memberships m
+                  JOIN communities c ON c.id = m.community_id
+                 WHERE m.community_id = auctions.community_id
+                   AND m.user_id = :uid
+                   AND m.generation = c.membership_generation))
        AND (current_bid IS NULL OR :amount >= current_bid + """
     + _increment_case("current_bid")
     + """)
