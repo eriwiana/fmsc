@@ -32,7 +32,8 @@ async def sm():
     async with maker() as s:
         await s.execute(
             text(
-                "TRUNCATE outbox, bids, auctions, ws_tickets, sessions, users RESTART IDENTITY CASCADE"
+                "TRUNCATE outbox, bids, auctions, ws_tickets, sessions, login_attempts, users"
+                " RESTART IDENTITY CASCADE"
             )
         )
         await s.commit()

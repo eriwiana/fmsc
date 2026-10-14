@@ -16,13 +16,20 @@ from litestar.exceptions import (
     HTTPException,
     NotAuthorizedException,
     NotFoundException,
+    PermissionDeniedException,
 )
 from litestar.status_codes import HTTP_409_CONFLICT
 from sqlalchemy import Row, bindparam, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.auth import provide_current_user, purge_expired_tickets, user_for_ticket
+from app.auth import (
+    provide_current_user,
+    prune_login_attempts,
+    purge_expired_sessions,
+    purge_expired_tickets,
+    user_for_ticket,
+)
 from app.models import Auction, Bid, Outbox, User
 from app.schemas import AuctionResponse, BidRequest, CreateAuctionRequest
 
@@ -95,6 +102,15 @@ def _channel(auction_id: int) -> str:
 async def create_auction(
     data: CreateAuctionRequest, current_user: User, db_session: AsyncSession
 ) -> AuctionResponse:
+    # Selling, not bidding: an auction is a promise to deliver, and the seller is who a
+    # buyer has to be able to reach. Bidding stays open to an unverified account on
+    # purpose — the money only moves at settlement, which is where M11 can ask again.
+    #
+    # First, before the payload is looked at, so an unverified caller is told the one
+    # thing they can act on. Validating first would answer 400 on the field they got
+    # wrong and 403 only once they fixed it, which reads as the field being the problem.
+    if current_user.verified_at is None:
+        raise PermissionDeniedException("verify your email address before selling")
     ends_at = resolve_deadline(data.ends_at)
     if ends_at <= datetime.now(timezone.utc):
         raise ClientException("ends_at must be in the future")
@@ -561,6 +577,8 @@ async def run_closer(
             await relay_pending(session_maker, channels)
             async with session_maker() as session:
                 await purge_expired_tickets(session)
+                await purge_expired_sessions(session)
+                await prune_login_attempts(session)
                 await prune_outbox(session)
         except Exception:
             # Blind on purpose: a transient database error must not kill the loop. BLE001
