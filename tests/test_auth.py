@@ -17,7 +17,11 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
-from litestar.exceptions import NotAuthorizedException, TooManyRequestsException
+from litestar.exceptions import (
+    ClientException,
+    NotAuthorizedException,
+    TooManyRequestsException,
+)
 from sqlalchemy import text
 
 from app import auth
@@ -25,6 +29,7 @@ from app.auth import (
     LOGIN_WINDOW,
     MAX_FAILURES_PER_ACCOUNT,
     MAX_FAILURES_PER_IP,
+    MIN_PASSWORD_LENGTH,
     SESSION_TTL,
     client_ip,
     hash_password,
@@ -35,6 +40,7 @@ from app.auth import (
     purge_expired_sessions,
     revoke_all_sessions,
     revoke_session,
+    signup,
     user_for_token,
 )
 from app.models import User
@@ -369,6 +375,42 @@ async def test_a_forged_forwarded_header_cannot_buy_a_fresh_budget(sm):
         # Counted against the proxy's entry, not the claimed one.
         assert await login_retry_after(s, "whoever@x.com", real) is not None
         assert await login_retry_after(s, "whoever@x.com", claimed) is None
+
+
+async def test_a_short_password_is_refused_at_signup(sm):
+    """Criterion 5. `password` is eight characters and is the first thing anyone tries;
+    the policy is a length floor, so it is refused for being short rather than for being
+    on a list."""
+    for weak in ("password", "hunter2", "letmein", ""):
+        with pytest.raises(ClientException):
+            async with sm() as s:
+                await signup.fn(data=SignupRequest(email="weak@x.com", password=weak), db_session=s)
+    async with sm() as s:
+        assert await s.scalar(text("SELECT count(*) FROM users")) == 0
+
+
+async def test_a_long_password_is_accepted_at_signup(sm):
+    """The control. A policy that refused everything would pass the test above."""
+    async with sm() as s:
+        created = await signup.fn(
+            data=SignupRequest(email="strong@x.com", password=PASSWORD), db_session=s
+        )
+    assert created.token
+    async with sm() as s:
+        assert (await user_for_token(s, created.token)).email == "strong@x.com"
+
+
+async def test_the_minimum_length_is_twelve(sm):
+    """Pinned to the literal, not to the constant: comparing MIN_PASSWORD_LENGTH with
+    itself passes for any value, including a floor quietly lowered to 4."""
+    assert MIN_PASSWORD_LENGTH == 12
+    async with sm() as s:
+        with pytest.raises(ClientException):
+            await signup.fn(data=SignupRequest(email="k@x.com", password="k" * 11), db_session=s)
+    async with sm() as s:
+        assert (
+            await signup.fn(data=SignupRequest(email="k@x.com", password="k" * 12), db_session=s)
+        ).token
 
 
 async def test_an_empty_forwarded_entry_is_not_an_address(sm):

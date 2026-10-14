@@ -30,6 +30,16 @@ TICKET_TTL = timedelta(seconds=30)
 # for the ones nobody notices.
 SESSION_TTL = timedelta(days=7)
 
+# The whole password policy. A length floor and nothing else: it is the one rule that
+# rules out most of what people actually choose, and twelve characters of anything beats
+# eight characters of a composition rule nobody can satisfy without writing it down.
+#
+# Not here, on purpose: a breached-password check. The useful version is a k-anonymity
+# lookup against Have I Been Pwned, which means an outbound call on the signup path and a
+# decision about what to do when it is down. That is its own piece of work, and a
+# hand-written list of twenty bad passwords would only look like one.
+MIN_PASSWORD_LENGTH = 12
+
 # Failed logins are limited on two independent buckets, never a combined (email, ip) key.
 # A combined key defeats both halves at once: an attacker with many addresses gets a fresh
 # per-account budget from each, and a scan across many accounts never spends a per-address
@@ -181,8 +191,10 @@ async def _issue_token(db_session: AsyncSession, user_id: int) -> str:
 
 @post("/auth/signup")
 async def signup(data: SignupRequest, db_session: AsyncSession) -> TokenResponse:
-    if not data.email or not data.password:
+    if not data.email:
         raise ClientException("email and password required")
+    if len(data.password) < MIN_PASSWORD_LENGTH:
+        raise ClientException(f"password must be at least {MIN_PASSWORD_LENGTH} characters")
     user = User(email=data.email, pw_hash=hash_password(data.password))
     db_session.add(user)
     try:
