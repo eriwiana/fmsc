@@ -14,8 +14,11 @@ App timezone is **Asia/Jakarta** (`APP_TZ` in `app/auctions.py`). Storage stays 
 Jakarta wall time, responses render `+07:00`. Process runs with `TZ=Asia/Jakarta` for logs.
 
 ## API
-- `POST /auth/signup`, `POST /auth/login` → `{token}`
-- `POST /auctions` (auth) — `{title, starting_bid, ends_at, currency?}` (ends_at in the
+- `POST /auth/signup`, `POST /auth/login` → `{token}`. A password under **12 characters**
+  is refused; repeated failed logins answer **429** with `Retry-After`
+- `POST /auth/logout` → **204**, revokes the token it was given. `POST /auth/logout-all`
+  (auth) → **204**, revokes every session the user has
+- `POST /auctions` (auth, **verified address only**) — `{title, starting_bid, ends_at, currency?}` (ends_at in the
   future; a naive value is read as **Asia/Jakarta** wall time; `currency` is an ISO 4217
   code, **IDR** by default, case-insensitive). The response also carries `hard_ends_at`, the
   latest the auction can possibly end once anti-snipe extensions are accounted for
@@ -32,6 +35,91 @@ Auth is `Authorization: Bearer <token>`. The WebSocket takes a **ticket** instea
 session token: a browser cannot set headers on a handshake, so the credential travels in the
 URL — where proxies log it, browsers keep it in history and Referer leaks it. A ticket is
 opaque, bound to one user, dead in 30 seconds and spent on first use.
+
+## Sessions and account security
+A session token lasts **7 days** and the expiry is part of the authentication query:
+
+```python
+.where(Session.token == token, Session.expires_at > func.clock_timestamp())
+```
+
+`clock_timestamp()`, not `now()`. Authentication is the first query of a request, so `now()`
+would compare against a clock frozen before the request did any work and a session expiring
+mid-request would authenticate anyway — the same bug as the bid deadline, one layer lower.
+
+Expiry alone is not enough, because seven days is a long time to wait for a stolen laptop,
+so a session can be revoked: logout takes away the token it was presented with, revoke-all
+takes away every session for that user. Presenting a token *is* the authorisation to revoke
+it, so logout needs no other credential and an already-expired token can still clean up
+after itself. An unknown token answers the same as a known one, or the endpoint would be a
+way to ask which tokens exist. A *missing* `Authorization` header is refused instead: there
+is no token for the 204 to be true of, and a client whose header never got built would
+otherwise be told it had signed out.
+
+Expired rows are swept on the closer's tick, indexed by `expires_at` — one row arrives per
+login and nothing else deletes them, so the scan would otherwise grow with every account
+that has ever signed in.
+
+### Failed logins
+Two buckets, counted independently — **5 per account** and **20 per address**, each over
+**15 minutes**, answered 429 with `Retry-After`:
+
+| Bucket | Why it is that size |
+|---|---|
+| account | tight, because it is what protects one specific person |
+| address | looser, because an office, a school or a mobile carrier puts many honest people behind one |
+
+Never a combined `(email, ip)` key, which is the part worth understanding: with one, an
+attacker holding many addresses gets a fresh per-account budget from each, *and* a scan
+across many accounts never spends a per-address budget. Both limits stop being limits. Two
+tests are those exact attacks.
+
+The counts live in Postgres rather than in process memory, because the fan-out backend is
+optional here and a limit that resets on deploy is not a limit. They are rows, not a
+counter, because the limit is a rate and a window cannot be subtracted from an integer. The
+lockout is read *before* the password is checked, so a caller who has spent their budget
+cannot keep spending the server's CPU on scrypt, and a request refused by the lockout
+records nothing — hammering it cannot extend it. A failure is counted whether or not the
+address exists, or probing for valid accounts would be cheaper than guessing at a real one.
+
+A login for an unknown address still pays for a scrypt hash, against a throwaway hash
+nothing can match. Skipping it would make the response time say whether an account exists
+— the same enumeration the counting is there to stop, except it needs one request per
+address rather than five, and identical response bodies do not help if one of them arrives
+50 ms sooner.
+
+The two counts come from one statement, one indexed subquery per bucket. Counting with
+`count(*) FILTER` over the whole window reads the same numbers, but its only predicate is
+on `failed_at`, which neither index starts with, so it plans as a sequential scan: measured
+at 50,000 attempts inside the window, 9.0 ms that way against 0.5 ms this way. The flood is
+exactly when the table is large.
+
+A successful login empties the account's bucket, or four typos would leave someone one typo
+from a lockout for the rest of the window. Those rows are also the only record the address
+bucket has, so signing in refunds a little address budget too — not a way in, since the
+refund needs the password, but it does soften a shared address by every honest user behind
+it who mistypes and then succeeds. Keeping the address count intact would need a
+`cleared_at` column filtered on in both buckets, which is more machinery than the leak is
+worth today.
+
+`X-Forwarded-For` is read from the **right**. Only the rightmost entry was appended by the
+proxy in front of the app; everything to its left is whatever the client typed. Reading
+from the left would let an attacker have a new address per request and spend the budget of
+an address they do not hold.
+
+### Verification
+`users.verified_at` is NULL until the address has been proved — signup never sets it, which
+is what the acceptance test signs up to prove — and an unverified account cannot create an
+auction (**403**) — an auction is a promise to deliver and the seller is
+who a buyer has to be able to reach. Bidding stays open to an unverified account on
+purpose: the money only moves at settlement, which is where to ask again.
+
+**Nothing sets the column yet.** No mail is sent, so until a verification flow lands it is
+set out of band:
+
+```sql
+UPDATE users SET verified_at = clock_timestamp() WHERE email = '...';
+```
 
 ## Realtime
 A socket receives a `snapshot` of the auction as its first message, then live events. The
@@ -190,9 +278,17 @@ alembic upgrade head
 ```
 
 ## Deferred (see the milestones)
-Account security — a session never expires, cannot be revoked and there is no logout, so a
-leaked token is valid forever. Then ownership and lifecycle (cancelling an auction, editing
-one before it opens), settlement and payments, reserve prices.
+The verification flow itself: sending the mail, the confirmation link, and resending it.
+The column and the rule that reads it are in place, so what is missing is the delivery.
+With it, a password change and reset endpoint — both of which should revoke every other
+session, which is now possible.
+
+A breached-password check is deliberately absent: the useful version is a k-anonymity
+lookup against Have I Been Pwned, which puts an outbound call on the signup path and needs
+an answer for what to do when it is down.
+
+Then ownership and lifecycle (cancelling an auction, editing one before it opens),
+settlement and payments, reserve prices.
 
 Multi-currency is only half done: the schema carries the unit, nothing converts between
 units, and no endpoint lets a seller change one. That is deliberate — the column had to land
