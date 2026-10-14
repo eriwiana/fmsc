@@ -44,6 +44,15 @@ class BidRequest(msgspec.Struct):
     amount: Decimal
 
 
+class RedeemRequest(msgspec.Struct):
+    code: str
+
+
+class MembershipResponse(msgspec.Struct):
+    community_id: int
+    generation: int
+
+
 class AuctionResponse(msgspec.Struct):
     id: int
     title: str

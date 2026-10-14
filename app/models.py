@@ -214,6 +214,39 @@ class CommunityCode(BigIntAuditBase):
     )
 
 
+class CodeAudit(BigIntBase):
+    """Why a redemption went the way it did. The only place the four failures differ.
+
+    A caller is told nothing beyond "no": not-found, revoked, expired and exhausted are
+    one answer, because telling them apart is how a code becomes something to enumerate —
+    OWASP calls it OAT-002. The distinction an operator needs still has to live somewhere,
+    and this is it.
+
+    The code itself is never written here. code_id is, and it is NULL for a code that was
+    never found, which is the one case with nothing to point at.
+    """
+
+    __tablename__ = "code_audit"
+    community_id: Mapped[int | None] = mapped_column(
+        ForeignKey("communities.id"), nullable=True, index=True
+    )
+    code_id: Mapped[int | None] = mapped_column(
+        ForeignKey("community_codes.id"), nullable=True, index=True
+    )
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    ip: Mapped[str] = mapped_column(String(45))
+    outcome: Mapped[str] = mapped_column(String(20))
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IN ('redeemed', 'not_found', 'revoked', 'expired', 'exhausted',"
+            " 'already_member')",
+            name="outcome_known",
+        ),
+    )
+
+
 class Auction(BigIntAuditBase):
     __tablename__ = "auctions"
     title: Mapped[str] = mapped_column(String(200))

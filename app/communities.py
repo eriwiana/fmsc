@@ -9,12 +9,19 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from litestar import Request, post
+from litestar.di import Provide
+from litestar.exceptions import NotFoundException
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import codes
-from app.models import CommunityCode
+from app.auth import client_ip, provide_current_user
+from app.models import CommunityCode, User
+from app.schemas import MembershipResponse, RedeemRequest
+
+_authed = {"current_user": Provide(provide_current_user)}
 
 # One guarded UPDATE, scoped to the owner. Ownership is in the WHERE rather than checked
 # first, for the same reason as every other guard in this project: two statements leave a
@@ -199,27 +206,112 @@ _JOIN_SQL = text("""
 # with a fresh code; only a live membership trips this.
 _MEMBERSHIP_CONSTRAINT = "uq_memberships_community_user_generation"
 
+# Why the claim found no room, read once, on the failure path, for the audit log and for
+# nothing else. The caller's answer is already decided by then and does not depend on this.
+#
+# One statement for all four outcomes, so they cost the same work: that is what criterion
+# 5's "indistinguishable in timing" amounts to in a system where the four branches are the
+# same query. A wall-clock assertion wide enough not to flake is wider than the leak it
+# looks for; an extra query is the leak that matters, and the test counts statements.
+#
+# Precedence when more than one applies: revoked, then expired, then exhausted. Arbitrary
+# but fixed, so the log reads the same way every time.
+_DIAGNOSE_SQL = text("""
+    SELECT id,
+           community_id,
+           invalidated_at IS NOT NULL AS revoked,
+           (expires_at IS NOT NULL AND expires_at <= clock_timestamp()) AS expired,
+           used_count >= max_uses AS exhausted
+      FROM community_codes
+     WHERE code_lookup = :lookup
+    """)
 
-async def redeem_code(session: AsyncSession, presented: str, user_id: int) -> int | None:
+_AUDIT_SQL = text("""
+    INSERT INTO code_audit (community_id, code_id, user_id, ip, outcome, at)
+    VALUES (:community_id, :code_id, :user_id, :ip, :outcome, now())
+    """)
+
+
+async def _audit(
+    session: AsyncSession,
+    *,
+    outcome: str,
+    ip: str,
+    user_id: int | None = None,
+    code_id: int | None = None,
+    community_id: int | None = None,
+) -> None:
+    await session.execute(
+        _AUDIT_SQL,
+        {
+            "community_id": community_id,
+            "code_id": code_id,
+            "user_id": user_id,
+            "ip": ip,
+            "outcome": outcome,
+        },
+    )
+
+
+async def redeem_code(
+    session: AsyncSession, presented: str, user_id: int, *, ip: str = "unknown"
+) -> int | None:
     """Trade a code for a membership. Returns the membership id, or None.
 
     None for every reason: not a code at all, never issued, rotated away, expired, out of
     uses, already a member. The caller cannot act on the difference, and telling them apart
-    is how a code becomes something to enumerate — OWASP calls that OAT-002.
+    is how a code becomes something to enumerate — OWASP calls that OAT-002. Which it was
+    goes to code_audit, which is the only place the four differ.
     """
     body = codes.normalise(presented)
     if body is None:
-        # A string that is not a code never reaches the database. The check symbol caught
-        # it, which is what the check symbol is for.
+        # A string that is not a code never reaches the database, and is not written down
+        # either: the check symbol caught it, so this is a typo rather than an attempt at
+        # anything. Auditing it would fill the log with somebody's bad afternoon and make
+        # a fat finger look like enumeration; the caller is answered the same as the four.
+        #
+        # It is also why this path is cheaper than those four. What that reveals is the
+        # check symbol algorithm, which is public, and nothing about which codes exist.
         return None
-    claimed = (await session.execute(_CLAIM_USE_SQL, {"lookup": codes.lookup(body)})).first()
+    lookup = codes.lookup(body)
+    claimed = (await session.execute(_CLAIM_USE_SQL, {"lookup": lookup})).first()
     if claimed is None:
+        # The claim is rolled back first, so the audit row is not undone with it.
         await session.rollback()
+        found = (await session.execute(_DIAGNOSE_SQL, {"lookup": lookup})).first()
+        if found is None:
+            outcome, code_id, community_id = "not_found", None, None
+        elif found.revoked:
+            outcome, code_id, community_id = "revoked", found.id, found.community_id
+        elif found.expired:
+            outcome, code_id, community_id = "expired", found.id, found.community_id
+        else:
+            outcome, code_id, community_id = "exhausted", found.id, found.community_id
+        await _audit(
+            session,
+            outcome=outcome,
+            ip=ip,
+            user_id=user_id,
+            code_id=code_id,
+            community_id=community_id,
+        )
+        await session.commit()
         return None
     try:
         membership_id = await session.scalar(
             _JOIN_SQL,
             {"user_id": user_id, "code_id": claimed.id, "community_id": claimed.community_id},
+        )
+        # In the same transaction as the membership, unlike the failure paths: a successful
+        # redemption and its audit row are one fact, and a crash between them would leave
+        # a membership nothing accounts for.
+        await _audit(
+            session,
+            outcome="redeemed",
+            ip=ip,
+            user_id=user_id,
+            code_id=claimed.id,
+            community_id=claimed.community_id,
         )
         await session.commit()
     except IntegrityError as exc:
@@ -232,6 +324,15 @@ async def redeem_code(session: AsyncSession, presented: str, user_id: int) -> in
         # other IntegrityError is a real one and is re-raised.
         await session.rollback()
         if getattr(exc.orig.__cause__, "constraint_name", None) == _MEMBERSHIP_CONSTRAINT:
+            await _audit(
+                session,
+                outcome="already_member",
+                ip=ip,
+                user_id=user_id,
+                code_id=claimed.id,
+                community_id=claimed.community_id,
+            )
+            await session.commit()
             return None
         raise
     return membership_id
@@ -296,3 +397,28 @@ async def rotate_code(
     )
     await session.commit()
     return shown
+
+
+# One answer for every way a redemption can fail, including the ones that are not the
+# caller's fault. 404 and a fixed sentence: a client cannot act on the difference between
+# a code that never existed, one that was rotated away, one past its deadline and one out
+# of uses, and telling them apart turns the endpoint into something to enumerate. OWASP
+# calls that OAT-002. code_audit is where the difference is kept.
+_REFUSED = "that code cannot be redeemed"
+
+
+@post("/communities/codes/redeem", dependencies=_authed)
+async def redeem(
+    data: RedeemRequest, request: Request, current_user: User, db_session: AsyncSession
+) -> MembershipResponse:
+    """Join a community by code."""
+    membership_id = await redeem_code(db_session, data.code, current_user.id, ip=client_ip(request))
+    if membership_id is None:
+        raise NotFoundException(_REFUSED)
+    row = (
+        await db_session.execute(
+            text("SELECT community_id, generation FROM community_memberships WHERE id = :id"),
+            {"id": membership_id},
+        )
+    ).one()
+    return MembershipResponse(community_id=row.community_id, generation=row.generation)
