@@ -7,9 +7,11 @@ round-trips and a lookup that cannot be reversed.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import os
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import text
@@ -25,7 +27,7 @@ from app.codes import (
     new_code,
     normalise,
 )
-from app.communities import issue_code
+from app.communities import issue_code, kick_member, redeem_code
 from app.models import Community, User
 
 
@@ -234,6 +236,216 @@ async def test_a_code_can_be_issued_with_a_use_limit_and_a_deadline(sm):
     assert row.expires_at == expires_at
 
 
+async def _joiner(maker, email: str) -> int:
+    async with maker() as s:
+        user = User(email=email, pw_hash="x")
+        s.add(user)
+        await s.commit()
+        return user.id
+
+
+async def test_redeeming_a_code_records_where_the_membership_came_from(sm):
+    """Criterion 7. Both columns, at redemption. Without them a community cannot answer
+    "which code let this person in", which is the first question after a code leaks."""
+    community_id, owner_id = await _community(sm)
+    joiner = await _joiner(sm, "joiner@x.com")
+    async with sm() as s:
+        shown = await issue_code(s, community_id, owner_id=owner_id)
+
+    async with sm() as s:
+        membership_id = await redeem_code(s, shown, joiner)
+    assert membership_id is not None
+
+    async with sm() as s:
+        row = (
+            await s.execute(
+                text(
+                    "SELECT m.generation, m.joined_via_code_id, m.joined_via_generation,"
+                    " k.id AS code_id"
+                    " FROM community_memberships m, community_codes k WHERE m.id = :id"
+                ),
+                {"id": membership_id},
+            )
+        ).one()
+    assert row.joined_via_code_id == row.code_id
+    assert row.joined_via_generation == 0
+    assert row.generation == 0
+
+
+async def test_a_redeemed_membership_is_the_one_the_bid_guard_wants(sm):
+    """The point of the whole slice: redeeming has to produce a membership the bid
+    statement recognises, not a row that merely looks like one."""
+    from app.auctions import MAX_EXTENSION, place_bid_tx
+    from app.models import Auction
+
+    community_id, owner_id = await _community(sm)
+    joiner = await _joiner(sm, "joiner@x.com")
+    async with sm() as s:
+        shown = await issue_code(s, community_id, owner_id=owner_id)
+    async with sm() as s:
+        assert await redeem_code(s, shown, joiner) is not None
+
+    ends_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    async with sm() as s:
+        auction = Auction(
+            title="t",
+            seller_id=owner_id,
+            community_id=community_id,
+            currency="IDR",
+            starting_bid=Decimal("10.00"),
+            ends_at=ends_at,
+            hard_ends_at=ends_at + MAX_EXTENSION,
+        )
+        s.add(auction)
+        await s.commit()
+        auction_id = auction.id
+    async with sm() as s:
+        assert await place_bid_tx(s, auction_id, joiner, Decimal("10.00")) is not None
+
+
+async def test_a_one_use_code_is_spent_by_the_first_redemption(sm):
+    community_id, owner_id = await _community(sm)
+    first = await _joiner(sm, "first@x.com")
+    second = await _joiner(sm, "second@x.com")
+    async with sm() as s:
+        shown = await issue_code(s, community_id, owner_id=owner_id)
+
+    async with sm() as s:
+        assert await redeem_code(s, shown, first) is not None
+    async with sm() as s:
+        assert await redeem_code(s, shown, second) is None
+    async with sm() as s:
+        assert await s.scalar(text("SELECT used_count FROM community_codes")) == 1
+
+
+async def test_concurrent_redemptions_of_a_one_use_code_yield_exactly_one_membership(sm):
+    """Criterion 6, and the reason the count is claimed by an UPDATE rather than read and
+    then written. `used_count < max_uses` read by one connection and acted on by another
+    is CWE-837 — ten of them read 0 and all ten let somebody in.
+
+    Ten at once rather than two: with two, a broken implementation gets the right answer
+    often enough to pass.
+    """
+    community_id, owner_id = await _community(sm)
+    joiners = [await _joiner(sm, f"j{n}@x.com") for n in range(10)]
+    async with sm() as s:
+        shown = await issue_code(s, community_id, owner_id=owner_id)
+
+    async def redeem(user_id: int):
+        async with sm() as s:
+            return await redeem_code(s, shown, user_id)
+
+    results = await asyncio.gather(*(redeem(user_id) for user_id in joiners))
+
+    assert sum(1 for result in results if result is not None) == 1
+    async with sm() as s:
+        assert await s.scalar(text("SELECT count(*) FROM community_memberships")) == 1
+        assert await s.scalar(text("SELECT used_count FROM community_codes")) == 1
+
+
+async def test_a_code_with_several_uses_stops_at_its_limit(sm):
+    """The control for the test above: the limit is max_uses, not one."""
+    community_id, owner_id = await _community(sm)
+    joiners = [await _joiner(sm, f"j{n}@x.com") for n in range(5)]
+    async with sm() as s:
+        shown = await issue_code(s, community_id, owner_id=owner_id, max_uses=3)
+
+    async def redeem(user_id: int):
+        async with sm() as s:
+            return await redeem_code(s, shown, user_id)
+
+    results = await asyncio.gather(*(redeem(user_id) for user_id in joiners))
+    assert sum(1 for result in results if result is not None) == 3
+    async with sm() as s:
+        assert await s.scalar(text("SELECT used_count FROM community_codes")) == 3
+
+
+async def test_redeeming_twice_costs_the_code_nothing(sm):
+    """Somebody who clicks the link again is not a second member. The unique constraint
+    on (community, user, generation) is what makes that safe: a read-first check would be
+    two statements, and two clicks arriving together would spend two uses."""
+    community_id, owner_id = await _community(sm)
+    joiner = await _joiner(sm, "joiner@x.com")
+    async with sm() as s:
+        shown = await issue_code(s, community_id, owner_id=owner_id, max_uses=5)
+
+    async with sm() as s:
+        assert await redeem_code(s, shown, joiner) is not None
+    async with sm() as s:
+        assert await redeem_code(s, shown, joiner) is None
+    async with sm() as s:
+        assert await s.scalar(text("SELECT used_count FROM community_codes")) == 1
+        assert await s.scalar(text("SELECT count(*) FROM community_memberships")) == 1
+
+
+async def test_an_expired_code_is_refused(sm):
+    community_id, owner_id = await _community(sm)
+    joiner = await _joiner(sm, "joiner@x.com")
+    async with sm() as s:
+        shown = await issue_code(
+            s,
+            community_id,
+            owner_id=owner_id,
+            expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        )
+    async with sm() as s:
+        assert await redeem_code(s, shown, joiner) is None
+    async with sm() as s:
+        assert await s.scalar(text("SELECT used_count FROM community_codes")) == 0
+
+
+async def test_an_invalidated_code_is_refused(sm):
+    community_id, owner_id = await _community(sm)
+    joiner = await _joiner(sm, "joiner@x.com")
+    async with sm() as s:
+        shown = await issue_code(s, community_id, owner_id=owner_id)
+    async with sm() as s:
+        await s.execute(text("UPDATE community_codes SET invalidated_at = clock_timestamp()"))
+        await s.commit()
+    async with sm() as s:
+        assert await redeem_code(s, shown, joiner) is None
+
+
+async def test_a_code_that_was_never_issued_is_refused(sm):
+    """And a string that is not a code at all, which never reaches the database."""
+    joiner = await _joiner(sm, "joiner@x.com")
+    async with sm() as s:
+        assert await redeem_code(s, formatted(new_code()[1]), joiner) is None
+    async with sm() as s:
+        assert await redeem_code(s, "not-a-code", joiner) is None
+
+
+async def test_a_redemption_after_a_remove_all_lands_in_the_new_generation(sm):
+    """Re-redeeming is what a member does after a remove-all, so the generation has to come
+    off the community in the statement that writes the row — a bump committing in between
+    would otherwise stamp the membership with a generation that is already history."""
+    community_id, owner_id = await _community(sm)
+    joiner = await _joiner(sm, "joiner@x.com")
+    async with sm() as s:
+        await s.execute(
+            text("UPDATE communities SET membership_generation = 4 WHERE id = :c"),
+            {"c": community_id},
+        )
+        await s.commit()
+    async with sm() as s:
+        shown = await issue_code(s, community_id, owner_id=owner_id)
+    async with sm() as s:
+        membership_id = await redeem_code(s, shown, joiner)
+
+    async with sm() as s:
+        row = (
+            await s.execute(
+                text(
+                    "SELECT generation, joined_via_generation FROM community_memberships"
+                    " WHERE id = :id"
+                ),
+                {"id": membership_id},
+            )
+        ).one()
+    assert row.generation == 4
+    assert row.joined_via_generation == 4
+
+
 def test_a_payload_that_begins_with_the_prefix_still_round_trips():
     """One code in about a million starts FMSC itself. Stripping the prefix on its first
     four characters alone breaks the no-prefix form for exactly those, which is also a
@@ -256,3 +468,62 @@ def test_a_check_symbol_outside_the_alphabet_is_refused_not_raised():
     # And a plain wrong symbol from inside the alphabet is still refused.
     wrong = "*" if check_symbol(body) != "*" else "~"
     assert normalise(body + wrong) is None
+
+
+async def test_a_kicked_member_can_be_let_back_in(sm):
+    """The uniqueness is partial, on revoked_at IS NULL, so a revoked row does not block a
+    rejoin.
+
+    A kick leaves the row at the community's current generation. With a plain constraint a
+    mistaken kick is permanent — the person can never redeem again and the only remedy is
+    remove-all, which ends everyone else's membership too — and the audit log calls them
+    already_member while they are revoked.
+    """
+    community_id, owner_id = await _community(sm)
+    member = await _joiner(sm, "member@x.com")
+    async with sm() as s:
+        code = await issue_code(s, community_id, owner_id=owner_id, max_uses=9)
+    async with sm() as s:
+        assert await redeem_code(s, code, member) is not None
+    async with sm() as s:
+        assert await kick_member(s, community_id, member, owner_id=owner_id) is True
+
+    async with sm() as s:
+        assert await redeem_code(s, code, member) is not None
+
+    async with sm() as s:
+        rows = (
+            await s.execute(
+                text(
+                    "SELECT revoked_at IS NULL AS live FROM community_memberships"
+                    " WHERE user_id = :u ORDER BY id"
+                ),
+                {"u": member},
+            )
+        ).all()
+    # Two rows: the kick is still on the record, and the new membership stands beside it.
+    # The audit side of this — that the second redemption is logged as a redemption rather
+    # than as already_member — is asserted where the audit table exists, two commits on.
+    assert [row.live for row in rows] == [False, True]
+
+
+async def test_a_live_membership_still_blocks_a_second_one(sm):
+    """The control for the partial index: it is one *live* membership per generation, not
+    any number of them. Without that half, a double-click is two rows and the bid guard's
+    EXISTS would not notice."""
+    community_id, owner_id = await _community(sm)
+    member = await _joiner(sm, "member@x.com")
+    async with sm() as s:
+        code = await issue_code(s, community_id, owner_id=owner_id, max_uses=9)
+    async with sm() as s:
+        assert await redeem_code(s, code, member) is not None
+    async with sm() as s:
+        assert await redeem_code(s, code, member) is None
+    async with sm() as s:
+        assert (
+            await s.scalar(
+                text("SELECT count(*) FROM community_memberships WHERE user_id = :u"),
+                {"u": member},
+            )
+            == 1
+        )

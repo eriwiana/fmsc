@@ -139,6 +139,16 @@ class CommunityMembership(BigIntAuditBase):
     # NULL while the membership stands. A kick sets it, and the bid guard compares it with
     # the auction's start so a kick cannot reach back into an auction already open.
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # How this membership came about. NULL means it was not created by a redemption, which
+    # today means a test or a hand-written row.
+    joined_via_code_id: Mapped[int | None] = mapped_column(
+        ForeignKey("community_codes.id"), nullable=True
+    )
+    # The community's generation when the code was redeemed. Equal to `generation` above by
+    # construction, and kept separately on purpose: that one is the key the bid guard
+    # compares, this one is the provenance record. If how a generation gets assigned ever
+    # changes, history should not be rewritten along with it.
+    joined_via_generation: Mapped[int | None] = mapped_column(nullable=True)
 
     __table_args__ = (
         # One *live* membership per person per generation. A second live row would be a

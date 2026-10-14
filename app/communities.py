@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import codes
@@ -153,3 +154,80 @@ async def issue_code(
     )
     await session.commit()
     return shown
+
+
+# Claiming a use, and the only test of whether a code is usable. One statement, because
+# `used_count < max_uses` read by one connection and acted on by another is CWE-837: the
+# UPDATE takes the row lock, so a second redemption re-reads the count under that lock and
+# finds no room. The check constraint behind it is the backstop, not the rule.
+#
+# Every reason to refuse is in this one WHERE — never issued, tombstoned by a rotation,
+# past its deadline, out of uses — so all four cost the same work and reach the caller as
+# the same nothing. Criterion 5 is about that, and it is a property of the statement rather
+# than of the handler above it.
+_CLAIM_USE_SQL = text("""
+    UPDATE community_codes
+       SET used_count = used_count + 1
+     WHERE code_lookup = :lookup
+       AND invalidated_at IS NULL
+       AND used_count < max_uses
+       AND (expires_at IS NULL OR expires_at > clock_timestamp())
+    RETURNING id, community_id
+    """)
+
+# The generation comes off the community in the same statement that writes the row, so a
+# remove-all committing in between cannot leave a membership stamped with a generation that
+# is already history.
+_JOIN_SQL = text("""
+    INSERT INTO community_memberships
+        (community_id, user_id, generation, joined_via_code_id, joined_via_generation,
+         created_at, updated_at)
+    SELECT c.id, :user_id, c.membership_generation, :code_id, c.membership_generation,
+           now(), now()
+      FROM communities c
+     WHERE c.id = :community_id
+    RETURNING id
+    """)
+
+
+# The partial unique index on (community, user, generation) WHERE revoked_at IS NULL.
+# A revoked row does not collide, so somebody kicked by mistake can be let back in
+# with a fresh code; only a live membership trips this.
+_MEMBERSHIP_CONSTRAINT = "uq_memberships_community_user_generation"
+
+
+async def redeem_code(session: AsyncSession, presented: str, user_id: int) -> int | None:
+    """Trade a code for a membership. Returns the membership id, or None.
+
+    None for every reason: not a code at all, never issued, rotated away, expired, out of
+    uses, already a member. The caller cannot act on the difference, and telling them apart
+    is how a code becomes something to enumerate — OWASP calls that OAT-002.
+    """
+    body = codes.normalise(presented)
+    if body is None:
+        # A string that is not a code never reaches the database. The check symbol caught
+        # it, which is what the check symbol is for.
+        return None
+    claimed = (await session.execute(_CLAIM_USE_SQL, {"lookup": codes.lookup(body)})).first()
+    if claimed is None:
+        await session.rollback()
+        return None
+    try:
+        membership_id = await session.scalar(
+            _JOIN_SQL,
+            {"user_id": user_id, "code_id": claimed.id, "community_id": claimed.community_id},
+        )
+        await session.commit()
+    except IntegrityError as exc:
+        # Already a member of this generation. The rollback takes the claimed use with it,
+        # so redeeming twice costs the code nothing — and the unique constraint is what
+        # makes that safe under concurrency, where a read-then-insert would not be.
+        #
+        # Matched on the constraint name off asyncpg's own exception rather than on the
+        # message text, which a reworded driver error would turn into a swallowed bug. Any
+        # other IntegrityError is a real one and is re-raised.
+        await session.rollback()
+        if getattr(exc.orig.__cause__, "constraint_name", None) == _MEMBERSHIP_CONSTRAINT:
+            return None
+        raise
+    return membership_id
