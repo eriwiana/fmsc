@@ -47,6 +47,7 @@ async def _seed(
         auction = Auction(
             title="t",
             seller_id=seller.id,
+            currency="IDR",
             starting_bid=Decimal(starting),
             ends_at=ends_at,
             hard_ends_at=ends_at + extension,
@@ -567,7 +568,7 @@ async def test_reason_falls_back_when_the_row_moved_in_flight(sm):
 
 
 async def test_amount_beyond_the_column_range_rejected(sm):
-    """Numeric(12,2) overflows in Postgres; the bid must not reach the statement."""
+    """Numeric(18,2) overflows in Postgres; the bid must not reach the statement."""
     _, bidder, aid = await _seed(sm)
     async with sm() as s:
         assert await place_bid_tx(s, aid, bidder, MAX_BID + 1) is None
@@ -591,5 +592,7 @@ async def test_non_positive_amount_rejected(sm):
 
 async def test_reason_names_an_out_of_range_amount(sm):
     _, bidder, aid = await _seed(sm)
-    reason = await _reason(sm, aid, bidder, "10000000000.00")
-    assert reason == "amount must be between 0.01 and 9999999999.99, to at most 2 decimal places"
+    reason = await _reason(sm, aid, bidder, "10000000000000000.00")
+    assert (
+        reason == "amount must be between 0.01 and 9999999999999999.99, to at most 2 decimal places"
+    )

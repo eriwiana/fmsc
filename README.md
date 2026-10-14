@@ -15,8 +15,9 @@ Jakarta wall time, responses render `+07:00`. Process runs with `TZ=Asia/Jakarta
 
 ## API
 - `POST /auth/signup`, `POST /auth/login` → `{token}`
-- `POST /auctions` (auth) — `{title, starting_bid, ends_at}` (ends_at in the future; a naive
-  value is read as **Asia/Jakarta** wall time). The response also carries `hard_ends_at`, the
+- `POST /auctions` (auth) — `{title, starting_bid, ends_at, currency?}` (ends_at in the
+  future; a naive value is read as **Asia/Jakarta** wall time; `currency` is an ISO 4217
+  code, **IDR** by default, case-insensitive). The response also carries `hard_ends_at`, the
   latest the auction can possibly end once anti-snipe extensions are accounted for
 - `GET /auctions`, `GET /auctions/{id}`
 - `POST /auctions/{id}/bids` (auth) — `{amount}`; atomic, highest-wins, extends the
@@ -106,6 +107,27 @@ client that times out and resends is not told it has outbid itself. Reusing the 
 finds out instead of believing a bid it never placed. A refused bid consumes nothing: the key
 is free to reuse.
 
+## Money
+Amounts are `Numeric(18,2)` — never float, and never a cent rounded by a binary
+approximation. The old `Numeric(12,2)` stopped just under 10 miliar IDR, which one lot can
+exceed; `MAX_BID` is exactly what the column holds, so a bid at the ceiling is a stored bid
+and not a 500.
+
+Every amount names its unit. An auction carries a `currency`, a bid carries the currency it
+was placed in, and the bid statement copies the auction's own across — the client never
+supplies it. The two are kept in step by the table itself:
+
+```
+auctions  UNIQUE (id, currency)
+bids      FOREIGN KEY (auction_id, currency) REFERENCES auctions (id, currency)
+```
+
+That one constraint says both "the auction exists" and "the currencies agree", replacing the
+plain `auction_id` key. A bid rewritten to another currency by `update`, a data migration or
+psql has no referent and is refused, and an auction cannot be redenominated while bids point
+at the pair. Settling an IDR auction against an amount read as USD is an error of four
+orders of magnitude in what is owed, so it is not left to the application to remember.
+
 ## Guardrails
 The invariants the bid path assumes are enforced by the schema, not only by Python —
 `update`, a migration and psql all bypass the handlers:
@@ -117,6 +139,9 @@ The invariants the bid path assumes are enforced by the schema, not only by Pyth
 | `ck_auctions_starting_bid_positive` | `starting_bid > 0` |
 | `ck_auctions_current_bid_at_least_starting` | `current_bid IS NULL OR current_bid >= starting_bid` |
 | `ck_bids_amount_positive` | `amount > 0` |
+| `ck_auctions_currency_is_a_code` | `currency ~ '^[A-Z]{3}$'` |
+| `ck_bids_currency_is_a_code` | `currency ~ '^[A-Z]{3}$'` |
+| `fk_bids_auction_id_auctions` | `(auction_id, currency)` references `auctions (id, currency)` |
 
 Adding these to a table that already holds a violating row fails the migration, by design:
 a bad money row should be looked at, not silently rewritten.
@@ -164,9 +189,13 @@ alembic revision --autogenerate -m "what changed"   # review the generated file
 alembic upgrade head
 ```
 
-## Deferred (see plan)
-Redis fan-out (before multi-instance), idempotent retries, payments, reserve prices. Publishing
-is at-most-once with no backlog: a process that dies between the commit and the channel publish
-closes an auction without telling its watchers, and a client that subscribes a moment late gets
-nothing. Both want an outbox plus a snapshot on subscribe.
+## Deferred (see the milestones)
+Account security — a session never expires, cannot be revoked and there is no logout, so a
+leaked token is valid forever. Then ownership and lifecycle (cancelling an auction, editing
+one before it opens), settlement and payments, reserve prices.
+
+Multi-currency is only half done: the schema carries the unit, nothing converts between
+units, and no endpoint lets a seller change one. That is deliberate — the column had to land
+before live bids, the rate table does not.
+
 Each has a clean seam; the bid stays one atomic SQL statement.

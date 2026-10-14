@@ -44,6 +44,7 @@ async def _seed(maker, ends_delta: timedelta = timedelta(hours=1)) -> tuple[int,
         auction = Auction(
             title="t",
             seller_id=seller.id,
+            currency="IDR",
             starting_bid=Decimal("10.00"),
             ends_at=ends_at,
             hard_ends_at=ends_at + MAX_EXTENSION,
