@@ -19,9 +19,10 @@ Jakarta wall time, responses render `+07:00`. Process runs with `TZ=Asia/Jakarta
 - `POST /auth/logout` → **204**, revokes the token it was given. `POST /auth/logout-all`
   (auth) → **204**, revokes every session the user has
 - `POST /auctions` (auth, **verified address only**) — `{title, starting_bid, ends_at, currency?, reserve?, status?}`
-  (ends_at in the future; a naive value is read as **Asia/Jakarta** wall time; `currency` is
-  an ISO 4217 code, **IDR** by default, case-insensitive; `status` is `open` or `draft` and
-  nothing else). The response also carries `hard_ends_at`, the latest the auction can
+  `community_id?` (ends_at in the future; a naive value is read as **Asia/Jakarta** wall
+  time; `currency` is an ISO 4217 code, **IDR** by default, case-insensitive; `status` is
+  `open` or `draft` and nothing else; `community_id` gates bidding and may only be a
+  community the seller owns or belongs to). The response also carries `hard_ends_at`, the latest the auction can
   possibly end once anti-snipe extensions are accounted for
 - `GET /auctions` — everything but the drafts. `GET /auctions/{id}` — **404** for a draft
 - `GET /auctions/mine` (auth) — every auction the caller sells, drafts included, newest
@@ -39,6 +40,19 @@ Jakarta wall time, responses render `+07:00`. Process runs with `TZ=Asia/Jakarta
 - `POST /ws/tickets` (auth) → `{ticket, expires_at}` — single-use, 30s
 - `GET /ws/auctions/{id}?ticket=...` — snapshot, then live `bid`, `status` and `closed`
   events. **4404** for an unknown auction or a draft
+- `POST /communities` (auth) — `{name}`; the caller owns it
+- `POST /communities/{id}/codes` (auth, owner) — `{label?, max_uses?, expires_at?}` →
+  `{code}` **once**. **409** if a live code already exists, **400** for `max_uses` under 1,
+  an over-long `label`, or an `expires_at` already past (a naive value is read as
+  **Asia/Jakarta**, like every other datetime in the API)
+- `POST /communities/{id}/codes/rotate` (auth, owner) — same body, replaces the live code
+- `POST /communities/codes/redeem` (auth) — `{code}` → `{community_id, generation}`.
+  **404** with one fixed sentence for every refusal, **429** with `Retry-After` once the
+  attempt limit is spent
+- `POST /communities/{id}/members/{user_id}/kick` (auth, owner) — **409** if nothing was
+  revoked
+- `POST /communities/{id}/members/remove-all` (auth, owner) → `{membership_generation}`.
+  **409** while the community has an auction open
 - `GET /health`, `GET /schema` (OpenAPI/Swagger UI)
 
 Auth is `Authorization: Bearer <token>`. The WebSocket takes a **ticket** instead, not the
@@ -291,6 +305,118 @@ every auction start one increment above the price it advertised.
 
 Both numbers and the bands are **chosen, not measured**. The milestone says so.
 
+## Communities
+Viewing is public. Only bidding is gated, and the gate is one more condition in the
+statement that was already accepting the bid:
+
+```sql
+AND (community_id IS NULL OR EXISTS (
+        SELECT 1 FROM community_memberships m
+          JOIN communities c ON c.id = m.community_id
+         WHERE m.community_id = auctions.community_id
+           AND m.user_id = :uid
+           AND m.generation = c.membership_generation
+           AND (m.revoked_at IS NULL OR auctions.starts_at < m.revoked_at)))
+```
+
+A handler that read the membership and then bid would be two statements, and a revocation
+landing between them would still see the bid accepted. `community_id IS NULL` comes first,
+so a public auction is not a special case and costs no subquery.
+
+**Owner rights come from `communities.owner_id`, never from a membership row.** Deriving
+them from a membership means remove-all locks the owner out of their own community — the
+one action they can take after a code leaks.
+
+**A kick is measured against the auction's start, not against now.** Somebody entitled to
+bid when a lot opened keeps that right: the seller has relied on the bids already placed,
+and letting a moderator reach into an open auction makes a kick a way to undo other
+people's bids. The auction they were kicked out of goes on; the next one is closed to them.
+
+Publishing a draft therefore **sets `starts_at`** — an auction starts when it is announced,
+not when its draft was first saved. Left at insert time, somebody kicked on Tuesday could
+still bid on a lot drafted Monday and published Wednesday, the kick reaching backwards past
+its own date.
+
+A kick is also not a ban. The membership uniqueness is partial, on `revoked_at IS NULL`, so
+a revoked row does not block a rejoin: somebody kicked by mistake can be let back in with a
+fresh code, and the revoked row stays as the record of the kick. Without that, a mis-click
+is permanent and the only remedy is remove-all, which ends everyone else's membership too.
+
+**Remove-all bumps a generation rather than deleting rows**, so "who was in this community
+when that lot sold" survives the action that ends every membership. It is refused while the
+community has an auction **open or still a draft** — nothing stops a draft's seller
+publishing it a second after the bump, and publishing takes no community lock, so a guard
+that only looked for `open` would let the generation move out from under a lot about to
+open. Cancelled and closed do not count: neither can take a bid again. And it is refused
+behind a row lock:
+
+```
+remove-all:      SELECT ... FROM communities ... FOR UPDATE   then look, then bump
+create-auction:  SELECT ... FROM communities ... FOR SHARE    then insert
+```
+
+A single `UPDATE ... WHERE NOT EXISTS (open auction)` reads auctions from its own snapshot,
+so a listing that has inserted but not committed is invisible to it — under read committed
+that is not a narrow race, it is the normal case. A lock only helps where both sides take
+it, which is why the listing path takes one too; `FOR SHARE` rather than `FOR UPDATE` so
+two sellers do not queue behind each other, only behind a remove-all.
+
+### Invite codes
+13 Crockford Base32 characters — 65 bits from a CSPRNG — plus Crockford's check symbol,
+shown as `FMSC-XXXX-XXXX-XXXX-XX`. Crockford because the alphabet omits I, L, O and U: the
+first three are what people type for 1 and 0 off a screenshot, and they are **corrected**
+rather than refused. The check symbol keeps a typo away from the database entirely: nothing is
+written to the audit log and nothing is charged to the rate limiter, because a mistype from
+a screenshot is not an enumeration attempt and five of them must not lock a member out.
+
+**The code is shown once and nothing stores it.** The row keeps
+`HMAC-SHA256(payload, FMSC_CODE_PEPPER)`, so a leaked backup hands nobody a working code
+and a lookup is still one indexed equality. There is no ciphertext and no second copy
+anywhere; an owner who loses a code rotates it. `FMSC_CODE_PEPPER` is required, at least 32
+characters, and read at import — **the app does not start without one**, because a default
+pepper is no pepper and a per-boot random one silently kills every existing code on deploy.
+
+A use is claimed by the statement that tests for it:
+
+```sql
+UPDATE community_codes SET used_count = used_count + 1
+ WHERE code_lookup = :lookup AND invalidated_at IS NULL
+   AND used_count < max_uses
+   AND (expires_at IS NULL OR expires_at > clock_timestamp())
+RETURNING id, community_id
+```
+
+`used_count < max_uses` read by one connection and acted on by another is **CWE-837**. The
+row lock is what makes ten concurrent redemptions of a one-use code yield one membership;
+the `used_count <= max_uses` check constraint behind it is the backstop, not the rule.
+
+**A rotation tombstones the old code with `invalidated_at` and never deletes it.** A
+deleted row is a code that can be issued again by accident — Check Point documented live
+exploitation in 2025 of Discord returning expired invite codes to the pool. One live code
+per community is a partial unique index, so rotation is invalidate-then-insert in one
+transaction and two rotations racing cannot both leave a code behind.
+
+**Every refusal is the same 404 with the same sentence**: never issued, rotated away, past
+its deadline, out of uses. Telling them apart is how a code becomes something to enumerate,
+which OWASP calls **OAT-002**. All four cost the same three statements — the claim that
+found no room, one diagnosis, one audit row — which is what "indistinguishable in timing"
+is tested as. A wall-clock assertion wide enough not to flake on a shared runner is wider
+than the leak it looks for; the leak that matters is an extra query, so the test counts
+statements.
+
+`code_audit` is the only place the four differ, which is what an operator needs when
+somebody says they cannot get in. It holds `code_id` and never the code, and `code_id` is
+NULL for a code that was never found — the one case with nothing to point at.
+
+Redemption attempts are limited on their own table, `code_attempts`: **5 per account** and
+**20 per address** over **15 minutes**, answered 429 with `Retry-After`. A code that works
+clears the account's own bucket, the way a successful login does — four mistypes then a
+successful join must not leave somebody one typo from a lockout. The address bucket is left
+alone: an address that has been guessing at codes still has been. Its own table and
+not a `kind` column on `login_attempts`, so guessing codes at somebody cannot lock them out
+of signing in. A 65-bit code does not fall to guessing; the limit is about the cost and the
+noise of somebody trying.
+
 ## Anti-snipe
 A bid inside the last **60s** (`SNIPE_WINDOW`) moves the deadline to 60s from the moment it
 lands, so a bid placed too late to be answered cannot win on timing alone. `hard_ends_at`,
@@ -340,6 +466,11 @@ The invariants the bid path assumes are enforced by the schema, not only by Pyth
 | `ck_auctions_status_known` | `status IN ('draft', 'open', 'closed', 'cancelled')` |
 | `ck_auctions_starting_bid_positive` | `starting_bid > 0` |
 | `ck_auctions_reserve_at_least_starting` | `reserve IS NULL OR reserve >= starting_bid` |
+| `ck_community_codes_uses_within_max` | `used_count <= max_uses` |
+| `ck_community_codes_max_uses_positive` | `max_uses > 0` |
+| `uq_one_live_code_per_community` | one row per community `WHERE invalidated_at IS NULL` |
+| `uq_memberships_community_user_generation` | one **live** membership per person per generation, `WHERE revoked_at IS NULL` |
+| `ck_code_audit_outcome_known` | the six outcomes and nothing else |
 | `ck_auctions_current_bid_at_least_starting` | `current_bid IS NULL OR current_bid >= starting_bid` |
 | `ck_bids_amount_positive` | `amount > 0` |
 | `ck_auctions_currency_is_a_code` | `currency ~ '^[A-Z]{3}$'` |
@@ -403,6 +534,14 @@ lookup against Have I Been Pwned, which puts an outbound call on the signup path
 an answer for what to do when it is down.
 
 Then settlement and payments.
+
+**Remove-all has no broadcast path until M10.** Everyone must redeem the new code again,
+and nothing tells them to — so between these two milestones the new code reaches members
+out of band. Named rather than papered over, the same way `verified_at` was.
+
+Communities have no read endpoints: nothing lists a community, its members or its codes,
+and nothing exposes a user's own id, which is why the kick route takes one from the caller.
+That is UI work on rows that already exist.
 
 A bid-history endpoint for the seller's dashboard: `/auctions/mine` is the list, and the
 obvious second endpoint is the bids on one of them, scoped to its seller.
