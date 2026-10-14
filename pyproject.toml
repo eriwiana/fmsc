@@ -72,9 +72,9 @@ source = ["app"]
 # flatters the number without testing anything.
 omit = ["alembic/*", "app/main.py"]
 exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:"]
-# Measured baseline, not an aspiration. 96.63% after M7, which brought tests for most of
-# app/auth.py's error paths; the floor sits one point under the measurement, because the
-# number moves by a few tenths between runs for the reason below.
+# Measured baseline, not an aspiration. 97.91% after M8, and the same number three runs
+# running: the wobble the note below describes has gone, because the lines it came from are
+# now the only uncovered ones and they are uncovered every time.
 #
 # Treat an unstable number as a missing test rather than something to average out. Every
 # wobble here has been a line no test called, which coverage credited some of the time.
@@ -83,9 +83,10 @@ exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:"]
 # trace, so some socket lines are exercised by passing tests and credited unevenly. Not a
 # gap in the tests, so do not go looking for one.
 #
-# What remains genuinely uncovered is create_auction's two validation branches and a
-# couple of lines in the socket handler. Ratchet up as tests land, never down.
-fail_under = 96
+# What remains genuinely uncovered is the idempotency key's lost race, which needs two
+# writers inside one transaction, one unreachable return in the socket handler, and four
+# of app/auth.py's own error paths. Ratchet up as tests land, never down.
+fail_under = 97
 
 [build-system]
 requires = ["setuptools>=61"]

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from queue import Empty
@@ -464,3 +465,210 @@ def test_too_many_failed_logins_answer_429_with_retry_after(client, clean_db):
     limited = client.post("/auth/login", json={"email": "locked@x.com", "password": PASSWORD})
     assert limited.status_code == 429
     assert 0 < int(limited.headers["Retry-After"]) <= LOGIN_WINDOW.total_seconds()
+
+
+def test_the_lifecycle_routes_move_an_auction_and_then_refuse_to(client, clean_db):
+    """Routing for criteria 1 and 2. Every other lifecycle test calls the functions
+    directly, so without this the endpoints could be unregistered, or registered on the
+    wrong verb, and the suite would not notice."""
+    seller = _seller(client, "seller@x.com")
+    bidder = _signup(client, "bidder@x.com")
+    headers = {"Authorization": f"Bearer {seller}"}
+    draft = client.post(
+        "/auctions",
+        headers=headers,
+        json={
+            "title": "t",
+            "starting_bid": "10.00",
+            "status": "draft",
+            "ends_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        },
+    )
+    assert draft.status_code == 201, draft.text
+    auction_id = draft.json()["id"]
+
+    # A draft takes no bids and is not public.
+    assert client.get(f"/auctions/{auction_id}").status_code == 404
+    bid = client.post(
+        f"/auctions/{auction_id}/bids",
+        headers={"Authorization": f"Bearer {bidder}"},
+        json={"amount": "10.00"},
+    )
+    assert bid.status_code == 400
+
+    assert (
+        client.patch(f"/auctions/{auction_id}", headers=headers, json={"title": "fixed"}).json()[
+            "title"
+        ]
+        == "fixed"
+    )
+    assert client.post(f"/auctions/{auction_id}/publish", headers=headers).status_code == 201
+    assert client.get(f"/auctions/{auction_id}").status_code == 200
+    # The edge is spent: a published auction cannot be published again.
+    assert client.post(f"/auctions/{auction_id}/publish", headers=headers).status_code == 409
+
+    assert (
+        client.post(
+            f"/auctions/{auction_id}/bids",
+            headers={"Authorization": f"Bearer {bidder}"},
+            json={"amount": "10.00"},
+        ).status_code
+        == 201
+    )
+    # And now neither cancel nor edit is the seller's alone to make.
+    assert client.post(f"/auctions/{auction_id}/cancel", headers=headers).status_code == 409
+    assert (
+        client.patch(
+            f"/auctions/{auction_id}", headers=headers, json={"title": "too late"}
+        ).status_code
+        == 409
+    )
+
+
+def _draft(client: TestClient, seller_token: str) -> int:
+    response = client.post(
+        "/auctions",
+        headers={"Authorization": f"Bearer {seller_token}"},
+        json={
+            "title": "secret lot",
+            "starting_bid": "10.00",
+            "status": "draft",
+            "ends_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        },
+    )
+    assert response.status_code == 201, response.text
+    return response.json()["id"]
+
+
+def test_a_draft_is_not_readable_over_a_socket_either(client, clean_db):
+    """GET /auctions/{id} answers 404 for a draft, and a socket that handed the same row
+    over would be the back door to a locked front one: the snapshot carries the whole
+    auction, and a ticket is something any signed-up account can mint for any id.
+
+    Measured before the guard existed: the socket was accepted and the snapshot came back
+    with the draft's title in it.
+    """
+    seller = _seller(client, "seller@x.com")
+    stranger = _signup(client, "stranger@x.com")
+    auction_id = _draft(client, seller)
+
+    assert client.get(f"/auctions/{auction_id}").status_code == 404
+    url = f"/ws/auctions/{auction_id}?ticket={_ticket(client, stranger)}"
+    with (
+        client.websocket_connect(url) as socket,
+        pytest.raises(WebSocketDisconnect) as closed,
+    ):
+        socket.receive(timeout=READ_TIMEOUT)
+    assert closed.value.code == 4404
+
+
+def test_a_watcher_survives_the_publish_that_opened_the_auction(client, clean_db):
+    """The sequence number a transition consumes has to carry an event with it.
+
+    Measured before it did: a watcher attached before publish, the publish bumped
+    event_seq from 0 to 1 silently, the first bid published seq 2, and the socket closed
+    the subscriber with **4408** — the code for "you missed an event" — when nothing had
+    been lost. The draft guard above makes that exact path unreachable, so this test
+    attaches after publish and checks the numbering is unbroken on both sides of it.
+    """
+    seller = _seller(client, "seller@x.com")
+    bidder = _signup(client, "bidder@x.com")
+    watcher = _signup(client, "watcher@x.com")
+    headers = {"Authorization": f"Bearer {seller}"}
+    auction_id = _draft(client, seller)
+    assert client.post(f"/auctions/{auction_id}/publish", headers=headers).status_code == 201
+
+    with client.websocket_connect(
+        f"/ws/auctions/{auction_id}?ticket={_ticket(client, watcher)}"
+    ) as socket:
+        snapshot = json.loads(socket.receive_text())
+        # The publish spent seq 1, so the snapshot is at 1 and the next event is 2.
+        assert snapshot["seq"] == 1
+        assert (
+            client.post(
+                f"/auctions/{auction_id}/bids",
+                headers={"Authorization": f"Bearer {bidder}"},
+                json={"amount": "10.00"},
+            ).status_code
+            == 201
+        )
+        event = json.loads(socket.receive(timeout=READ_TIMEOUT)["text"])
+        assert event["type"] == "bid"
+        assert event["seq"] == 2
+
+
+def test_a_watcher_is_told_when_the_lot_is_withdrawn(client, clean_db):
+    """Cancelling used to announce nothing: the closer skips a cancelled auction, so no
+    later event ever arrived and a watcher sat on a withdrawn lot until its socket died.
+    """
+    seller = _seller(client, "seller@x.com")
+    watcher = _signup(client, "watcher@x.com")
+    auction_id = _open_auction(client, seller)
+
+    with client.websocket_connect(
+        f"/ws/auctions/{auction_id}?ticket={_ticket(client, watcher)}"
+    ) as socket:
+        socket.receive_text()  # the snapshot
+        assert (
+            client.post(
+                f"/auctions/{auction_id}/cancel", headers={"Authorization": f"Bearer {seller}"}
+            ).status_code
+            == 201
+        )
+        event = json.loads(socket.receive(timeout=READ_TIMEOUT)["text"])
+    assert event["type"] == "status"
+    assert event["status"] == "cancelled"
+
+
+def test_a_reserve_under_the_starting_bid_answers_400(client, clean_db):
+    """ck_auctions_reserve_at_least_starting refuses the pair, and nothing on the app maps
+    an IntegrityError — so without the guards all three of these were 500s."""
+    seller = _seller(client, "seller@x.com")
+    headers = {"Authorization": f"Bearer {seller}"}
+    ends_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+
+    assert (
+        client.post(
+            "/auctions",
+            headers=headers,
+            json={"title": "t", "starting_bid": "100.00", "reserve": "50.00", "ends_at": ends_at},
+        ).status_code
+        == 400
+    )
+
+    created = client.post(
+        "/auctions",
+        headers=headers,
+        json={"title": "t", "starting_bid": "10.00", "reserve": "100.00", "ends_at": ends_at},
+    )
+    assert created.status_code == 201
+    auction_id = created.json()["id"]
+    assert (
+        client.patch(
+            f"/auctions/{auction_id}", headers=headers, json={"starting_bid": "500.00"}
+        ).status_code
+        == 400
+    )
+    assert (
+        client.patch(
+            f"/auctions/{auction_id}", headers=headers, json={"reserve": "1.00"}
+        ).status_code
+        == 400
+    )
+
+
+def test_the_dashboard_route_shows_only_the_callers_auctions(client, clean_db):
+    """Criterion 5 over HTTP. /auctions/mine has to not be swallowed by
+    /auctions/{auction_id:int} — the unit tests call the handler directly and would not
+    notice — and it has to need a token at all."""
+    mine = _seller(client, "mine@x.com")
+    theirs = _seller(client, "theirs@x.com")
+    ours = _open_auction(client, mine)
+    not_ours = _open_auction(client, theirs)
+
+    listed = client.get("/auctions/mine", headers={"Authorization": f"Bearer {mine}"})
+    assert listed.status_code == 200, listed.text
+    assert [a["id"] for a in listed.json()] == [ours]
+    assert not_ours not in [a["id"] for a in listed.json()]
+
+    assert client.get("/auctions/mine").status_code == 401

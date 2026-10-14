@@ -20,6 +20,7 @@ from sqlalchemy import text
 
 from app.auctions import (
     MAX_EXTENSION,
+    bid_increment,
     close_due,
     place_bid,
     place_bid_tx,
@@ -28,6 +29,10 @@ from app.auctions import (
 )
 from app.models import Auction, User
 from app.schemas import BidRequest
+
+# A second bid has to clear the band table's increment; the rule itself is tested in
+# test_bid.py and these tests only have to stay legal.
+STEP = bid_increment(Decimal("10.00"))
 
 # Its own seeders rather than the bid suite's, the way test_closer.py does: these want an
 # auction and two bidders and nothing else.
@@ -144,7 +149,7 @@ async def test_the_relay_publishes_in_sequence_order(sm, channels):
     async with sm() as s:
         await place_bid_tx(s, aid, bidder, Decimal("10.00"))
     async with sm() as s:
-        await place_bid_tx(s, aid, second, Decimal("11.00"))
+        await place_bid_tx(s, aid, second, Decimal("10.00") + STEP)
 
     assert await relay_pending(sm, channels) == 2
     assert [event["seq"] for _, event in channels.published] == [1, 2]
@@ -171,7 +176,7 @@ async def test_pruning_spares_a_recent_event_and_an_unsent_one(sm, channels):
     bidder, second, aid = await _seed(sm)
     await _post_bid(sm, aid, bidder, "10.00", channels)
     async with sm() as s:
-        await place_bid_tx(s, aid, second, Decimal("11.00"))
+        await place_bid_tx(s, aid, second, Decimal("10.00") + STEP)
 
     async with sm() as s:
         assert await prune_outbox(s) == 0

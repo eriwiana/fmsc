@@ -24,7 +24,7 @@ from app.models import Auction, User
 # -5s rather than -1s: the deadline is computed here and compared against Postgres'
 # clock_timestamp(), and a one-second margin is close enough to the boundary that the two
 # clocks can disagree about which side of it the auction is on.
-async def _seed(maker, ends_delta: timedelta = timedelta(seconds=-5)) -> int:
+async def _seed(maker, ends_delta: timedelta = timedelta(seconds=-5), status: str = "open") -> int:
     async with maker() as s:
         seller = User(email="seller@x.com", pw_hash="x")
         s.add(seller)
@@ -35,6 +35,7 @@ async def _seed(maker, ends_delta: timedelta = timedelta(seconds=-5)) -> int:
             seller_id=seller.id,
             currency="IDR",
             starting_bid=Decimal("10.00"),
+            status=status,
             ends_at=ends_at,
             hard_ends_at=ends_at + MAX_EXTENSION,
         )
@@ -322,3 +323,46 @@ async def test_a_failing_tick_says_why(sm, channels, caplog):
         await asyncio.sleep(0.02)
     assert "closer tick failed" in caplog.text
     assert "connection refused" in caplog.text
+
+
+async def test_the_closer_leaves_a_draft_and_a_cancelled_auction_alone(sm, channels):
+    """draft -> closed and cancelled -> closed are illegal edges, and the closer is the
+    only thing that writes 'closed' in production — transition() is never called with it.
+    Without this the status guard in _CLOSE_SQL is untested: widening it to
+    `status <> 'closed'` passed the whole suite.
+
+    A draft closed by a deadline nobody announced is an auction with a result that was
+    never biddable, and a cancelled one closed afterwards erases the withdrawal.
+    """
+    draft = await _seed(sm, status="draft")
+    async with sm() as s:
+        await s.execute(text("UPDATE users SET email = 'other@x.com' WHERE email = 'seller@x.com'"))
+        await s.commit()
+    cancelled = await _seed(sm, status="cancelled")
+
+    assert await close_due(sm, channels) == 0
+
+    assert await _status(sm, draft) == "draft"
+    assert await _status(sm, cancelled) == "cancelled"
+    # And nothing was announced about either of them.
+    async with sm() as s:
+        assert (
+            await s.scalar(
+                text("SELECT count(*) FROM outbox WHERE auction_id IN (:a, :b)"),
+                {"a": draft, "b": cancelled},
+            )
+            == 0
+        )
+
+
+async def test_the_closer_still_closes_an_open_auction_beside_them(sm, channels):
+    """The control. A closer that closed nothing would pass the test above."""
+    draft = await _seed(sm, status="draft")
+    async with sm() as s:
+        await s.execute(text("UPDATE users SET email = 'other@x.com' WHERE email = 'seller@x.com'"))
+        await s.commit()
+    due = await _seed(sm)
+
+    assert await close_due(sm, channels) == 1
+    assert await _status(sm, due) == "closed"
+    assert await _status(sm, draft) == "draft"

@@ -8,7 +8,7 @@ from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 import msgspec
-from litestar import Request, WebSocket, get, post, websocket
+from litestar import Request, WebSocket, get, patch, post, websocket
 from litestar.channels import ChannelsPlugin
 from litestar.di import Provide
 from litestar.exceptions import (
@@ -31,7 +31,12 @@ from app.auth import (
     user_for_ticket,
 )
 from app.models import Auction, Bid, Outbox, User
-from app.schemas import AuctionResponse, BidRequest, CreateAuctionRequest
+from app.schemas import (
+    AuctionResponse,
+    BidRequest,
+    CreateAuctionRequest,
+    EditAuctionRequest,
+)
 
 _authed = {"current_user": Provide(provide_current_user)}
 
@@ -47,9 +52,15 @@ def resolve_deadline(dt: datetime) -> datetime:
     return dt.replace(tzinfo=APP_TZ) if dt.tzinfo is None else dt
 
 
-def _to_response(a: Auction | Row) -> AuctionResponse:
+def _to_response(a: Auction | Row, *, reveal_reserve: bool = False) -> AuctionResponse:
     """Works off either the ORM object or a raw RETURNING row — both expose the columns
-    by name, and the bid path has only the row."""
+    by name, and the bid path has only the row.
+
+    The reserve is the seller's own number and is withheld by default: a bidder who can
+    read it can bid exactly it, which turns the seller's floor into their ceiling. The
+    seller's own routes pass reveal_reserve, because a seller who cannot read back what
+    they set cannot tell a typo from a decision.
+    """
     return AuctionResponse(
         id=a.id,
         title=a.title,
@@ -59,11 +70,97 @@ def _to_response(a: Auction | Row) -> AuctionResponse:
         current_winner_id=a.current_winner_id,
         bid_count=a.bid_count,
         currency=a.currency,
+        reserve=a.reserve if reveal_reserve else None,
         status=a.status,
         starts_at=a.starts_at.astimezone(APP_TZ),
         ends_at=a.ends_at.astimezone(APP_TZ),
         hard_ends_at=a.hard_ends_at.astimezone(APP_TZ),
     )
+
+
+# The lifecycle, as a table of edges rather than a tree of ifs. A draft is a listing the
+# seller has not announced yet; cancelled is one withdrawn before anybody committed to it;
+# closed is what the deadline does.
+#
+# Keyed by destination, because that is what a caller asks for — "publish this" — and the
+# question the statement has to answer is whether the row is in a state that may go there.
+# An empty tuple means nothing may reach that state: nothing re-drafts an auction once it
+# has been announced, since the draft is the state before anyone has seen it.
+#
+# The table is the only place the machine is written down. _TRANSITION_SQL reads it as a
+# parameter, so a new edge is one entry here and no new SQL.
+#
+# `closed` is in the table because it is an edge of the machine, but nothing calls
+# transition() with it: the closer owns that edge and has to, because it closes every due
+# auction in one statement and writes an event per row. Its own WHERE carries the same
+# guard, and there is a test that it leaves a draft and a cancelled auction alone.
+LEGAL_FROM: dict[str, tuple[str, ...]] = {
+    "draft": (),
+    "open": ("draft",),
+    "closed": ("open",),
+    "cancelled": ("draft", "open"),
+}
+STATUSES = tuple(LEGAL_FROM)
+
+# One guarded UPDATE. The legality, the ownership and the bid check are all in the WHERE,
+# so there is no window between deciding and moving: two statements would let a bid land
+# between the check and the cancel, and the cancel would still go through.
+#
+# `status = ANY(...)` with an empty array matches nothing, which is how a
+# destination no edge reaches refuses itself without a special case. A same-state request
+# is refused for free: a state is never listed among the ones that may reach it. The CAST
+# is what asyncpg needs to type the list; without it the parameter arrives as a scalar and
+# every transition is refused.
+#
+# Two of the conditions are per destination. bid_count is only consulted for a cancel:
+# closing an auction that has bids is the point of closing it, and publishing one cannot
+# have any. The deadline is only consulted for a publish, because a draft sat on past its
+# own ends_at would open and then be closed by the very next closer tick — an auction that
+# was never biddable, announced to everyone watching.
+_TRANSITION_SQL = text("""
+    UPDATE auctions
+       SET status = :to, event_seq = event_seq + 1
+     WHERE id = :id
+       AND seller_id = :seller_id
+       AND status = ANY(CAST(:from_states AS varchar[]))
+       AND (:to <> 'cancelled' OR bid_count = 0)
+       AND (:to <> 'open' OR ends_at > clock_timestamp())
+    RETURNING *
+    """)
+
+
+async def transition(
+    session: AsyncSession, auction_id: int, to: str, *, seller_id: int
+) -> Row | None:
+    """Move an auction to `to`, or return None because the edge was not available.
+
+    None covers every refusal — illegal edge, wrong owner, bids already placed, no such
+    auction — on purpose. The caller cannot act on the difference, and spelling it out
+    would tell a stranger which auctions exist and how many bids they have.
+    """
+    row = (
+        await session.execute(
+            _TRANSITION_SQL,
+            {
+                "id": auction_id,
+                "to": to,
+                "seller_id": seller_id,
+                "from_states": list(LEGAL_FROM.get(to, ())),
+            },
+        )
+    ).first()
+    if row is None:
+        await session.rollback()
+        return None
+    # The event rides in the same transaction as the move, for the same reason a bid's
+    # does. event_seq counts events *published* about an auction, and the socket closes a
+    # subscriber that sees a number skipped — so a bump with no event would tell a watcher
+    # it had missed something that never existed. It is also the only way a watcher hears
+    # that the lot was withdrawn: the closer skips a cancelled auction, so no later event
+    # ever arrives.
+    session.add(_owed(row, _status_event(row)))
+    await session.commit()
+    return row
 
 
 # The Money column is Numeric(18,2), and this is exactly what it holds. Postgres raises
@@ -75,6 +172,44 @@ MAX_BID = Decimal("9999999999999999.99")
 # What the table's own check constraint accepts, spelled the same way. Validated here so
 # the refusal is a 400 naming the field, not the 500 an IntegrityError becomes.
 CURRENCY_CODE = re.compile(r"[A-Z]{3}")
+
+# The increment table. A bid has to beat the leader by this much, not by a cent: penny
+# wars are what bots are for, and an auction decided by who can issue the most requests is
+# not an auction. Bands rather than a percentage so the step is a round number a bidder can
+# predict, and rather than a per-auction column so there is no knob for a seller to get
+# wrong. IDR-shaped, because IDR is the only currency in use; a second currency needs its
+# own table, which is why the numbers are here and not in the SQL.
+#
+# Chosen, not measured. The milestone records that.
+#
+# (ceiling, step): the step applies while the current bid is under the ceiling. The last
+# entry's ceiling is None, which is everything above.
+BID_INCREMENTS: tuple[tuple[Decimal | None, Decimal], ...] = (
+    (Decimal("1000000"), Decimal("10000")),
+    (Decimal("10000000"), Decimal("100000")),
+    (None, Decimal("500000")),
+)
+
+
+def bid_increment(current: Decimal) -> Decimal:
+    """The step a bid must clear to beat `current`."""
+    return next(step for ceiling, step in BID_INCREMENTS if ceiling is None or current < ceiling)
+
+
+def _increment_case(column: str) -> str:
+    """The same table as SQL, generated rather than written out twice.
+
+    Two copies would drift, and the copy that drifted would be the message rather than the
+    rule — a bidder told to bid 20,000 and then refused at 20,000. The values are Decimals
+    from the tuple above, so there is nothing here a caller can reach.
+    """
+    whens = " ".join(
+        f"WHEN {column} < {ceiling} THEN {step}"
+        for ceiling, step in BID_INCREMENTS
+        if ceiling is not None
+    )
+    return f"CASE {whens} ELSE {BID_INCREMENTS[-1][1]} END"
+
 
 # Anti-snipe. A bid inside the last SNIPE_WINDOW pushes the deadline that far out from the
 # moment it lands, so a bid placed too late to be answered cannot win on timing alone.
@@ -116,37 +251,214 @@ async def create_auction(
         raise ClientException("ends_at must be in the future")
     if data.starting_bid <= 0:
         raise ClientException("starting_bid must be positive")
+    # ck_auctions_reserve_at_least_starting enforces this too. Checked here so the refusal
+    # is a 400 naming the field rather than the 500 an IntegrityError becomes.
+    if data.reserve is not None and data.reserve < data.starting_bid:
+        raise ClientException("reserve must be at least the starting bid")
     # Normalised here rather than relied on from the client: the table refuses anything
     # that is not three uppercase letters, and that refusal would arrive as a 500.
     currency = data.currency.strip().upper()
     if not CURRENCY_CODE.fullmatch(currency):
         raise ClientException("currency must be a three-letter ISO 4217 code")
+    # Opt-in, and only these two: a client asking to be created closed or cancelled is
+    # asking for a state the machine reaches by an edge, not by a POST.
+    if data.status not in ("open", "draft"):
+        raise ClientException("status must be open or draft")
     auction = Auction(
         title=data.title,
         seller_id=current_user.id,
         starting_bid=data.starting_bid,
         currency=currency,
+        reserve=data.reserve,
+        status=data.status,
         ends_at=ends_at,
         hard_ends_at=ends_at + MAX_EXTENSION,
     )
     db_session.add(auction)
     await db_session.commit()
     await db_session.refresh(auction)
-    return _to_response(auction)
+    return _to_response(auction, reveal_reserve=True)
 
 
 @get("/auctions")
 async def list_auctions(db_session: AsyncSession) -> list[AuctionResponse]:
-    rows = await db_session.scalars(select(Auction).order_by(Auction.ends_at))
+    """Everything but the drafts.
+
+    A draft is the state before anyone has seen the listing, so publishing it here would
+    make the draft pointless. Cancelled and closed auctions stay: a bidder who was
+    watching needs to see why bidding stopped, and the results are the archive.
+    """
+    rows = await db_session.scalars(
+        select(Auction).where(Auction.status != "draft").order_by(Auction.ends_at)
+    )
     return [_to_response(a) for a in rows]
+
+
+# Registered before /auctions/{auction_id:int} would matter in a framework that matched
+# routes in order; litestar matches the literal path first either way, and the test below
+# is what says so rather than the ordering here.
+@get("/auctions/mine", dependencies=_authed)
+async def my_auctions(current_user: User, db_session: AsyncSession) -> list[AuctionResponse]:
+    """Criterion 5. Every auction this caller sells, whatever its status.
+
+    The seller's own view, which is why it is the one place drafts appear and the one
+    place the reserve is echoed back. Filtered by seller_id in the WHERE rather than by
+    reading and then checking: a filter that happens in Python is one somebody later
+    forgets to apply to a second query.
+
+    Newest first, by id. The public list is ordered by deadline because a bidder wants
+    what ends soonest; a seller wants what they just created, and a draft has no
+    meaningful deadline to sort by yet.
+    """
+    rows = await db_session.scalars(
+        select(Auction).where(Auction.seller_id == current_user.id).order_by(Auction.id.desc())
+    )
+    return [_to_response(a, reveal_reserve=True) for a in rows]
 
 
 @get("/auctions/{auction_id:int}")
 async def get_auction(auction_id: int, db_session: AsyncSession) -> AuctionResponse:
     auction = await db_session.get(Auction, auction_id)
-    if auction is None:
+    # A draft answers 404 rather than 403: this route takes no credentials, and a 403
+    # would confirm the id belongs to something. The seller reads their drafts from
+    # /auctions/mine.
+    if auction is None or auction.status == "draft":
         raise NotFoundException("auction not found")
     return _to_response(auction)
+
+
+# Criterion 2's other half. Same shape as the transition: the guards are in the WHERE, so
+# a bid landing between a check and the write cannot be edited out from under.
+#
+# bid_count = 0 is the rule. Bidders bid on the description, so changing it afterwards is a
+# bait-and-switch, and raising starting_bid after a bid would retroactively invalidate a bid
+# that had already been accepted.
+#
+# NULL means unchanged, so COALESCE does the whole patch in one statement. hard_ends_at
+# rides on :ends_at rather than on the stored column: NULL + interval is NULL, so the
+# COALESCE falls through to the existing ceiling and an edit that leaves the deadline alone
+# does not move it either.
+#
+# status IN ('draft', 'open') and not just a bid count: a closed auction has a result and a
+# cancelled one is withdrawn, and editing the description of either rewrites history.
+#
+# The last condition pairs whichever of the two numbers the request carries with whichever
+# it leaves alone, and refuses the combination the table would refuse anyway. In the WHERE
+# rather than read and then checked, because a read would be a second statement and the
+# window between them is where the 500 lives.
+#
+# The IS NULL arm is not decoration: without it an auction with no reserve compares NULL
+# against its starting bid, which is NULL rather than true, and every edit is refused.
+_EDIT_SQL = text("""
+    UPDATE auctions
+       SET title = COALESCE(:title, title),
+           starting_bid = COALESCE(:starting_bid, starting_bid),
+           reserve = COALESCE(:reserve, reserve),
+           ends_at = COALESCE(:ends_at, ends_at),
+           hard_ends_at = COALESCE(:ends_at + :extension, hard_ends_at)
+     WHERE id = :id
+       AND seller_id = :seller_id
+       AND bid_count = 0
+       AND status IN ('draft', 'open')
+       AND (COALESCE(:reserve, reserve) IS NULL
+            OR COALESCE(:reserve, reserve) >= COALESCE(:starting_bid, starting_bid))
+    RETURNING *
+    """)
+
+
+@patch("/auctions/{auction_id:int}", dependencies=_authed)
+async def edit_auction(
+    auction_id: int,
+    data: EditAuctionRequest,
+    current_user: User,
+    db_session: AsyncSession,
+) -> AuctionResponse:
+    """Fix a listing nobody has bid on yet. 409 once a bid exists.
+
+    The validation repeats create_auction's rather than sharing it: there are two call
+    sites and the checks are three lines, so a helper would be an indirection per field
+    for no fewer rules.
+    """
+    ends_at = resolve_deadline(data.ends_at) if data.ends_at is not None else None
+    if ends_at is not None and ends_at <= datetime.now(timezone.utc):
+        raise ClientException("ends_at must be in the future")
+    if data.starting_bid is not None and data.starting_bid <= 0:
+        raise ClientException("starting_bid must be positive")
+    row = (
+        await db_session.execute(
+            _EDIT_SQL,
+            {
+                "id": auction_id,
+                "seller_id": current_user.id,
+                "title": data.title,
+                "starting_bid": data.starting_bid,
+                "reserve": data.reserve,
+                "ends_at": ends_at,
+                "extension": MAX_EXTENSION,
+            },
+        )
+    ).first()
+    await db_session.commit()
+    if row is None:
+        # One read, on the refusal path only, to tell "you may not edit this" from "these
+        # two numbers do not go together" — the second is a 400 the seller can act on, and
+        # answering 409 for it would send them looking for a bid that is not there.
+        auction = await db_session.get(Auction, auction_id)
+        if auction is not None and auction.seller_id == current_user.id:
+            reserve = data.reserve if data.reserve is not None else auction.reserve
+            floor = data.starting_bid if data.starting_bid is not None else auction.starting_bid
+            if reserve is not None and reserve < floor:
+                raise ClientException("reserve must be at least the starting bid")
+        raise HTTPException(
+            status_code=HTTP_409_CONFLICT,
+            detail="an auction can only be edited by its seller, before its first bid,"
+            " and only while it is a draft or open",
+        )
+    return _to_response(row, reveal_reserve=True)
+
+
+async def _announce(db_session: AsyncSession, channels: ChannelsPlugin, row: Row) -> None:
+    """Publish the move the transition wrote, then mark it sent. Same shape as the bid
+    path: published here rather than left to the relay so a watcher hears it now, with
+    the outbox row as the safety net rather than the route.
+
+    An unsent row is picked up by the next relay tick and the watcher still hears it, just
+    a tick late — which is why the test asserts sent_at as well as the published event.
+    """
+    channels.publish(_status_event(row), _channel(row.id))
+    await mark_sent(db_session, row.id, row.event_seq)
+
+
+@post("/auctions/{auction_id:int}/publish", dependencies=_authed)
+async def publish_auction(
+    auction_id: int, current_user: User, db_session: AsyncSession, channels: ChannelsPlugin
+) -> AuctionResponse:
+    """Announce a draft. The only edge into open."""
+    row = await transition(db_session, auction_id, "open", seller_id=current_user.id)
+    if row is None:
+        raise HTTPException(
+            status_code=HTTP_409_CONFLICT,
+            detail="only the seller can publish their own auction, and only while it is a"
+            " draft whose deadline is still ahead",
+        )
+    await _announce(db_session, channels, row)
+    return _to_response(row, reveal_reserve=True)
+
+
+@post("/auctions/{auction_id:int}/cancel", dependencies=_authed)
+async def cancel_auction(
+    auction_id: int, current_user: User, db_session: AsyncSession, channels: ChannelsPlugin
+) -> AuctionResponse:
+    """Withdraw a listing nobody has bid on. 409 once a bid exists, because by then the
+    lot is somebody else's commitment and not only the seller's to withdraw."""
+    row = await transition(db_session, auction_id, "cancelled", seller_id=current_user.id)
+    if row is None:
+        raise HTTPException(
+            status_code=HTTP_409_CONFLICT,
+            detail="an auction can only be cancelled by its seller, before its first bid",
+        )
+    await _announce(db_session, channels, row)
+    return _to_response(row, reveal_reserve=True)
 
 
 # The entire correctness of an absolute auction: one conditional UPDATE. Postgres MVCC
@@ -167,9 +479,21 @@ async def get_auction(auction_id: int, db_session: AsyncSession) -> AuctionRespo
 # test can tell them apart. The ordering stays as written because it is still the correct
 # one if that constraint is ever dropped.
 #
+# The increment rides in the same WHERE for the same reason as the reserve, and it only
+# applies once there is a leader: an opening bid has nothing to beat, so it may still equal
+# starting_bid.
+#
 # WHERE still reads the pre-update ends_at, so a bid that arrives after the deadline loses
 # rather than extending its way back in.
-_BID_SQL = text("""
+#
+# The reserve is a floor in this same WHERE, which is the whole of criterion 3: a handler
+# that read the reserve and then decided would be two statements, and the reserve could be
+# edited between them. COALESCE(reserve, starting_bid) means no reserve is not a special
+# case. The starting_bid guard above is kept even though the constraint
+# reserve >= starting_bid makes it redundant: if that constraint is ever dropped, a reserve
+# set below the advertised price must not become a way under the advertised price.
+_BID_SQL = text(
+    """
     UPDATE auctions
        SET current_bid = :amount, current_winner_id = :uid, bid_count = bid_count + 1,
            event_seq = event_seq + 1,
@@ -177,9 +501,13 @@ _BID_SQL = text("""
      WHERE id = :id AND status = 'open' AND ends_at > clock_timestamp()
        AND seller_id <> :uid
        AND :amount >= starting_bid
-       AND (current_bid IS NULL OR :amount > current_bid)
+       AND :amount >= COALESCE(reserve, starting_bid)
+       AND (current_bid IS NULL OR :amount >= current_bid + """
+    + _increment_case("current_bid")
+    + """)
     RETURNING *
-    """)
+    """
+)
 
 
 # IETF draft-ietf-httpapi-idempotency-key-header spells it this way, and caps the key at
@@ -208,6 +536,21 @@ def _closed_event(row: Row) -> dict:
         "auction_id": row.id,
         "winner_id": row.current_winner_id,
         "amount": str(row.current_bid) if row.current_bid is not None else None,
+        "ends_at": row.ends_at.astimezone(APP_TZ).isoformat(),
+        "seq": row.event_seq,
+    }
+
+
+def _status_event(row: Row) -> dict:
+    """A lifecycle move, announced like a bid or a close.
+
+    One type for all of them rather than one per status: a client switches on `type` and
+    `status` carries which way it went, so a state added later needs no new event type.
+    """
+    return {
+        "type": "status",
+        "auction_id": row.id,
+        "status": row.status,
         "ends_at": row.ends_at.astimezone(APP_TZ).isoformat(),
         "seq": row.event_seq,
     }
@@ -370,8 +713,16 @@ async def reject_reason(
         return "a seller cannot bid on their own auction"
     if amount < auction.starting_bid:
         return f"bid must be at least {auction.starting_bid}"
-    if auction.current_bid is not None and amount <= auction.current_bid:
-        return f"bid must be above {auction.current_bid}"
+    if auction.reserve is not None and amount < auction.reserve:
+        # The number is not in the message. A reserve a bidder can read is a reserve they
+        # can bid exactly, which is the seller's floor turned into the seller's ceiling.
+        return "the seller's reserve has not been met"
+    if auction.current_bid is not None:
+        least = auction.current_bid + bid_increment(auction.current_bid)
+        if amount < least:
+            # The number, not the rule: a bidder needs to know what to type, and working
+            # the band table out from a refusal is not their job.
+            return f"bid must be at least {least}"
     return "outbid while the bid was in flight"
 
 
@@ -455,7 +806,11 @@ async def auction_ws(
     # The client is not expected to send anything; whatever arrives is discarded.
     async with channels.start_subscription(_channel(auction_id)) as subscriber:
         auction = await db_session.get(Auction, auction_id)
-        if auction is None:
+        # A draft is refused here and not only by the HTTP route. GET /auctions/{id}
+        # answers 404 for one, and a socket that handed the same row over would be the
+        # back door to a locked front one: the snapshot carries the whole auction, and a
+        # ticket is something any signed-up account can mint for any id.
+        if auction is None or auction.status == "draft":
             await socket.close(code=4404)
             return
         # Order matters, and it is the whole point of the snapshot. The subscription is

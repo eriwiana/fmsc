@@ -104,7 +104,10 @@ class LoginAttempt(BigIntBase):
 class Auction(BigIntAuditBase):
     __tablename__ = "auctions"
     title: Mapped[str] = mapped_column(String(200))
-    seller_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    # Indexed because the seller's dashboard filters on it, and Postgres does not index a
+    # foreign key for you — without this, reading one seller's listings scans every auction
+    # on the service.
+    seller_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     starting_bid: Mapped[Decimal] = mapped_column(Money)
     # NULL current_bid = no bids yet, so the opening bid may equal starting_bid.
     current_bid: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
@@ -112,9 +115,15 @@ class Auction(BigIntAuditBase):
     # currency is in use: an amount without its unit is not a price, and the cost of
     # adding the column later is a money migration over live bids.
     currency: Mapped[str] = mapped_column(Currency)
+    # The price below which the seller will not sell, and nobody else is told what it is.
+    # NULL means there is none, which is what an absolute auction is: starting_bid is then
+    # the only floor. Evaluated inside the bid statement, never in the handler.
+    reserve: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
     current_winner_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     bid_count: Mapped[int] = mapped_column(default=0)
-    status: Mapped[str] = mapped_column(String(10), default="open")  # open | closed
+    # draft | open | closed | cancelled. A draft is unannounced, cancelled is withdrawn
+    # before anybody committed. The legal edges between them live in app.auctions.
+    status: Mapped[str] = mapped_column(String(10), default="open")
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     # The latest ends_at may ever be extended to. Fixed when the auction is created:
@@ -137,12 +146,18 @@ class Auction(BigIntAuditBase):
         CheckConstraint("hard_ends_at >= ends_at", name="ceiling_after_deadline"),
         # Both the bid guard and the closer read status. A typo'd value makes an auction
         # unbiddable and uncloseable at once, and nothing would report it.
-        CheckConstraint("status IN ('open', 'closed')", name="status_known"),
+        CheckConstraint("status IN ('draft', 'open', 'closed', 'cancelled')", name="status_known"),
         CheckConstraint("starting_bid > 0", name="starting_bid_positive"),
         # An accepted bid below the advertised price.
         CheckConstraint(
             "current_bid IS NULL OR current_bid >= starting_bid",
             name="current_bid_at_least_starting",
+        ),
+        # A reserve under the advertised starting price is not a reserve; it would also
+        # make the bid statement's COALESCE floor lower than starting_bid, so the two
+        # guards there would disagree about what the minimum is.
+        CheckConstraint(
+            "reserve IS NULL OR reserve >= starting_bid", name="reserve_at_least_starting"
         ),
         CheckConstraint("event_seq >= 0", name="event_seq_not_negative"),
         CheckConstraint(CURRENCY_IS_A_CODE, name="currency_is_a_code"),
