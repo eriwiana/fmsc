@@ -856,3 +856,33 @@ async def test_the_increment_rides_in_the_one_bid_update(sm):
 
     assert len(updates) == 1, f"the bid path issued {len(updates)} UPDATEs on auctions"
     assert "CASE" in updates[0]
+
+
+async def test_an_auction_cannot_be_created_with_a_past_deadline_or_a_free_lot(sm):
+    """create_auction's own two validations, which had nothing calling them. Both are
+    also table constraints, so without the checks here each arrives as the 500 an
+    IntegrityError becomes rather than a 400 naming the field."""
+    async with sm() as s:
+        seller = User(email="s@x.com", pw_hash="x", verified_at=datetime.now(timezone.utc))
+        s.add(seller)
+        await s.commit()
+    future = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    with pytest.raises(ClientException):
+        async with sm() as s:
+            await create_auction.fn(
+                data=CreateAuctionRequest(
+                    title="t",
+                    starting_bid=Decimal("10.00"),
+                    ends_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+                ),
+                current_user=seller,
+                db_session=s,
+            )
+    with pytest.raises(ClientException):
+        async with sm() as s:
+            await create_auction.fn(
+                data=CreateAuctionRequest(title="t", starting_bid=Decimal("0"), ends_at=future),
+                current_user=seller,
+                db_session=s,
+            )
