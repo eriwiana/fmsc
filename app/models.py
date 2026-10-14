@@ -71,6 +71,31 @@ class WsTicket(BigIntBase):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class LoginAttempt(BigIntBase):
+    """One failed login. Successful ones are not recorded; this table is only a counter.
+
+    Rows, not a counter column, because the limit is a rate: a count has to be of the
+    attempts inside a window, and a window cannot be subtracted from a single integer.
+    Postgres rather than memory so the limit holds across processes — the fan-out backend
+    is optional in this project, and a rate limit that resets on deploy is not one.
+    """
+
+    __tablename__ = "login_attempts"
+    # The email as presented, not a user id: an attacker guessing at an address that does
+    # not exist has to be counted too, or probing for valid accounts is free.
+    email: Mapped[str] = mapped_column(String(255))
+    ip: Mapped[str] = mapped_column(String(45))  # fits an IPv6 address with a v4 suffix
+    failed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        # One index per bucket. The two counts are deliberately independent: a combined
+        # (email, ip) key would hand every address its own budget per account, which is
+        # the hole the milestone's criterion names.
+        Index("ix_login_attempts_email_failed_at", "email", "failed_at"),
+        Index("ix_login_attempts_ip_failed_at", "ip", "failed_at"),
+    )
+
+
 class Auction(BigIntAuditBase):
     __tablename__ = "auctions"
     title: Mapped[str] = mapped_column(String(200))

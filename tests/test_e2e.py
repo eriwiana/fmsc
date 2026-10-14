@@ -30,6 +30,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
+from app.auth import LOGIN_WINDOW, MAX_FAILURES_PER_ACCOUNT
 from app.main import (
     SUBSCRIBER_BACKLOG_STRATEGY,
     SUBSCRIBER_MAX_BACKLOG,
@@ -72,8 +73,8 @@ def clean_db():
         async with engine.begin() as conn:
             await conn.execute(
                 text(
-                    "TRUNCATE outbox, bids, auctions, ws_tickets, sessions, users"
-                    " RESTART IDENTITY CASCADE"
+                    "TRUNCATE outbox, bids, auctions, ws_tickets, sessions,"
+                    " login_attempts, users RESTART IDENTITY CASCADE"
                 )
             )
         await engine.dispose()
@@ -422,3 +423,17 @@ def test_logout_revokes_the_token_it_was_given(client, clean_db):
     assert (
         client.post("/ws/tickets", headers={"Authorization": f"Bearer {second}"}).status_code == 401
     )
+
+
+def test_too_many_failed_logins_answer_429_with_retry_after(client, clean_db):
+    """Criterion 3's wire format. Every other rate-limit test asserts the exception, which
+    says nothing about the status code or whether litestar puts the header on the response
+    — and a 429 with no Retry-After tells a client to guess, so it retries immediately."""
+    _signup(client, "locked@x.com")
+    for _ in range(MAX_FAILURES_PER_ACCOUNT):
+        refused = client.post("/auth/login", json={"email": "locked@x.com", "password": "wrong"})
+        assert refused.status_code == 401
+
+    limited = client.post("/auth/login", json={"email": "locked@x.com", "password": PASSWORD})
+    assert limited.status_code == 429
+    assert 0 < int(limited.headers["Retry-After"]) <= LOGIN_WINDOW.total_seconds()

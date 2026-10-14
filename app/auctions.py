@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.auth import (
     provide_current_user,
+    prune_login_attempts,
     purge_expired_sessions,
     purge_expired_tickets,
     user_for_ticket,
@@ -567,6 +568,7 @@ async def run_closer(
             async with session_maker() as session:
                 await purge_expired_tickets(session)
                 await purge_expired_sessions(session)
+                await prune_login_attempts(session)
                 await prune_outbox(session)
         except Exception:
             # Blind on purpose: a transient database error must not kill the loop. BLE001
