@@ -44,6 +44,33 @@ class BidRequest(msgspec.Struct):
     amount: Decimal
 
 
+class CreateCommunityRequest(msgspec.Struct):
+    name: str
+
+
+class CommunityResponse(msgspec.Struct):
+    id: int
+    name: str
+    owner_id: int
+    membership_generation: int
+
+
+class IssueCodeRequest(msgspec.Struct):
+    label: str = ""
+    max_uses: int = 1
+    expires_at: datetime | None = None
+
+
+class CodeResponse(msgspec.Struct):
+    """The one and only time the code is readable. Nothing stores it."""
+
+    code: str
+
+
+class GenerationResponse(msgspec.Struct):
+    membership_generation: int
+
+
 class RedeemRequest(msgspec.Struct):
     code: str
 

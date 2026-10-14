@@ -5,7 +5,6 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from zoneinfo import ZoneInfo
 
 import msgspec
 from litestar import Request, WebSocket, get, patch, post, websocket
@@ -30,6 +29,7 @@ from app.auth import (
     purge_expired_tickets,
     user_for_ticket,
 )
+from app.clock import APP_TZ, resolve_deadline
 from app.communities import prune_code_attempts
 from app.models import Auction, Bid, Outbox, User
 from app.schemas import (
@@ -42,15 +42,6 @@ from app.schemas import (
 _authed = {"current_user": Provide(provide_current_user)}
 
 logger = logging.getLogger(__name__)
-
-# The app operates in Asia/Jakarta (WIB, UTC+7). Storage stays UTC (timestamptz); this only
-# governs the boundaries — naive input is read as Jakarta wall time, output is rendered in it.
-APP_TZ = ZoneInfo("Asia/Jakarta")
-
-
-def resolve_deadline(dt: datetime) -> datetime:
-    """A naive datetime is interpreted as Jakarta wall time; an aware one is left as-is."""
-    return dt.replace(tzinfo=APP_TZ) if dt.tzinfo is None else dt
 
 
 def _to_response(a: Auction | Row, *, reveal_reserve: bool = False) -> AuctionResponse:

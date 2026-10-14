@@ -11,15 +11,30 @@ from datetime import datetime, timedelta, timezone
 
 from litestar import Request, post
 from litestar.di import Provide
-from litestar.exceptions import NotFoundException, TooManyRequestsException
+from litestar.exceptions import (
+    ClientException,
+    HTTPException,
+    NotFoundException,
+    TooManyRequestsException,
+)
+from litestar.status_codes import HTTP_409_CONFLICT
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import codes
 from app.auth import client_ip, provide_current_user
-from app.models import CodeAttempt, CommunityCode, User
-from app.schemas import MembershipResponse, RedeemRequest
+from app.clock import resolve_deadline
+from app.models import CodeAttempt, Community, CommunityCode, User
+from app.schemas import (
+    CodeResponse,
+    CommunityResponse,
+    CreateCommunityRequest,
+    GenerationResponse,
+    IssueCodeRequest,
+    MembershipResponse,
+    RedeemRequest,
+)
 
 _authed = {"current_user": Provide(provide_current_user)}
 
@@ -205,6 +220,7 @@ _JOIN_SQL = text("""
 # A revoked row does not collide, so somebody kicked by mistake can be let back in
 # with a fresh code; only a live membership trips this.
 _MEMBERSHIP_CONSTRAINT = "uq_memberships_community_user_generation"
+_ONE_LIVE_CODE = "uq_one_live_code_per_community"
 
 # Why the claim found no room, read once, on the failure path, for the audit log and for
 # nothing else. The caller's answer is already decided by then and does not depend on this.
@@ -524,3 +540,136 @@ async def redeem(
         )
     ).one()
     return MembershipResponse(community_id=row.community_id, generation=row.generation)
+
+
+# Every owner-only refusal is this, for the same reason the redemption has one answer: the
+# caller cannot act on the difference between "no such community" and "not yours", and
+# telling them apart says which communities exist.
+_NOT_YOURS = "no such community, or not yours"
+
+
+def _refused(detail: str = _NOT_YOURS) -> HTTPException:
+    return HTTPException(status_code=HTTP_409_CONFLICT, detail=detail)
+
+
+# The table refuses all of these anyway. Checked here so the refusal is a 400 naming the
+# field rather than the 500 an IntegrityError becomes — the same reasoning as
+# create_auction's, and the same three columns' worth of constraints.
+MAX_LABEL = 60
+MAX_NAME = 100
+
+
+def _checked(data: IssueCodeRequest) -> datetime | None:
+    if data.max_uses < 1:
+        raise ClientException("max_uses must be at least 1")
+    if len(data.label) > MAX_LABEL:
+        raise ClientException(f"label must be at most {MAX_LABEL} characters")
+    if data.expires_at is None:
+        return None
+    # Through resolve_deadline like every other client datetime in the API, so a naive
+    # value is read as Asia/Jakarta wall time rather than as UTC — seven hours from what
+    # the owner meant, in the direction that expires the code early.
+    expires_at = resolve_deadline(data.expires_at)
+    if expires_at <= datetime.now(timezone.utc):
+        raise ClientException("expires_at must be in the future")
+    return expires_at
+
+
+@post("/communities", dependencies=_authed)
+async def create_community(
+    data: CreateCommunityRequest, current_user: User, db_session: AsyncSession
+) -> CommunityResponse:
+    """Start a community. The caller owns it, and ownership is the only thing that confers
+    moderator rights — there is no membership row for an owner to lose."""
+    if not data.name or len(data.name) > MAX_NAME:
+        raise ClientException(f"name must be between 1 and {MAX_NAME} characters")
+    community = Community(name=data.name, owner_id=current_user.id)
+    db_session.add(community)
+    await db_session.commit()
+    await db_session.refresh(community)
+    return CommunityResponse(
+        id=community.id,
+        name=community.name,
+        owner_id=community.owner_id,
+        membership_generation=community.membership_generation,
+    )
+
+
+@post("/communities/{community_id:int}/codes", dependencies=_authed)
+async def issue(
+    community_id: int,
+    data: IssueCodeRequest,
+    current_user: User,
+    db_session: AsyncSession,
+) -> CodeResponse:
+    """Mint the community's first code, and answer 409 if it already has a live one.
+
+    Deliberately not a silent rotation: an owner who has already shared a code and calls
+    this again by accident would otherwise invalidate the code everybody is holding.
+    Replacing one is the other endpoint, and saying so is the point.
+    """
+    owner_id = current_user.id
+    expires_at = _checked(data)
+    try:
+        shown = await issue_code(
+            db_session,
+            community_id,
+            owner_id=owner_id,
+            label=data.label,
+            max_uses=data.max_uses,
+            expires_at=expires_at,
+        )
+    except IntegrityError as exc:
+        await db_session.rollback()
+        if getattr(exc.orig.__cause__, "constraint_name", None) == _ONE_LIVE_CODE:
+            raise _refused("this community already has a live code; rotate it instead") from None
+        raise
+    if shown is None:
+        raise _refused()
+    return CodeResponse(code=shown)
+
+
+@post("/communities/{community_id:int}/codes/rotate", dependencies=_authed)
+async def rotate(
+    community_id: int,
+    data: IssueCodeRequest,
+    current_user: User,
+    db_session: AsyncSession,
+) -> CodeResponse:
+    """Replace the live code. The old one stops working the moment this answers."""
+    expires_at = _checked(data)
+    shown = await rotate_code(
+        db_session,
+        community_id,
+        owner_id=current_user.id,
+        label=data.label,
+        max_uses=data.max_uses,
+        expires_at=expires_at,
+    )
+    if shown is None:
+        raise _refused()
+    return CodeResponse(code=shown)
+
+
+@post("/communities/{community_id:int}/members/{user_id:int}/kick", dependencies=_authed)
+async def kick(
+    community_id: int, user_id: int, current_user: User, db_session: AsyncSession
+) -> None:
+    """Revoke one membership. The auctions already open stay open to them."""
+    if not await kick_member(db_session, community_id, user_id, owner_id=current_user.id):
+        raise _refused("no such membership, or not yours to revoke")
+
+
+@post("/communities/{community_id:int}/members/remove-all", dependencies=_authed)
+async def remove_all(
+    community_id: int, current_user: User, db_session: AsyncSession
+) -> GenerationResponse:
+    """End every membership at once. Refused while the community has an open auction.
+
+    Everyone has to redeem the new code again afterwards, and until M10 there is no
+    broadcast path — so the new code reaches them out of band.
+    """
+    generation = await remove_all_members(db_session, community_id, owner_id=current_user.id)
+    if generation is None:
+        raise _refused("not yours, or the community has an auction still open")
+    return GenerationResponse(membership_generation=generation)

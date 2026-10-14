@@ -15,10 +15,16 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
-from litestar.exceptions import NotFoundException, TooManyRequestsException
+from litestar.exceptions import (
+    ClientException,
+    HTTPException,
+    NotFoundException,
+    TooManyRequestsException,
+)
 from sqlalchemy import event, text
 
 from app import codes
+from app.clock import APP_TZ
 from app.codes import (
     CODE_LENGTH,
     CROCKFORD,
@@ -31,19 +37,26 @@ from app.codes import (
 )
 from app.communities import (
     _REFUSED,
+    MAX_LABEL,
+    MAX_NAME,
     MAX_REDEEM_FAILURES_PER_ACCOUNT,
     MAX_REDEEM_FAILURES_PER_IP,
     REDEEM_WINDOW,
+    create_community,
+    issue,
     issue_code,
+    kick,
     kick_member,
     prune_code_attempts,
     redeem,
     redeem_code,
     redeem_retry_after,
+    remove_all,
+    rotate,
     rotate_code,
 )
 from app.models import Community, User
-from app.schemas import RedeemRequest
+from app.schemas import CreateCommunityRequest, IssueCodeRequest, RedeemRequest
 
 
 async def _community(maker) -> tuple[int, int]:
@@ -969,6 +982,129 @@ async def test_failures_older_than_the_window_do_not_count(sm):
         assert await redeem_retry_after(s, caller, "10.0.0.1") is None
 
 
+async def test_issuing_a_second_code_is_a_409_and_not_a_500(sm):
+    """The partial unique index reached the owner as a 500 before this caught it, which is
+    the whole reason issue and rotate are separate routes: a silent replacement would
+    invalidate the code they had already shared, and an unexplained 500 is worse than
+    either."""
+    community_id, owner_id = await _community(sm)
+    async with sm() as s:
+        owner = await s.get(User, owner_id)
+        first = await issue.fn(
+            community_id=community_id,
+            data=IssueCodeRequest(),
+            current_user=owner,
+            db_session=s,
+        )
+    assert first.code.startswith("FMSC-")
+
+    async with sm() as s:
+        with pytest.raises(HTTPException) as refused:
+            await issue.fn(
+                community_id=community_id,
+                data=IssueCodeRequest(),
+                current_user=await s.get(User, owner_id),
+                db_session=s,
+            )
+    assert refused.value.status_code == 409
+    assert "rotate" in refused.value.detail
+
+
+async def test_the_owner_only_routes_all_answer_the_same_409(sm):
+    """ "No such community" and "not yours" are one answer, for the same reason the four
+    redemption failures are: a caller cannot act on the difference, and telling them apart
+    says which communities exist and who is in them.
+
+    A session each, because every one of these refusals rolls back and a rolled-back
+    session is no good for the next call.
+    """
+    community_id, _ = await _community(sm)
+    stranger = await _joiner(sm, "stranger@x.com")
+
+    async def issue_it(s, user):
+        return await issue.fn(
+            community_id=community_id,
+            data=IssueCodeRequest(),
+            current_user=user,
+            db_session=s,
+        )
+
+    async def rotate_it(s, user):
+        return await rotate.fn(
+            community_id=community_id,
+            data=IssueCodeRequest(),
+            current_user=user,
+            db_session=s,
+        )
+
+    async def kick_it(s, user):
+        return await kick.fn(
+            community_id=community_id, user_id=stranger, current_user=user, db_session=s
+        )
+
+    async def remove_it(s, user):
+        return await remove_all.fn(community_id=community_id, current_user=user, db_session=s)
+
+    for call in (issue_it, rotate_it, kick_it, remove_it):
+        async with sm() as s:
+            with pytest.raises(HTTPException) as refused:
+                await call(s, await s.get(User, stranger))
+        assert refused.value.status_code == 409, call.__name__
+
+
+async def test_the_owner_only_routes_work_for_the_owner(sm):
+    """The controls. Four handlers that raised on every call would pass the test above."""
+    community_id, owner_id = await _community(sm)
+    joiner = await _joiner(sm, "joiner@x.com")
+
+    async with sm() as s:
+        owner = await s.get(User, owner_id)
+        code = await rotate.fn(
+            community_id=community_id,
+            data=IssueCodeRequest(max_uses=5),
+            current_user=owner,
+            db_session=s,
+        )
+    async with sm() as s:
+        assert await redeem_code(s, code.code, joiner) is not None
+
+    async with sm() as s:
+        assert (
+            await kick.fn(
+                community_id=community_id,
+                user_id=joiner,
+                current_user=await s.get(User, owner_id),
+                db_session=s,
+            )
+            is None
+        )
+    async with sm() as s:
+        generation = await remove_all.fn(
+            community_id=community_id,
+            current_user=await s.get(User, owner_id),
+            db_session=s,
+        )
+    assert generation.membership_generation == 1
+
+
+async def test_creating_a_community_makes_the_caller_its_owner(sm):
+    """Ownership is the only thing that confers moderator rights, so the one place it is
+    set matters more than it looks: there is no membership row for an owner to lose, and
+    no second way to become one."""
+    owner_id = await _joiner(sm, "founder@x.com")
+    async with sm() as s:
+        created = await create_community.fn(
+            data=CreateCommunityRequest(name="the shed"),
+            current_user=await s.get(User, owner_id),
+            db_session=s,
+        )
+    assert created.owner_id == owner_id
+    assert created.name == "the shed"
+    # A community starts in the generation its first memberships will be granted in, or
+    # every one of them would be history the moment it was written.
+    assert created.membership_generation == 0
+
+
 def test_a_payload_that_begins_with_the_prefix_still_round_trips():
     """One code in about a million starts FMSC itself. Stripping the prefix on its first
     four characters alone breaks the no-prefix form for exactly those, which is also a
@@ -1106,3 +1242,134 @@ async def test_a_code_that_works_clears_the_accounts_failures(sm):
             )
             == 0
         )
+
+
+async def test_issuing_and_rotating_at_once_is_never_a_500(sm):
+    """Both take the community row now, so the two serialise instead of colliding.
+
+    Without the lock on the issue side a rotation cannot see its insert until it commits,
+    tombstones nothing, inserts its own, and trips the one-live-code index — which an owner
+    double-clicking reads as a 500. With it, whichever lands second sees the truth: if that
+    is the rotation it replaces what it found, and if it is the issue it answers 409,
+    because there really is a live code by then.
+
+    Asserted through the handlers, which is where the translation lives; the functions
+    underneath them raise, and raising is right.
+    """
+    community_id, owner_id = await _community(sm)
+
+    async def issue_one():
+        async with sm() as s:
+            try:
+                return await issue.fn(
+                    community_id=community_id,
+                    data=IssueCodeRequest(),
+                    current_user=await s.get(User, owner_id),
+                    db_session=s,
+                )
+            except HTTPException as refused:
+                assert refused.status_code == 409, refused.status_code
+                return None
+
+    async def rotate_one():
+        async with sm() as s:
+            return await rotate.fn(
+                community_id=community_id,
+                data=IssueCodeRequest(),
+                current_user=await s.get(User, owner_id),
+                db_session=s,
+            )
+
+    results = await asyncio.gather(issue_one(), rotate_one(), return_exceptions=True)
+    assert not any(isinstance(result, BaseException) for result in results), results
+    # The rotation always gets a code; the issue gets one or a 409, never a 500.
+    assert results[1] is not None
+    async with sm() as s:
+        assert (
+            await s.scalar(
+                text("SELECT count(*) FROM community_codes WHERE invalidated_at IS NULL")
+            )
+            == 1
+        )
+
+
+async def test_the_routes_refuse_what_the_table_would_refuse(sm):
+    """Each of these violates a constraint, and an IntegrityError reaching the client is a
+    500 with nothing in it they can act on. The same reasoning as create_auction's
+    reserve check, and the same three columns' worth of constraints."""
+    community_id, owner_id = await _community(sm)
+    async with sm() as s:
+        owner = await s.get(User, owner_id)
+        with pytest.raises(ClientException):
+            await create_community.fn(
+                data=CreateCommunityRequest(name="x" * (MAX_NAME + 1)),
+                current_user=owner,
+                db_session=s,
+            )
+    async with sm() as s:
+        with pytest.raises(ClientException):
+            await create_community.fn(
+                data=CreateCommunityRequest(name=""),
+                current_user=await s.get(User, owner_id),
+                db_session=s,
+            )
+
+    for bad in (
+        IssueCodeRequest(max_uses=0),
+        IssueCodeRequest(max_uses=-1),
+        IssueCodeRequest(label="x" * (MAX_LABEL + 1)),
+    ):
+        async with sm() as s:
+            with pytest.raises(ClientException):
+                await issue.fn(
+                    community_id=community_id,
+                    data=bad,
+                    current_user=await s.get(User, owner_id),
+                    db_session=s,
+                )
+        async with sm() as s:
+            with pytest.raises(ClientException):
+                await rotate.fn(
+                    community_id=community_id,
+                    data=bad,
+                    current_user=await s.get(User, owner_id),
+                    db_session=s,
+                )
+    async with sm() as s:
+        assert await s.scalar(text("SELECT count(*) FROM community_codes")) == 0
+
+
+async def test_a_deadline_on_a_code_is_read_as_jakarta_wall_time(sm):
+    """Every other client datetime in the API goes through resolve_deadline. Without it a
+    naive value is read as UTC — seven hours from what the owner meant, in the direction
+    that expires the code early."""
+    community_id, owner_id = await _community(sm)
+    naive = (datetime.now(APP_TZ) + timedelta(days=1)).replace(tzinfo=None)
+    async with sm() as s:
+        assert (
+            await issue.fn(
+                community_id=community_id,
+                data=IssueCodeRequest(expires_at=naive),
+                current_user=await s.get(User, owner_id),
+                db_session=s,
+            )
+        ).code.startswith("FMSC-")
+    async with sm() as s:
+        stored = await s.scalar(text("SELECT expires_at FROM community_codes"))
+    assert stored == naive.replace(tzinfo=APP_TZ)
+
+
+async def test_a_code_cannot_be_issued_already_expired(sm):
+    """It would mint something that can only ever answer 404, and the owner would have no
+    way to tell that from a code they had mistyped into their newsletter."""
+    community_id, owner_id = await _community(sm)
+    past = datetime.now(timezone.utc) - timedelta(minutes=1)
+    for handler in (issue, rotate):
+        async with sm() as s:
+            with pytest.raises(ClientException):
+                await handler.fn(
+                    community_id=community_id,
+                    data=IssueCodeRequest(expires_at=past),
+                    current_user=await s.get(User, owner_id),
+                    db_session=s,
+                )

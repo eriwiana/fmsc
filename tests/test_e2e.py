@@ -110,6 +110,37 @@ def _expire_tickets() -> None:
     asyncio.run(run())
 
 
+def _close_auction(auction_id: int) -> None:
+    """Close a lot without waiting for its deadline. The closer's own path is tested
+    elsewhere; here it is a precondition, not the subject."""
+
+    async def run():
+        engine = create_async_engine(PG_URL, poolclass=NullPool)
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE auctions SET status = 'closed' WHERE id = :id"), {"id": auction_id}
+            )
+        await engine.dispose()
+
+    asyncio.run(run())
+
+
+def _user_id(client: TestClient, token: str) -> int:
+    """The caller's own id, read from the database: nothing exposes it over HTTP yet, and
+    the kick route needs one."""
+
+    async def run():
+        engine = create_async_engine(PG_URL, poolclass=NullPool)
+        async with engine.begin() as conn:
+            found = await conn.execute(
+                text("SELECT user_id FROM sessions WHERE token = :t"), {"t": token}
+            )
+            return found.scalar()
+        await engine.dispose()
+
+    return asyncio.run(run())
+
+
 def _verify(email: str) -> None:
     """Mark an address as verified, the way an operator does today.
 
@@ -672,3 +703,215 @@ def test_the_dashboard_route_shows_only_the_callers_auctions(client, clean_db):
     assert not_ours not in [a["id"] for a in listed.json()]
 
     assert client.get("/auctions/mine").status_code == 401
+
+
+def test_a_community_gates_bidding_end_to_end(client, clean_db):
+    """M9 over HTTP, which is the only place the routes are exercised at all — every other
+    community test calls the functions directly and would not notice them unregistered.
+
+    One walk through the whole thing: create, issue, redeem, list into the community, a
+    stranger refused, a member accepted, remove-all refused while that lot is open, then
+    allowed once it is closed, and the member locked out of the next lot.
+    """
+    owner = _seller(client, "owner@x.com")
+    member = _signup(client, "member@x.com")
+    stranger = _signup(client, "stranger@x.com")
+    owner_headers = {"Authorization": f"Bearer {owner}"}
+
+    community = client.post("/communities", headers=owner_headers, json={"name": "the shed"})
+    assert community.status_code == 201, community.text
+    community_id = community.json()["id"]
+    assert community.json()["membership_generation"] == 0
+
+    issued = client.post(f"/communities/{community_id}/codes", headers=owner_headers, json={})
+    assert issued.status_code == 201, issued.text
+    code = issued.json()["code"]
+    assert code.startswith("FMSC-")
+    # A second issue is refused rather than silently replacing the code already shared.
+    assert (
+        client.post(
+            f"/communities/{community_id}/codes", headers=owner_headers, json={}
+        ).status_code
+        == 409
+    )
+
+    joined = client.post(
+        "/communities/codes/redeem",
+        headers={"Authorization": f"Bearer {member}"},
+        json={"code": code},
+    )
+    assert joined.status_code == 201, joined.text
+    assert joined.json() == {"community_id": community_id, "generation": 0}
+
+    auction = client.post(
+        "/auctions",
+        headers=owner_headers,
+        json={
+            "title": "t",
+            "starting_bid": "10.00",
+            "community_id": community_id,
+            "ends_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        },
+    )
+    assert auction.status_code == 201, auction.text
+    auction_id = auction.json()["id"]
+
+    # Viewing is public; bidding is not.
+    assert client.get(f"/auctions/{auction_id}").status_code == 200
+    refused = client.post(
+        f"/auctions/{auction_id}/bids",
+        headers={"Authorization": f"Bearer {stranger}"},
+        json={"amount": "10.00"},
+    )
+    assert refused.status_code == 400
+    assert (
+        client.post(
+            f"/auctions/{auction_id}/bids",
+            headers={"Authorization": f"Bearer {member}"},
+            json={"amount": "10.00"},
+        ).status_code
+        == 201
+    )
+
+    # Remove-all is refused while that lot is running, allowed once it is not.
+    assert (
+        client.post(
+            f"/communities/{community_id}/members/remove-all", headers=owner_headers
+        ).status_code
+        == 409
+    )
+    _close_auction(auction_id)
+    removed = client.post(f"/communities/{community_id}/members/remove-all", headers=owner_headers)
+    assert removed.status_code == 201, removed.text
+    assert removed.json() == {"membership_generation": 1}
+
+    # The old membership is history, so the next lot is closed to them until they redeem
+    # the new code — which nothing broadcasts yet, by decision.
+    next_auction = client.post(
+        "/auctions",
+        headers=owner_headers,
+        json={
+            "title": "t2",
+            "starting_bid": "10.00",
+            "community_id": community_id,
+            "ends_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        },
+    ).json()["id"]
+    assert (
+        client.post(
+            f"/auctions/{next_auction}/bids",
+            headers={"Authorization": f"Bearer {member}"},
+            json={"amount": "10.00"},
+        ).status_code
+        == 400
+    )
+    # And the rotated code lets them back in.
+    rotated = client.post(
+        f"/communities/{community_id}/codes/rotate", headers=owner_headers, json={}
+    )
+    assert rotated.status_code == 201, rotated.text
+    assert (
+        client.post(
+            "/communities/codes/redeem",
+            headers={"Authorization": f"Bearer {member}"},
+            json={"code": rotated.json()["code"]},
+        ).json()["generation"]
+        == 1
+    )
+    assert (
+        client.post(
+            f"/auctions/{next_auction}/bids",
+            headers={"Authorization": f"Bearer {member}"},
+            json={"amount": "10.00"},
+        ).status_code
+        == 201
+    )
+
+
+def test_a_kick_over_http_spares_the_auction_already_open(client, clean_db):
+    """Criterion 4 through the route. The kicked member keeps bidding on the lot that was
+    running when they were kicked, and is shut out of the next one."""
+    owner = _seller(client, "owner@x.com")
+    member = _signup(client, "member@x.com")
+    owner_headers = {"Authorization": f"Bearer {owner}"}
+    member_headers = {"Authorization": f"Bearer {member}"}
+
+    community_id = client.post("/communities", headers=owner_headers, json={"name": "c"}).json()[
+        "id"
+    ]
+    code = client.post(f"/communities/{community_id}/codes", headers=owner_headers, json={}).json()[
+        "code"
+    ]
+    member_id = client.post(
+        "/communities/codes/redeem", headers=member_headers, json={"code": code}
+    ).status_code
+    assert member_id == 201
+
+    def open_auction(title: str) -> int:
+        return client.post(
+            "/auctions",
+            headers=owner_headers,
+            json={
+                "title": title,
+                "starting_bid": "10.00",
+                "community_id": community_id,
+                "ends_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+            },
+        ).json()["id"]
+
+    running = open_auction("running")
+    kicked = client.post(
+        f"/communities/{community_id}/members/{_user_id(client, member)}/kick",
+        headers=owner_headers,
+    )
+    assert kicked.status_code == 201, kicked.text
+
+    assert (
+        client.post(
+            f"/auctions/{running}/bids", headers=member_headers, json={"amount": "10.00"}
+        ).status_code
+        == 201
+    )
+    assert (
+        client.post(
+            f"/auctions/{open_auction('next')}/bids",
+            headers=member_headers,
+            json={"amount": "10.00"},
+        ).status_code
+        == 400
+    )
+
+
+def test_a_kick_that_changes_nothing_says_so(client, clean_db):
+    """A refused kick has to answer 409, not 201. Without that an owner cannot tell a
+    kick that landed from one that found nobody — and a stranger calling the route would
+    get a success for doing nothing.
+
+    One answer for both, for the same reason as everywhere else here: "not a member" and
+    "not your community" together would tell a caller who is in a community they are not
+    in.
+    """
+    owner = _seller(client, "owner@x.com")
+    stranger = _signup(client, "stranger@x.com")
+    owner_headers = {"Authorization": f"Bearer {owner}"}
+
+    community_id = client.post("/communities", headers=owner_headers, json={"name": "c"}).json()[
+        "id"
+    ]
+    stranger_id = _user_id(client, stranger)
+
+    # Nobody has joined, so there is nothing to revoke.
+    assert (
+        client.post(
+            f"/communities/{community_id}/members/{stranger_id}/kick", headers=owner_headers
+        ).status_code
+        == 409
+    )
+    # And somebody else's community is not theirs to moderate.
+    assert (
+        client.post(
+            f"/communities/{community_id}/members/{stranger_id}/kick",
+            headers={"Authorization": f"Bearer {stranger}"},
+        ).status_code
+        == 409
+    )
