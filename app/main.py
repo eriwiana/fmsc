@@ -126,6 +126,7 @@ app = Litestar(
         auth.logout_all,
         auth.issue_ws_ticket,
         auctions.create_auction,
+        auctions.edit_auction,
         auctions.publish_auction,
         auctions.cancel_auction,
         auctions.list_auctions,

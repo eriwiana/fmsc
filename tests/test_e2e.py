@@ -467,6 +467,64 @@ def test_too_many_failed_logins_answer_429_with_retry_after(client, clean_db):
     assert 0 < int(limited.headers["Retry-After"]) <= LOGIN_WINDOW.total_seconds()
 
 
+def test_the_lifecycle_routes_move_an_auction_and_then_refuse_to(client, clean_db):
+    """Routing for criteria 1 and 2. Every other lifecycle test calls the functions
+    directly, so without this the endpoints could be unregistered, or registered on the
+    wrong verb, and the suite would not notice."""
+    seller = _seller(client, "seller@x.com")
+    bidder = _signup(client, "bidder@x.com")
+    headers = {"Authorization": f"Bearer {seller}"}
+    draft = client.post(
+        "/auctions",
+        headers=headers,
+        json={
+            "title": "t",
+            "starting_bid": "10.00",
+            "status": "draft",
+            "ends_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        },
+    )
+    assert draft.status_code == 201, draft.text
+    auction_id = draft.json()["id"]
+
+    # A draft takes no bids and is not public.
+    assert client.get(f"/auctions/{auction_id}").status_code == 404
+    bid = client.post(
+        f"/auctions/{auction_id}/bids",
+        headers={"Authorization": f"Bearer {bidder}"},
+        json={"amount": "10.00"},
+    )
+    assert bid.status_code == 400
+
+    assert (
+        client.patch(f"/auctions/{auction_id}", headers=headers, json={"title": "fixed"}).json()[
+            "title"
+        ]
+        == "fixed"
+    )
+    assert client.post(f"/auctions/{auction_id}/publish", headers=headers).status_code == 201
+    assert client.get(f"/auctions/{auction_id}").status_code == 200
+    # The edge is spent: a published auction cannot be published again.
+    assert client.post(f"/auctions/{auction_id}/publish", headers=headers).status_code == 409
+
+    assert (
+        client.post(
+            f"/auctions/{auction_id}/bids",
+            headers={"Authorization": f"Bearer {bidder}"},
+            json={"amount": "10.00"},
+        ).status_code
+        == 201
+    )
+    # And now neither cancel nor edit is the seller's alone to make.
+    assert client.post(f"/auctions/{auction_id}/cancel", headers=headers).status_code == 409
+    assert (
+        client.patch(
+            f"/auctions/{auction_id}", headers=headers, json={"title": "too late"}
+        ).status_code
+        == 409
+    )
+
+
 def _draft(client: TestClient, seller_token: str) -> int:
     response = client.post(
         "/auctions",

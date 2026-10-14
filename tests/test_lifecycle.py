@@ -7,9 +7,9 @@ Criteria 1 and 2:
    draft->open, draft->cancelled, open->closed and open->cancelled. Refusal means the
    statement matched no row, not that a Python branch raised: `update`, a data migration
    and psql all bypass a Python branch, and the test drives the statement directly.
-2. Cancel is refused once a bid exists. A cancelled auction with bids on it is a seller
-   walking away from money other people committed. The edit half of criterion 2 lands
-   with the edit endpoint.
+2. Cancel is refused once a bid exists, and edit is refused after the first bid. A
+   cancelled auction with bids on it is a seller walking away from money other people
+   committed, and an edited one is a bait-and-switch: bidders bid on the description.
 """
 
 from __future__ import annotations
@@ -27,13 +27,14 @@ from app.auctions import (
     STATUSES,
     cancel_auction,
     create_auction,
+    edit_auction,
     get_auction,
     list_auctions,
     publish_auction,
     transition,
 )
 from app.models import User
-from app.schemas import CreateAuctionRequest
+from app.schemas import CreateAuctionRequest, EditAuctionRequest
 
 
 async def _seller(maker, email: str = "seller@x.com") -> User:
@@ -165,6 +166,132 @@ async def test_cancel_is_allowed_while_no_bid_exists(sm):
     assert await _status(sm, auction_id) == "cancelled"
 
 
+async def test_edit_is_refused_after_the_first_bid(sm):
+    """Criterion 2, the other half. Bidders bid on the description; changing it under
+    them is a bait-and-switch, and changing starting_bid after a bid would let a seller
+    invalidate the bid that had already been accepted."""
+    seller = await _seller(sm)
+    auction_id = await _auction(sm, seller.id, "open", bid_count=1)
+    async with sm() as s:
+        with pytest.raises(HTTPException) as refused:
+            await edit_auction.fn(
+                auction_id=auction_id,
+                data=EditAuctionRequest(title="something else"),
+                current_user=seller,
+                db_session=s,
+            )
+    assert refused.value.status_code == 409
+    async with sm() as s:
+        assert (
+            await s.scalar(text("SELECT title FROM auctions WHERE id = :id"), {"id": auction_id})
+            == "t"
+        )
+
+
+async def test_edit_is_allowed_while_no_bid_exists(sm):
+    """The control, and the reason edit exists: a seller fixing a typo before anyone has
+    committed anything is not changing the deal."""
+    seller = await _seller(sm)
+    auction_id = await _auction(sm, seller.id, "open")
+    async with sm() as s:
+        edited = await edit_auction.fn(
+            auction_id=auction_id,
+            data=EditAuctionRequest(title="a better title", starting_bid=Decimal("25.00")),
+            current_user=seller,
+            db_session=s,
+        )
+    assert edited.title == "a better title"
+    assert edited.starting_bid == Decimal("25.00")
+
+
+async def test_a_closed_auction_cannot_be_edited(sm):
+    """No bids and still refused: a closed auction has a result, and rewriting the
+    description of a lot that already sold rewrites what the winner agreed to."""
+    seller = await _seller(sm)
+    auction_id = await _auction(sm, seller.id, "closed")
+    async with sm() as s:
+        with pytest.raises(HTTPException):
+            await edit_auction.fn(
+                auction_id=auction_id,
+                data=EditAuctionRequest(title="after the fact"),
+                current_user=seller,
+                db_session=s,
+            )
+
+
+async def test_only_the_seller_may_edit_their_own_auction(sm):
+    """Ownership is in the same WHERE as the bid count, for the same reason as the
+    transition: a separate check leaves a window."""
+    seller = await _seller(sm)
+    stranger = await _seller(sm, "stranger@x.com")
+    auction_id = await _auction(sm, seller.id, "open")
+    async with sm() as s:
+        with pytest.raises(HTTPException):
+            await edit_auction.fn(
+                auction_id=auction_id,
+                data=EditAuctionRequest(title="mine now"),
+                current_user=stranger,
+                db_session=s,
+            )
+
+
+async def test_an_edit_that_moves_the_deadline_moves_the_ceiling_with_it(sm):
+    """hard_ends_at >= ends_at is a check constraint, so an edit that pushed the deadline
+    past the old ceiling would be refused by the table as a 500. An edit that leaves the
+    deadline alone must leave the ceiling alone too, or every title fix quietly buys the
+    auction another two hours of extensions."""
+    seller = await _seller(sm)
+    auction_id = await _auction(sm, seller.id, "open")
+    async with sm() as s:
+        before = (
+            await s.execute(
+                text("SELECT ends_at, hard_ends_at FROM auctions WHERE id = :id"),
+                {"id": auction_id},
+            )
+        ).one()
+
+    async with sm() as s:
+        await edit_auction.fn(
+            auction_id=auction_id,
+            data=EditAuctionRequest(title="just the title"),
+            current_user=seller,
+            db_session=s,
+        )
+    async with sm() as s:
+        untouched = (
+            await s.execute(
+                text("SELECT ends_at, hard_ends_at FROM auctions WHERE id = :id"),
+                {"id": auction_id},
+            )
+        ).one()
+    assert untouched == before
+
+    later = datetime.now(timezone.utc) + timedelta(hours=5)
+    async with sm() as s:
+        moved = await edit_auction.fn(
+            auction_id=auction_id,
+            data=EditAuctionRequest(ends_at=later),
+            current_user=seller,
+            db_session=s,
+        )
+    assert moved.hard_ends_at > moved.ends_at
+
+
+async def test_an_edit_cannot_put_the_deadline_in_the_past(sm):
+    """The same rule create_auction applies. Without it a seller could close an auction
+    early by editing it, which is a cancel that dodges the no-bids rule."""
+    seller = await _seller(sm)
+    auction_id = await _auction(sm, seller.id, "open")
+    async with sm() as s:
+        with pytest.raises(ClientException):
+            await edit_auction.fn(
+                auction_id=auction_id,
+                data=EditAuctionRequest(ends_at=datetime.now(timezone.utc) - timedelta(hours=1)),
+                current_user=seller,
+                db_session=s,
+            )
+
+
 async def test_a_draft_is_absent_from_the_public_list_and_by_id(sm):
     """A draft is the state before anybody has seen the listing, so a public endpoint
     showing one makes the draft pointless. 404 and not 403 by id: that route takes no
@@ -208,6 +335,22 @@ async def test_an_auction_cannot_be_created_into_a_state_an_edge_leads_to(sm):
                     data=CreateAuctionRequest(
                         title="t", starting_bid=Decimal("10.00"), ends_at=ends_at, status=bad
                     ),
+                    current_user=seller,
+                    db_session=s,
+                )
+
+
+async def test_an_edit_cannot_make_the_starting_bid_zero_or_negative(sm):
+    """The same rule create_auction applies, and the table's own constraint behind it:
+    without the check here a 0 would arrive as the 500 an IntegrityError becomes."""
+    seller = await _seller(sm)
+    auction_id = await _auction(sm, seller.id, "open")
+    for bad in (Decimal("0"), Decimal("-1.00")):
+        async with sm() as s:
+            with pytest.raises(ClientException):
+                await edit_auction.fn(
+                    auction_id=auction_id,
+                    data=EditAuctionRequest(starting_bid=bad),
                     current_user=seller,
                     db_session=s,
                 )

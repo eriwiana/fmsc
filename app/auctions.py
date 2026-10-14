@@ -8,7 +8,7 @@ from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 import msgspec
-from litestar import Request, WebSocket, get, post, websocket
+from litestar import Request, WebSocket, get, patch, post, websocket
 from litestar.channels import ChannelsPlugin
 from litestar.di import Provide
 from litestar.exceptions import (
@@ -31,7 +31,12 @@ from app.auth import (
     user_for_ticket,
 )
 from app.models import Auction, Bid, Outbox, User
-from app.schemas import AuctionResponse, BidRequest, CreateAuctionRequest
+from app.schemas import (
+    AuctionResponse,
+    BidRequest,
+    CreateAuctionRequest,
+    EditAuctionRequest,
+)
 
 _authed = {"current_user": Provide(provide_current_user)}
 
@@ -248,6 +253,75 @@ async def get_auction(auction_id: int, db_session: AsyncSession) -> AuctionRespo
     if auction is None or auction.status == "draft":
         raise NotFoundException("auction not found")
     return _to_response(auction)
+
+
+# Criterion 2's other half. Same shape as the transition: the guards are in the WHERE, so
+# a bid landing between a check and the write cannot be edited out from under.
+#
+# bid_count = 0 is the rule. Bidders bid on the description, so changing it afterwards is a
+# bait-and-switch, and raising starting_bid after a bid would retroactively invalidate a bid
+# that had already been accepted.
+#
+# NULL means unchanged, so COALESCE does the whole patch in one statement. hard_ends_at
+# rides on :ends_at rather than on the stored column: NULL + interval is NULL, so the
+# COALESCE falls through to the existing ceiling and an edit that leaves the deadline alone
+# does not move it either.
+#
+# status IN ('draft', 'open') and not just a bid count: a closed auction has a result and a
+# cancelled one is withdrawn, and editing the description of either rewrites history.
+_EDIT_SQL = text("""
+    UPDATE auctions
+       SET title = COALESCE(:title, title),
+           starting_bid = COALESCE(:starting_bid, starting_bid),
+           ends_at = COALESCE(:ends_at, ends_at),
+           hard_ends_at = COALESCE(:ends_at + :extension, hard_ends_at)
+     WHERE id = :id
+       AND seller_id = :seller_id
+       AND bid_count = 0
+       AND status IN ('draft', 'open')
+    RETURNING *
+    """)
+
+
+@patch("/auctions/{auction_id:int}", dependencies=_authed)
+async def edit_auction(
+    auction_id: int,
+    data: EditAuctionRequest,
+    current_user: User,
+    db_session: AsyncSession,
+) -> AuctionResponse:
+    """Fix a listing nobody has bid on yet. 409 once a bid exists.
+
+    The validation repeats create_auction's rather than sharing it: there are two call
+    sites and the checks are three lines, so a helper would be an indirection per field
+    for no fewer rules.
+    """
+    ends_at = resolve_deadline(data.ends_at) if data.ends_at is not None else None
+    if ends_at is not None and ends_at <= datetime.now(timezone.utc):
+        raise ClientException("ends_at must be in the future")
+    if data.starting_bid is not None and data.starting_bid <= 0:
+        raise ClientException("starting_bid must be positive")
+    row = (
+        await db_session.execute(
+            _EDIT_SQL,
+            {
+                "id": auction_id,
+                "seller_id": current_user.id,
+                "title": data.title,
+                "starting_bid": data.starting_bid,
+                "ends_at": ends_at,
+                "extension": MAX_EXTENSION,
+            },
+        )
+    ).first()
+    await db_session.commit()
+    if row is None:
+        raise HTTPException(
+            status_code=HTTP_409_CONFLICT,
+            detail="an auction can only be edited by its seller, before its first bid,"
+            " and only while it is a draft or open",
+        )
+    return _to_response(row)
 
 
 async def _announce(db_session: AsyncSession, channels: ChannelsPlugin, row: Row) -> None:

@@ -28,6 +28,15 @@ class CreateAuctionRequest(msgspec.Struct):
     status: str = "open"  # "draft" to keep it unannounced; nothing else is accepted
 
 
+class EditAuctionRequest(msgspec.Struct):
+    """Every field optional. None means "leave it alone", not "clear it", which is why
+    there is nothing nullable on an auction worth clearing from here."""
+
+    title: str | None = None
+    starting_bid: Decimal | None = None
+    ends_at: datetime | None = None
+
+
 class BidRequest(msgspec.Struct):
     amount: Decimal
 
