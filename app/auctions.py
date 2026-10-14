@@ -30,6 +30,7 @@ from app.auth import (
     purge_expired_tickets,
     user_for_ticket,
 )
+from app.communities import prune_code_attempts
 from app.models import Auction, Bid, Outbox, User
 from app.schemas import (
     AuctionResponse,
@@ -1002,6 +1003,7 @@ async def run_closer(
                 await purge_expired_tickets(session)
                 await purge_expired_sessions(session)
                 await prune_login_attempts(session)
+                await prune_code_attempts(session)
                 await prune_outbox(session)
         except Exception:
             # Blind on purpose: a transient database error must not kill the loop. BLE001

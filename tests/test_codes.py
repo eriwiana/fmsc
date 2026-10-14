@@ -12,9 +12,11 @@ import importlib
 import os
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import text
+from litestar.exceptions import NotFoundException, TooManyRequestsException
+from sqlalchemy import event, text
 
 from app import codes
 from app.codes import (
@@ -27,8 +29,21 @@ from app.codes import (
     new_code,
     normalise,
 )
-from app.communities import issue_code, kick_member, redeem_code, rotate_code
+from app.communities import (
+    _REFUSED,
+    MAX_REDEEM_FAILURES_PER_ACCOUNT,
+    MAX_REDEEM_FAILURES_PER_IP,
+    REDEEM_WINDOW,
+    issue_code,
+    kick_member,
+    prune_code_attempts,
+    redeem,
+    redeem_code,
+    redeem_retry_after,
+    rotate_code,
+)
 from app.models import Community, User
+from app.schemas import RedeemRequest
 
 
 async def _community(maker) -> tuple[int, int]:
@@ -633,6 +648,327 @@ async def test_two_rotations_at_once_both_succeed_and_leave_one_code(sm):
     assert redeemable == 1
 
 
+async def _community_named(maker, email: str) -> tuple[int, int]:
+    async with maker() as s:
+        owner = User(email=email, pw_hash="x", verified_at=datetime.now(timezone.utc))
+        s.add(owner)
+        await s.flush()
+        community = Community(name="c", owner_id=owner.id)
+        s.add(community)
+        await s.commit()
+        return community.id, owner.id
+
+
+async def _four_failures(sm) -> list[str]:
+    """One code in each of the four states criterion 5 names: never issued, rotated away,
+    past its deadline, out of uses.
+
+    Four communities, because only one code per community may be live at a time and two
+    of these four have to be the live one. The answer is about the code, not the
+    community, so spreading them out changes nothing about what is being tested.
+    """
+    never_issued = formatted(new_code()[1])
+
+    rotated_community, rotated_owner = await _community_named(sm, "rotated@x.com")
+    async with sm() as s:
+        rotated = await issue_code(s, rotated_community, owner_id=rotated_owner)
+    async with sm() as s:
+        await rotate_code(s, rotated_community, owner_id=rotated_owner)
+
+    expired_community, expired_owner = await _community_named(sm, "expired@x.com")
+    async with sm() as s:
+        expired = await issue_code(s, expired_community, owner_id=expired_owner)
+    async with sm() as s:
+        await s.execute(
+            text(
+                "UPDATE community_codes"
+                " SET expires_at = clock_timestamp() - interval '1 second'"
+                " WHERE community_id = :c"
+            ),
+            {"c": expired_community},
+        )
+        await s.commit()
+
+    spent_community, spent_owner = await _community_named(sm, "spent@x.com")
+    spender = await _joiner(sm, "spender@x.com")
+    async with sm() as s:
+        exhausted = await issue_code(s, spent_community, owner_id=spent_owner)
+    async with sm() as s:
+        assert await redeem_code(s, exhausted, spender) is not None
+
+    return [never_issued, rotated, expired, exhausted]
+
+
+async def test_the_four_failures_are_one_answer(sm):
+    """Criterion 5, the body half. A client that can tell a code that never existed from
+    one that was rotated away can walk the space looking for the difference, which is the
+    whole of OWASP's OAT-002."""
+    codes_to_try = await _four_failures(sm)
+    caller = await _joiner(sm, "caller@x.com")
+
+    answers = []
+    for code in codes_to_try:
+        async with sm() as s:
+            with pytest.raises(NotFoundException) as refused:
+                await redeem.fn(
+                    data=RedeemRequest(code=code),
+                    request=SimpleNamespace(headers={}, client=None),
+                    current_user=await s.get(User, caller),
+                    db_session=s,
+                )
+        answers.append((refused.value.status_code, refused.value.detail))
+
+    assert answers == [(404, _REFUSED)] * 4
+    # And the sentence says nothing about which of the four it was.
+    for word in ("expired", "revoked", "rotated", "exhausted", "used", "found"):
+        assert word not in _REFUSED
+
+
+async def test_the_four_failures_cost_the_same_work(sm):
+    """Criterion 5, the timing half, asserted as equal work rather than equal wall clock.
+
+    A wall-clock assertion wide enough not to flake on a shared runner is wider than the
+    leak it looks for. The leak that matters is an extra query — a path that looks the code
+    up again, or skips a lookup it could have done — and that is what counting statements
+    sees. It is the same technique the bid path uses to pin its single UPDATE.
+    """
+    codes_to_try = await _four_failures(sm)
+    caller = await _joiner(sm, "caller@x.com")
+
+    counts = []
+    for code in codes_to_try:
+        statements: list[str] = []
+        engine = sm.kw["bind"].sync_engine
+
+        def record(conn, cursor, statement, parameters, context, executemany, seen=statements):
+            seen.append(statement)
+
+        event.listen(engine, "before_cursor_execute", record)
+
+        try:
+            async with sm() as s:
+                assert await redeem_code(s, code, caller) is None
+        finally:
+            event.remove(engine, "before_cursor_execute", record)
+        counts.append(len(statements))
+
+    assert len(set(counts)) == 1, f"the four failure paths issued {counts} statements"
+
+
+async def test_the_audit_log_is_where_the_four_differ(sm):
+    """Criterion 5's other half: indistinguishable to the caller, distinguished for the
+    operator. A log that recorded one word for all four would make the endpoint
+    unanswerable the first time somebody asks why a member cannot get in."""
+    codes_to_try = await _four_failures(sm)
+    caller = await _joiner(sm, "caller@x.com")
+
+    for code in codes_to_try:
+        async with sm() as s:
+            assert await redeem_code(s, code, caller, ip="203.0.113.5") is None
+
+    async with sm() as s:
+        rows = (
+            await s.execute(
+                text(
+                    "SELECT outcome, code_id IS NOT NULL AS has_code, ip FROM code_audit"
+                    " WHERE user_id = :u ORDER BY id"
+                ),
+                {"u": caller},
+            )
+        ).all()
+    assert [row.outcome for row in rows] == ["not_found", "revoked", "expired", "exhausted"]
+    # not_found is the one case with no row to point at; the rest name the code.
+    assert [row.has_code for row in rows] == [False, True, True, True]
+    assert {row.ip for row in rows} == {"203.0.113.5"}
+
+
+async def test_the_audit_log_records_a_success_and_a_repeat(sm):
+    """The two outcomes that are not failures. A log that only recorded refusals could not
+    answer which code let somebody in, which is the first question after a leak."""
+    community_id, owner_id = await _community(sm)
+    joiner = await _joiner(sm, "joiner@x.com")
+    async with sm() as s:
+        shown = await issue_code(s, community_id, owner_id=owner_id, max_uses=5)
+
+    async with sm() as s:
+        assert await redeem_code(s, shown, joiner) is not None
+    async with sm() as s:
+        assert await redeem_code(s, shown, joiner) is None
+
+    async with sm() as s:
+        rows = (
+            await s.execute(text("SELECT outcome, community_id FROM code_audit ORDER BY id"))
+        ).all()
+    assert [row.outcome for row in rows] == ["redeemed", "already_member"]
+    assert {row.community_id for row in rows} == {community_id}
+
+
+async def test_the_audit_log_never_holds_the_code(sm):
+    """It holds code_id. A log that wrote the code would be a second copy of a bearer
+    credential, in the one table nobody thinks to protect."""
+    community_id, owner_id = await _community(sm)
+    joiner = await _joiner(sm, "joiner@x.com")
+    async with sm() as s:
+        shown = await issue_code(s, community_id, owner_id=owner_id)
+    async with sm() as s:
+        await redeem_code(s, shown, joiner)
+
+    body = normalise(shown)
+    async with sm() as s:
+        rows = (await s.execute(text("SELECT * FROM code_audit"))).all()
+    stored = " ".join(str(value) for row in rows for value in row)
+    for fragment in (body, shown, shown.replace("-", ""), lookup(body)):
+        assert fragment not in stored
+
+
+def _request(ip: str = "10.0.0.1") -> SimpleNamespace:
+    return SimpleNamespace(headers={"X-Forwarded-For": ip}, client=None)
+
+
+async def _try_code(sm, user_id: int, code: str, ip: str = "10.0.0.1"):
+    async with sm() as s:
+        return await redeem.fn(
+            data=RedeemRequest(code=code),
+            request=_request(ip),
+            current_user=await s.get(User, user_id),
+            db_session=s,
+        )
+
+
+async def _fail_code(sm, user_id: int, ip: str = "10.0.0.1") -> None:
+    with pytest.raises(NotFoundException):
+        await _try_code(sm, user_id, formatted(new_code()[1]), ip)
+
+
+async def test_an_account_guessing_codes_is_slowed_down(sm):
+    """Not in a criterion; in CONTEXT, and the reason is enumeration rather than the code
+    falling. 65 bits does not fall to guessing — the limit is about the cost and the noise
+    of somebody trying, which is OWASP's OAT-002."""
+    caller = await _joiner(sm, "caller@x.com")
+    for n in range(MAX_REDEEM_FAILURES_PER_ACCOUNT):
+        await _fail_code(sm, caller, ip=f"10.0.0.{n + 1}")
+
+    # From a sixth address, and with a code that would have worked: the account is locked,
+    # not the address.
+    community_id, owner_id = await _community(sm)
+    async with sm() as s:
+        good = await issue_code(s, community_id, owner_id=owner_id)
+    with pytest.raises(TooManyRequestsException) as limited:
+        await _try_code(sm, caller, good, ip="10.0.0.99")
+    assert 0 < int(limited.value.headers["Retry-After"]) <= REDEEM_WINDOW.total_seconds()
+
+
+async def test_an_address_guessing_codes_is_slowed_down(sm):
+    """The other bucket. Twenty failures spread across twenty accounts still lock the
+    address, or a botnet with a user list never trips a limit."""
+    for n in range(MAX_REDEEM_FAILURES_PER_IP):
+        user = await _joiner(sm, f"spread{n}@x.com")
+        await _fail_code(sm, user, ip="203.0.113.7")
+
+    innocent = await _joiner(sm, "innocent@x.com")
+    with pytest.raises(TooManyRequestsException):
+        await _try_code(sm, innocent, formatted(new_code()[1]), ip="203.0.113.7")
+
+
+async def test_the_code_limit_is_not_the_login_limit(sm):
+    """The reason this is its own table. Guessing codes at somebody must not lock them out
+    of signing in, and a login they fumbled must not stop them joining."""
+    from app.auth import login_retry_after
+
+    caller = await _joiner(sm, "caller@x.com")
+    for n in range(MAX_REDEEM_FAILURES_PER_ACCOUNT):
+        await _fail_code(sm, caller, ip=f"10.0.0.{n + 1}")
+
+    async with sm() as s:
+        assert await redeem_retry_after(s, caller, "10.0.0.99") is not None
+        # The login limiter has seen nothing at all.
+        assert await login_retry_after(s, "caller@x.com", "10.0.0.1") is None
+        assert await s.scalar(text("SELECT count(*) FROM login_attempts")) == 0
+
+
+async def test_one_locked_account_does_not_lock_another(sm):
+    """A limiter that locked everyone out when one account was attacked is a denial of
+    service with extra steps."""
+    attacked = await _joiner(sm, "attacked@x.com")
+    bystander = await _joiner(sm, "bystander@x.com")
+    for n in range(MAX_REDEEM_FAILURES_PER_ACCOUNT):
+        await _fail_code(sm, attacked, ip=f"198.51.100.{n + 1}")
+
+    community_id, owner_id = await _community(sm)
+    async with sm() as s:
+        good = await issue_code(s, community_id, owner_id=owner_id)
+    assert (await _try_code(sm, bystander, good, ip="198.51.100.200")).community_id == (
+        community_id
+    )
+
+
+async def test_a_refused_request_is_not_itself_counted(sm):
+    """Or hammering a lockout would extend it, and the limit would never let go."""
+    caller = await _joiner(sm, "caller@x.com")
+    for _ in range(MAX_REDEEM_FAILURES_PER_ACCOUNT):
+        await _fail_code(sm, caller)
+    async with sm() as s:
+        before = await s.scalar(text("SELECT count(*) FROM code_attempts"))
+
+    with pytest.raises(TooManyRequestsException):
+        await _try_code(sm, caller, formatted(new_code()[1]))
+    async with sm() as s:
+        assert await s.scalar(text("SELECT count(*) FROM code_attempts")) == before
+
+
+async def test_a_successful_redemption_is_not_counted_as_a_failure(sm):
+    """The control. A limiter that counted everything would lock out a community's fifth
+    member on the day it opened."""
+    community_id, owner_id = await _community(sm)
+    async with sm() as s:
+        good = await issue_code(s, community_id, owner_id=owner_id, max_uses=10)
+    for n in range(6):
+        joiner = await _joiner(sm, f"j{n}@x.com")
+        assert (await _try_code(sm, joiner, good)).community_id == community_id
+    async with sm() as s:
+        assert await s.scalar(text("SELECT count(*) FROM code_attempts")) == 0
+
+
+async def test_attempts_outside_the_window_are_pruned(sm):
+    """Nothing else deletes them and the window query never reads them again. Same sweeper
+    slot in the closer's tick as the login attempts."""
+    caller = await _joiner(sm, "caller@x.com")
+    await _fail_code(sm, caller)
+    async with sm() as s:
+        await s.execute(
+            text(
+                "UPDATE code_attempts SET failed_at ="
+                " failed_at - CAST(:w AS interval) - interval '1 second'"
+            ),
+            {"w": REDEEM_WINDOW},
+        )
+        await s.commit()
+    await _fail_code(sm, caller)
+
+    async with sm() as s:
+        assert await prune_code_attempts(s) == 1
+    async with sm() as s:
+        assert await s.scalar(text("SELECT count(*) FROM code_attempts")) == 1
+
+
+async def test_failures_older_than_the_window_do_not_count(sm):
+    """The limit is a rate, not a lifetime total."""
+    caller = await _joiner(sm, "caller@x.com")
+    for _ in range(MAX_REDEEM_FAILURES_PER_ACCOUNT):
+        await _fail_code(sm, caller)
+    async with sm() as s:
+        await s.execute(
+            text(
+                "UPDATE code_attempts SET failed_at ="
+                " failed_at - CAST(:w AS interval) - interval '1 second'"
+            ),
+            {"w": REDEEM_WINDOW},
+        )
+        await s.commit()
+    async with sm() as s:
+        assert await redeem_retry_after(s, caller, "10.0.0.1") is None
+
+
 def test_a_payload_that_begins_with_the_prefix_still_round_trips():
     """One code in about a million starts FMSC itself. Stripping the prefix on its first
     four characters alone breaks the no-prefix form for exactly those, which is also a
@@ -713,4 +1049,60 @@ async def test_a_live_membership_still_blocks_a_second_one(sm):
                 {"u": member},
             )
             == 1
+        )
+
+
+async def test_a_mistyped_code_is_not_written_down_and_costs_nothing(sm):
+    """The check symbol caught it, so it is a typo rather than an attempt at anything.
+
+    Auditing it fills the log with somebody's bad afternoon and makes a fat finger look
+    like enumeration; charging it means five mistypes from a screenshot lock a member out
+    of redemption for a quarter of an hour.
+    """
+    caller = await _joiner(sm, "caller@x.com")
+    _, body = new_code()
+    mistyped = formatted(body)[:-1] + ("0" if formatted(body)[-1] != "0" else "1")
+    assert normalise(mistyped) is None
+
+    for _ in range(MAX_REDEEM_FAILURES_PER_ACCOUNT + 2):
+        async with sm() as s:
+            with pytest.raises(NotFoundException):
+                await redeem.fn(
+                    data=RedeemRequest(code=mistyped),
+                    request=_request(),
+                    current_user=await s.get(User, caller),
+                    db_session=s,
+                )
+
+    async with sm() as s:
+        assert await s.scalar(text("SELECT count(*) FROM code_audit")) == 0
+        assert await s.scalar(text("SELECT count(*) FROM code_attempts")) == 0
+        # Still able to redeem, which is the part that matters to a member.
+        assert await redeem_retry_after(s, caller, "10.0.0.1") is None
+
+
+async def test_a_code_that_works_clears_the_accounts_failures(sm):
+    """Four mistakes then a successful join must not leave the account one typo away from
+    a lockout for the rest of the window. The address bucket is left alone: an address
+    that has been guessing at codes is still an address that has been guessing at codes.
+    """
+    community_id, owner_id = await _community(sm)
+    caller = await _joiner(sm, "caller@x.com")
+    for _ in range(MAX_REDEEM_FAILURES_PER_ACCOUNT - 1):
+        await _fail_code(sm, caller)
+    async with sm() as s:
+        assert await s.scalar(text("SELECT count(*) FROM code_attempts")) == (
+            MAX_REDEEM_FAILURES_PER_ACCOUNT - 1
+        )
+
+    async with sm() as s:
+        code = await issue_code(s, community_id, owner_id=owner_id)
+    assert (await _try_code(sm, caller, code)).community_id == community_id
+
+    async with sm() as s:
+        assert (
+            await s.scalar(
+                text("SELECT count(*) FROM code_attempts WHERE user_id = :u"), {"u": caller}
+            )
+            == 0
         )

@@ -101,6 +101,31 @@ class LoginAttempt(BigIntBase):
     )
 
 
+class CodeAttempt(BigIntBase):
+    """One refused redemption, counted the way a failed login is.
+
+    Its own table rather than a kind column on login_attempts, so that guessing codes at
+    somebody cannot lock them out of signing in and a login they fumbled cannot stop them
+    joining. One missing predicate on a shared table merges the two buckets, and nothing
+    would report it.
+
+    user_id rather than an email: redeeming needs a session, so there is always an account
+    to count against and no reason to key on a string the caller chose.
+    """
+
+    __tablename__ = "code_attempts"
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    ip: Mapped[str] = mapped_column(String(45))
+    failed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        # One index per bucket, and the two counts stay independent for the same reason as
+        # the login ones: a combined key hands every address its own budget per account.
+        Index("ix_code_attempts_user_failed_at", "user_id", "failed_at"),
+        Index("ix_code_attempts_ip_failed_at", "ip", "failed_at"),
+    )
+
+
 class Community(BigIntAuditBase):
     """A group whose auctions only its members may bid on.
 

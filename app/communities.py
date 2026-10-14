@@ -7,18 +7,18 @@ handful of writes that move a membership around.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from litestar import Request, post
 from litestar.di import Provide
-from litestar.exceptions import NotFoundException
+from litestar.exceptions import NotFoundException, TooManyRequestsException
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import codes
 from app.auth import client_ip, provide_current_user
-from app.models import CommunityCode, User
+from app.models import CodeAttempt, CommunityCode, User
 from app.schemas import MembershipResponse, RedeemRequest
 
 _authed = {"current_user": Provide(provide_current_user)}
@@ -399,6 +399,85 @@ async def rotate_code(
     return shown
 
 
+# The same numbers as M7's failed logins, on their own buckets. Chosen, not measured.
+#
+# A 65-bit code is not going to fall to guessing; the limit is about the cost and the noise
+# of somebody trying, which is what OWASP calls OAT-002. It also bounds how fast one
+# account could walk the space if a code ever got shorter.
+REDEEM_WINDOW = timedelta(minutes=15)
+MAX_REDEEM_FAILURES_PER_ACCOUNT = 5
+MAX_REDEEM_FAILURES_PER_IP = 20
+
+# One statement, one indexed subquery per bucket — the shape M7's login limiter ended up
+# with after exactly this was got wrong there: `count(*) FILTER` over the whole window has
+# no predicate either index starts with, so it plans as a sequential scan, and the flood is
+# when the table is large.
+_REDEEM_FAILURES_SQL = text("""
+    SELECT by_user.n AS by_user,
+           by_ip.n AS by_ip,
+           CEIL(EXTRACT(EPOCH FROM (
+               by_user.oldest + CAST(:window AS interval) - clock_timestamp()))) AS user_retry,
+           CEIL(EXTRACT(EPOCH FROM (
+               by_ip.oldest + CAST(:window AS interval) - clock_timestamp()))) AS ip_retry
+      FROM (SELECT count(*) AS n, MIN(failed_at) AS oldest
+              FROM code_attempts
+             WHERE user_id = :user_id
+               AND failed_at > clock_timestamp() - CAST(:window AS interval)) AS by_user,
+           (SELECT count(*) AS n, MIN(failed_at) AS oldest
+              FROM code_attempts
+             WHERE ip = :ip
+               AND failed_at > clock_timestamp() - CAST(:window AS interval)) AS by_ip
+    """)
+
+
+async def redeem_retry_after(session: AsyncSession, user_id: int, ip: str) -> int | None:
+    """Seconds to wait before another code may be tried, or None if one may be now."""
+    row = (
+        await session.execute(
+            _REDEEM_FAILURES_SQL,
+            {"user_id": user_id, "ip": ip, "window": REDEEM_WINDOW},
+        )
+    ).one()
+    if row.by_user >= MAX_REDEEM_FAILURES_PER_ACCOUNT:
+        return max(int(row.user_retry), 1)
+    if row.by_ip >= MAX_REDEEM_FAILURES_PER_IP:
+        return max(int(row.ip_retry), 1)
+    return None
+
+
+async def record_failed_redemption(session: AsyncSession, user_id: int, ip: str) -> None:
+    """Both buckets are fed by one row; which one it counts towards is the query's
+    business, not the writer's."""
+    session.add(CodeAttempt(user_id=user_id, ip=ip, failed_at=datetime.now(timezone.utc)))
+    await session.commit()
+
+
+async def clear_failed_redemptions(session: AsyncSession, user_id: int) -> None:
+    """A code that worked empties the account's bucket.
+
+    Without this, four mistypes followed by a successful join leave the account one typo
+    away from a lockout for the rest of the window — the same reasoning as the login
+    limiter's. The address bucket is left alone: an address that has been guessing at codes
+    is still an address that has been guessing at codes.
+    """
+    await session.execute(
+        text("DELETE FROM code_attempts WHERE user_id = :user_id"), {"user_id": user_id}
+    )
+    await session.commit()
+
+
+async def prune_code_attempts(session: AsyncSession) -> int:
+    """Attempts older than the window are never counted again."""
+    result = await session.execute(
+        text(
+            "DELETE FROM code_attempts WHERE failed_at <= clock_timestamp() - CAST(:w AS interval)"
+        ),
+        {"w": REDEEM_WINDOW},
+    )
+    await session.commit()
+    return result.rowcount
+
+
 # One answer for every way a redemption can fail, including the ones that are not the
 # caller's fault. 404 and a fixed sentence: a client cannot act on the difference between
 # a code that never existed, one that was rotated away, one past its deadline and one out
@@ -412,9 +491,32 @@ async def redeem(
     data: RedeemRequest, request: Request, current_user: User, db_session: AsyncSession
 ) -> MembershipResponse:
     """Join a community by code."""
-    membership_id = await redeem_code(db_session, data.code, current_user.id, ip=client_ip(request))
-    if membership_id is None:
+    # Read the id before anything can roll back. redeem_code rolls back on every refusal,
+    # and a rollback expires every instance in the session regardless of expire_on_commit
+    # — so touching current_user afterwards attempts a lazy reload, which raises
+    # MissingGreenlet inside an async session and turns every refused code into a 500 with
+    # no reason in it. The same trap place_bid documents.
+    user_id = current_user.id
+    ip = client_ip(request)
+    retry_after = await redeem_retry_after(db_session, user_id, ip)
+    if retry_after is not None:
+        # Read before the code is looked at, so a caller who has spent their budget cannot
+        # keep the database doing lookups. Nothing is recorded for a request refused here,
+        # or hammering a lockout would extend it.
+        raise TooManyRequestsException(
+            detail="too many codes tried", headers={"Retry-After": str(retry_after)}
+        )
+    if codes.normalise(data.code) is None:
+        # Not a code at all, and the check symbol said so without asking the database.
+        # Answered the same as the four real refusals, and charged nothing: a member
+        # retyping from a screenshot must not be able to lock themselves out, and five of
+        # these in the log would be indistinguishable from an attack that never happened.
         raise NotFoundException(_REFUSED)
+    membership_id = await redeem_code(db_session, data.code, user_id, ip=ip)
+    if membership_id is None:
+        await record_failed_redemption(db_session, user_id, ip)
+        raise NotFoundException(_REFUSED)
+    await clear_failed_redemptions(db_session, user_id)
     row = (
         await db_session.execute(
             text("SELECT community_id, generation FROM community_memberships WHERE id = :id"),
