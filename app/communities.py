@@ -135,7 +135,11 @@ async def issue_code(
     """
     owns = (
         await session.execute(
-            text("SELECT 1 FROM communities WHERE id = :c AND owner_id = :o"),
+            # FOR UPDATE, so this serialises against a rotation of the same community.
+            # Without it a rotation cannot see this insert until it commits, tombstones
+            # nothing, inserts its own, and collides with the one-live-code index — which
+            # the owner reads as a 500 for double-clicking.
+            text("SELECT 1 FROM communities WHERE id = :c AND owner_id = :o FOR UPDATE"),
             {"c": community_id, "o": owner_id},
         )
     ).first()
@@ -231,3 +235,64 @@ async def redeem_code(session: AsyncSession, presented: str, user_id: int) -> in
             return None
         raise
     return membership_id
+
+
+# Rotation: tombstone whatever is live, then issue. One transaction, and the partial unique
+# index on (community_id) WHERE invalidated_at IS NULL is what makes it safe — two
+# rotations racing cannot both leave a code behind, because the second insert collides.
+#
+# invalidated_at rather than DELETE. A deleted row is a code that can be issued again by
+# accident; Check Point documented live exploitation in 2025 of Discord returning expired
+# invite codes to the pool, which is what reissuing looks like from the outside. The
+# tombstone is also what the audit log points at when somebody asks which code let a
+# person in.
+_TOMBSTONE_SQL = text("""
+    UPDATE community_codes
+       SET invalidated_at = clock_timestamp()
+     WHERE community_id = :community_id
+       AND invalidated_at IS NULL
+    RETURNING id
+    """)
+
+
+async def rotate_code(
+    session: AsyncSession,
+    community_id: int,
+    *,
+    owner_id: int,
+    label: str = "",
+    max_uses: int = 1,
+    expires_at: datetime | None = None,
+) -> str | None:
+    """Replace the community's live code. Returns the new one once, or None if the caller
+    is not the owner.
+
+    The old code stops validating the moment this commits, including for somebody who is
+    mid-redemption: their claim is an UPDATE against a row this one has already locked, so
+    they wait and then find it tombstoned.
+
+    Rotation is also the answer to a lost code, which is why there is nothing to re-display
+    and no second copy of a code anywhere.
+    """
+    owns = (
+        await session.execute(
+            text("SELECT 1 FROM communities WHERE id = :c AND owner_id = :o FOR UPDATE"),
+            {"c": community_id, "o": owner_id},
+        )
+    ).first()
+    if owns is None:
+        await session.rollback()
+        return None
+    await session.execute(_TOMBSTONE_SQL, {"community_id": community_id})
+    shown, body = codes.new_code()
+    session.add(
+        CommunityCode(
+            community_id=community_id,
+            label=label,
+            code_lookup=codes.lookup(body),
+            max_uses=max_uses,
+            expires_at=expires_at,
+        )
+    )
+    await session.commit()
+    return shown

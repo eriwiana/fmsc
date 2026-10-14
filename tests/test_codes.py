@@ -27,7 +27,7 @@ from app.codes import (
     new_code,
     normalise,
 )
-from app.communities import issue_code, kick_member, redeem_code
+from app.communities import issue_code, kick_member, redeem_code, rotate_code
 from app.models import Community, User
 
 
@@ -379,19 +379,42 @@ async def test_redeeming_twice_costs_the_code_nothing(sm):
 
 
 async def test_an_expired_code_is_refused(sm):
+    """The deadline is put into the past by the database's own clock, not by Python's.
+
+    The comparison under test is made by Postgres, so a deadline computed here turns any
+    skew between this process and the database into a failing test — which is exactly what
+    it did on this machine, where the container clock drifts by minutes.
+    """
     community_id, owner_id = await _community(sm)
     joiner = await _joiner(sm, "joiner@x.com")
     async with sm() as s:
-        shown = await issue_code(
-            s,
-            community_id,
-            owner_id=owner_id,
-            expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        shown = await issue_code(s, community_id, owner_id=owner_id)
+    async with sm() as s:
+        await s.execute(
+            text("UPDATE community_codes SET expires_at = clock_timestamp() - interval '1 second'")
         )
+        await s.commit()
+
     async with sm() as s:
         assert await redeem_code(s, shown, joiner) is None
     async with sm() as s:
         assert await s.scalar(text("SELECT used_count FROM community_codes")) == 0
+
+
+async def test_a_code_inside_its_deadline_is_accepted(sm):
+    """The control. A guard that refused every code with a deadline would pass the test
+    above."""
+    community_id, owner_id = await _community(sm)
+    joiner = await _joiner(sm, "joiner@x.com")
+    async with sm() as s:
+        shown = await issue_code(s, community_id, owner_id=owner_id)
+    async with sm() as s:
+        await s.execute(
+            text("UPDATE community_codes SET expires_at = clock_timestamp() + interval '1 hour'")
+        )
+        await s.commit()
+    async with sm() as s:
+        assert await redeem_code(s, shown, joiner) is not None
 
 
 async def test_an_invalidated_code_is_refused(sm):
@@ -444,6 +467,170 @@ async def test_a_redemption_after_a_remove_all_lands_in_the_new_generation(sm):
         ).one()
     assert row.generation == 4
     assert row.joined_via_generation == 4
+
+
+async def test_a_rotated_code_never_validates_again(sm):
+    """Criterion 2. Check Point documented live exploitation in 2025 of Discord returning
+    expired invite codes to the pool; a tombstone is how a code stops existing rather
+    than becoming available again."""
+    community_id, owner_id = await _community(sm)
+    joiner = await _joiner(sm, "joiner@x.com")
+    async with sm() as s:
+        old = await issue_code(s, community_id, owner_id=owner_id)
+    async with sm() as s:
+        new = await rotate_code(s, community_id, owner_id=owner_id)
+    assert new is not None and new != old
+
+    async with sm() as s:
+        assert await redeem_code(s, old, joiner) is None
+    # The new one works, or the test above would pass with rotation simply breaking codes.
+    async with sm() as s:
+        assert await redeem_code(s, new, joiner) is not None
+
+
+async def test_the_old_code_is_tombstoned_rather_than_deleted(sm):
+    """A deleted row is a code that can be issued again by accident, and it is what the
+    audit log points at when somebody asks which code let a person in."""
+    community_id, owner_id = await _community(sm)
+    async with sm() as s:
+        await issue_code(s, community_id, owner_id=owner_id, label="first")
+    async with sm() as s:
+        await rotate_code(s, community_id, owner_id=owner_id, label="second")
+
+    async with sm() as s:
+        rows = (
+            await s.execute(
+                text(
+                    "SELECT label, invalidated_at IS NULL AS live FROM community_codes ORDER BY id"
+                )
+            )
+        ).all()
+    assert [(row.label, row.live) for row in rows] == [("first", False), ("second", True)]
+
+
+async def test_rotating_twice_leaves_exactly_one_live_code(sm):
+    """The partial unique index is what makes this a property rather than a hope."""
+    community_id, owner_id = await _community(sm)
+    async with sm() as s:
+        await issue_code(s, community_id, owner_id=owner_id)
+    for _ in range(3):
+        async with sm() as s:
+            assert await rotate_code(s, community_id, owner_id=owner_id) is not None
+    async with sm() as s:
+        assert await s.scalar(text("SELECT count(*) FROM community_codes")) == 4
+        assert (
+            await s.scalar(
+                text("SELECT count(*) FROM community_codes WHERE invalidated_at IS NULL")
+            )
+            == 1
+        )
+
+
+async def test_rotation_works_on_a_community_with_no_code_yet(sm):
+    """Tombstoning nothing is not an error. Otherwise an owner who never issued a code
+    has to call a different endpoint than one who did."""
+    community_id, owner_id = await _community(sm)
+    async with sm() as s:
+        assert await rotate_code(s, community_id, owner_id=owner_id) is not None
+
+
+async def test_only_the_owner_can_rotate(sm):
+    community_id, owner_id = await _community(sm)
+    stranger = await _joiner(sm, "stranger@x.com")
+    async with sm() as s:
+        old = await issue_code(s, community_id, owner_id=owner_id)
+    async with sm() as s:
+        assert await rotate_code(s, community_id, owner_id=stranger) is None
+    # And the live code is untouched, which is the half that matters: a failed rotation
+    # must not leave the community with no way in.
+    async with sm() as s:
+        assert await redeem_code(s, old, stranger) is not None
+
+
+async def test_a_redemption_in_flight_when_the_code_rotates_is_refused(sm):
+    """Built rather than raced. A redemption that has claimed its use but not committed
+    holds the code's row; the rotation blocks on it, and whichever order they settle in,
+    the old code is dead and the membership either exists from before the rotation or not
+    at all.
+    """
+    community_id, owner_id = await _community(sm)
+    joiner = await _joiner(sm, "joiner@x.com")
+    other = await _joiner(sm, "other@x.com")
+    async with sm() as s:
+        old = await issue_code(s, community_id, owner_id=owner_id, max_uses=5)
+
+    async with sm() as redeemer:
+        body = normalise(old)
+        claimed = (
+            await redeemer.execute(
+                text(
+                    "UPDATE community_codes SET used_count = used_count + 1"
+                    " WHERE code_lookup = :lookup AND invalidated_at IS NULL"
+                    "   AND used_count < max_uses RETURNING id"
+                ),
+                {"lookup": lookup(body)},
+            )
+        ).first()
+        assert claimed is not None
+
+        async def rotate():
+            async with sm() as s:
+                return await rotate_code(s, community_id, owner_id=owner_id)
+
+        rotation = asyncio.create_task(rotate())
+        await asyncio.sleep(0.2)
+        assert not rotation.done(), "the rotation did not wait for the redemption's lock"
+        await redeemer.commit()
+
+    assert await rotation is not None
+    # The old code is dead for everybody who comes next.
+    async with sm() as s:
+        assert await redeem_code(s, old, other) is None
+    assert joiner  # the in-flight redeemer; its claim committed before the tombstone
+
+
+async def test_two_rotations_at_once_both_succeed_and_leave_one_code(sm):
+    """What the community row lock in rotate_code is for, and the only thing that shows
+    it.
+
+    Rotation is tombstone-then-insert, and the partial unique index allows one live code.
+    Without the lock both rotations tombstone — the second waiting on the code row, not on
+    the community — and then both insert, so the index refuses the loser with an
+    IntegrityError the owner sees as a 500. Taking the community row first makes them
+    queue, so the second one tombstones what the first inserted and replaces it.
+
+    An owner double-clicking rotate is the whole of this scenario.
+    """
+    community_id, owner_id = await _community(sm)
+    async with sm() as s:
+        await issue_code(s, community_id, owner_id=owner_id)
+
+    async def rotate():
+        async with sm() as s:
+            return await rotate_code(s, community_id, owner_id=owner_id)
+
+    first, second = await asyncio.gather(rotate(), rotate())
+
+    assert first is not None and second is not None and first != second
+    async with sm() as s:
+        assert (
+            await s.scalar(
+                text("SELECT count(*) FROM community_codes WHERE invalidated_at IS NULL")
+            )
+            == 1
+        )
+        assert await s.scalar(text("SELECT count(*) FROM community_codes")) == 3
+    # Exactly one of the two works, and which one is whichever committed last. gather
+    # preserves the order its arguments were passed in, not the order they finished, so
+    # asserting that `second` is the live one is a coin flip — it failed two runs in five
+    # before this was written as a property.
+    joiner = await _joiner(sm, "joiner@x.com")
+    redeemable = 0
+    for code in (first, second):
+        async with sm() as s:
+            if await redeem_code(s, code, joiner) is not None:
+                redeemable += 1
+    assert redeemable == 1
 
 
 def test_a_payload_that_begins_with_the_prefix_still_round_trips():
