@@ -161,6 +161,49 @@ class CommunityMembership(BigIntAuditBase):
     )
 
 
+class CommunityCode(BigIntAuditBase):
+    """An invite code, as a row. The code itself is not in it.
+
+    code_lookup is HMAC-SHA256(payload, server pepper), so a leaked database hands nobody
+    a working code and a lookup is still one indexed equality. The code is shown to its
+    owner once, at creation; losing it means rotating it.
+
+    Rows are tombstoned with invalidated_at and never reissued. Check Point documented
+    live exploitation in 2025 of Discord returning expired invite codes to the pool, which
+    is what reissuing means in practice.
+    """
+
+    __tablename__ = "community_codes"
+    community_id: Mapped[int] = mapped_column(ForeignKey("communities.id"), index=True)
+    # For the owner's own benefit, since they cannot read the code back. "winter drop",
+    # "the one I put in the newsletter".
+    label: Mapped[str] = mapped_column(String(60), default="")
+    code_lookup: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    max_uses: Mapped[int] = mapped_column(default=1)
+    used_count: Mapped[int] = mapped_column(default=0)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Set by a rotation, and the row stays. A tombstone is the only way to be sure the old
+    # code never validates again.
+    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        # The database refuses the over-redemption rather than the application noticing
+        # it afterwards. An application-level used_count < max_uses test is CWE-837:
+        # whoever reads the count is not whoever increments it.
+        CheckConstraint("used_count <= max_uses", name="uses_within_max"),
+        CheckConstraint("max_uses > 0", name="max_uses_positive"),
+        CheckConstraint("used_count >= 0", name="used_count_not_negative"),
+        # One live code per community. Rotation is therefore invalidate-then-insert in one
+        # transaction, and two concurrent rotations cannot both leave a code behind.
+        Index(
+            "uq_one_live_code_per_community",
+            "community_id",
+            unique=True,
+            postgresql_where=text("invalidated_at IS NULL"),
+        ),
+    )
+
+
 class Auction(BigIntAuditBase):
     __tablename__ = "auctions"
     title: Mapped[str] = mapped_column(String(200))

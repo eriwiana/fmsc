@@ -7,8 +7,13 @@ handful of writes that move a membership around.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app import codes
+from app.models import CommunityCode
 
 # One guarded UPDATE, scoped to the owner. Ownership is in the WHERE rather than checked
 # first, for the same reason as every other guard in this project: two statements leave a
@@ -109,3 +114,42 @@ async def remove_all_members(
     generation = await session.scalar(_BUMP_SQL, {"community_id": community_id})
     await session.commit()
     return generation
+
+
+async def issue_code(
+    session: AsyncSession,
+    community_id: int,
+    *,
+    owner_id: int,
+    label: str = "",
+    max_uses: int = 1,
+    expires_at: datetime | None = None,
+) -> str | None:
+    """Mint a code for a community. Returns it once, or None if the caller is not the
+    owner.
+
+    Once, because this is the only moment it exists in a form anybody can read. What the
+    row keeps is the HMAC, so there is nothing to show a second time and nothing in a
+    backup to steal.
+    """
+    owns = (
+        await session.execute(
+            text("SELECT 1 FROM communities WHERE id = :c AND owner_id = :o"),
+            {"c": community_id, "o": owner_id},
+        )
+    ).first()
+    if owns is None:
+        await session.rollback()
+        return None
+    shown, body = codes.new_code()
+    session.add(
+        CommunityCode(
+            community_id=community_id,
+            label=label,
+            code_lookup=codes.lookup(body),
+            max_uses=max_uses,
+            expires_at=expires_at,
+        )
+    )
+    await session.commit()
+    return shown

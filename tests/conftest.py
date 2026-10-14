@@ -11,6 +11,11 @@ from __future__ import annotations
 
 import os
 
+# Before anything imports app: app.codes reads the pepper at import and refuses to start
+# without one, which is the behaviour a deployment wants and an awkward thing for a test
+# suite to be surprised by. A fixed value, because the tests assert on lookups.
+os.environ.setdefault("FMSC_CODE_PEPPER", "test-pepper-not-a-secret-0123456789abcdef")
+
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
