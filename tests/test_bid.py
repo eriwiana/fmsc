@@ -19,10 +19,12 @@ from sqlalchemy.exc import IntegrityError
 
 from app.auctions import (
     APP_TZ,
+    BID_INCREMENTS,
     IDEMPOTENCY_HEADER,
     MAX_BID,
     MAX_EXTENSION,
     _to_response,
+    bid_increment,
     create_auction,
     place_bid,
     place_bid_tx,
@@ -35,6 +37,12 @@ from app.schemas import BidRequest, CreateAuctionRequest, SignupRequest
 
 # Long enough for the signup handler's own length floor, which this file is not about.
 PASSWORD = "correct horse battery staple"
+
+# The increment the band table demands at the amounts these tests use. A second bid is the
+# first plus this, because a bid a cent above the leader is refused — the rule itself is
+# tested in test_a_bid_must_clear_the_increment below, and the tests here are about other
+# things and only have to stay legal.
+STEP = bid_increment(Decimal("10.00"))
 
 
 async def _seed(
@@ -184,10 +192,10 @@ async def test_higher_bid_replaces_the_leader(sm):
     async with sm() as s:
         await place_bid_tx(s, aid, bidder, Decimal("10.00"))
     async with sm() as s:
-        assert await place_bid_tx(s, aid, other, Decimal("11.00")) is not None
+        assert await place_bid_tx(s, aid, other, Decimal("10.00") + STEP) is not None
     async with sm() as s:
         auction = await s.get(Auction, aid)
-    assert auction.current_bid == Decimal("11.00")
+    assert auction.current_bid == Decimal("10.00") + STEP
     assert auction.current_winner_id == other
     assert auction.bid_count == 2
 
@@ -294,7 +302,10 @@ async def test_highest_bid_survives_n_way_concurrency(sm):
         s.add_all(users)
         await s.commit()
         ids = [u.id for u in users]
-    amounts = [Decimal(f"{11 + i}.00") for i in range(n)]
+    # Spaced by the increment so every one of them is a legal bid against any leader
+    # below it; without that the largest could be refused and the test would be asserting
+    # the increment rather than the lost-update guard.
+    amounts = [Decimal("10.00") + STEP * (i + 1) for i in range(n)]
     # strict: the two lists are built from the same n, and a silent truncation here
     # would quietly shrink the race this test exists to create.
     order = list(zip(ids, amounts, strict=True))
@@ -372,7 +383,11 @@ async def test_every_event_on_an_auction_is_numbered_in_order(sm, channels):
     second = await _add_bidder(sm, "second@x.com")
     third = await _add_bidder(sm, "third@x.com")
 
-    for uid, amount in ((bidder, "10.00"), (second, "11.00"), (third, "12.00")):
+    for uid, amount in (
+        (bidder, "10.00"),
+        (second, str(Decimal("10.00") + STEP)),
+        (third, str(Decimal("10.00") + STEP * 2)),
+    ):
         await _post_bid(sm, aid, uid, amount, None, channels)
 
     assert [event["seq"] for _, event in channels.published] == [1, 2, 3]
@@ -434,7 +449,7 @@ async def test_an_empty_key_counts_as_no_key(sm, channels):
     _, bidder, aid = await _seed(sm)
 
     await _post_bid(sm, aid, bidder, "10.00", "", channels)
-    second = await _post_bid(sm, aid, bidder, "11.00", "", channels)
+    second = await _post_bid(sm, aid, bidder, str(Decimal("10.00") + STEP), "", channels)
 
     assert second.bid_count == 2
     assert await _bid_rows(sm, aid) == 2
@@ -458,7 +473,7 @@ async def test_a_different_key_places_a_second_bid(sm, channels):
     _, bidder, aid = await _seed(sm)
 
     await _post_bid(sm, aid, bidder, "10.00", "first-key", channels)
-    second = await _post_bid(sm, aid, bidder, "11.00", "second-key", channels)
+    second = await _post_bid(sm, aid, bidder, str(Decimal("10.00") + STEP), "second-key", channels)
 
     assert second.bid_count == 2
     assert await _bid_rows(sm, aid) == 2
@@ -608,11 +623,15 @@ async def test_reason_names_the_starting_bid(sm):
     assert await _reason(sm, aid, bidder, "9.99") == "bid must be at least 10.00"
 
 
-async def test_reason_names_the_current_bid(sm):
+async def test_reason_names_the_least_acceptable_bid(sm):
+    """Not "must be above 15.00": with an increment that is the wrong number to type.
+    A bidder needs what to bid, and working the band table out from a refusal is not
+    their job."""
     _, bidder, aid = await _seed(sm)
     async with sm() as s:
         await place_bid_tx(s, aid, bidder, Decimal("15.00"))
-    assert await _reason(sm, aid, bidder, "15.00") == "bid must be above 15.00"
+    least = Decimal("15.00") + bid_increment(Decimal("15.00"))
+    assert await _reason(sm, aid, bidder, "15.00") == f"bid must be at least {least}"
 
 
 async def test_reason_falls_back_when_the_row_moved_in_flight(sm):
@@ -734,3 +753,106 @@ async def test_the_reserve_check_rides_in_the_one_bid_update(sm):
 
     assert len(updates) == 1, f"the bid path issued {len(updates)} UPDATEs on auctions"
     assert "reserve" in updates[0].lower()
+
+
+async def test_a_bid_must_clear_the_increment(sm):
+    """Criterion 4 of M8. A cent above the leader is a penny war, which is what bots are
+    for: an auction decided by who can issue the most requests is not an auction.
+    """
+    _, bidder, aid = await _seed(sm, starting="100000.00")
+    other = await _add_bidder(sm, "other@x.com")
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("100000.00")) is not None
+
+    step = bid_increment(Decimal("100000.00"))
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, other, Decimal("100000.01")) is None
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, other, Decimal("100000.00") + step - Decimal("0.01")) is (
+            None
+        )
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, other, Decimal("100000.00") + step) is not None
+
+
+async def test_the_increment_grows_with_the_price(sm):
+    """The band the leader is in, not the band the new bid would land in: a 100,000 step
+    at a million means a bidder cannot nudge a large lot by the small-lot increment."""
+    assert bid_increment(Decimal("0.01")) == Decimal("10000")
+    assert bid_increment(Decimal("999999.99")) == Decimal("10000")
+    assert bid_increment(Decimal("1000000")) == Decimal("100000")
+    assert bid_increment(Decimal("9999999.99")) == Decimal("100000")
+    assert bid_increment(Decimal("10000000")) == Decimal("500000")
+
+    # Pinned to the literals, not to the table: comparing BID_INCREMENTS with itself
+    # passes for any set of numbers, including a step quietly lowered to a cent.
+    assert (
+        (Decimal("1000000"), Decimal("10000")),
+        (Decimal("10000000"), Decimal("100000")),
+        (None, Decimal("500000")),
+    ) == BID_INCREMENTS
+
+
+async def test_the_increment_applies_in_the_band_of_the_standing_bid(sm):
+    """At a leader of 1,000,000 the step is 100,000, so 1,010,000 — legal one band down —
+    is refused here. The CASE reads current_bid, which is the column the band is about."""
+    _, bidder, aid = await _seed(sm, starting="1000000.00")
+    other = await _add_bidder(sm, "other@x.com")
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("1000000.00")) is not None
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, other, Decimal("1010000.00")) is None
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, other, Decimal("1100000.00")) is not None
+
+
+async def test_the_increment_is_read_from_the_standing_bid_not_the_new_one(sm):
+    """The discriminating case, and the only one that tells the two apart: a leader just
+    under a band boundary with a bid just over it.
+
+    At 999,999 the step is 10,000, so 1,009,999 is legal. Reading the band off the new
+    amount instead would find it in the next band up, demand 100,000 and refuse a bid
+    that cleared the rule the leader was under. Every other pair of numbers answers the
+    same either way, which is why this test exists separately.
+    """
+    _, bidder, aid = await _seed(sm, starting="999999.00")
+    other = await _add_bidder(sm, "other@x.com")
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("999999.00")) is not None
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, other, Decimal("1009999.00")) is not None
+
+
+async def test_an_opening_bid_still_only_has_to_equal_the_starting_bid(sm):
+    """The increment is about beating a leader, and an opening bid has nothing to beat.
+    Charging an increment on the first bid would make every auction start one step above
+    the price it advertised."""
+    _, bidder, aid = await _seed(sm, starting="500000.00")
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("500000.00")) is not None
+
+
+async def test_the_increment_rides_in_the_one_bid_update(sm):
+    """Criterion 4 says the same UPDATE. A second statement would read a leader the first
+    one could already have replaced."""
+    updates = []
+    engine = sm.kw["bind"].sync_engine
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def record(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("UPDATE AUCTIONS"):
+            updates.append(statement)
+
+    try:
+        _, bidder, aid = await _seed(sm, starting="100000.00")
+        other = await _add_bidder(sm, "other@x.com")
+        async with sm() as s:
+            await place_bid_tx(s, aid, bidder, Decimal("100000.00"))
+        updates.clear()
+        async with sm() as s:
+            assert await place_bid_tx(s, aid, other, Decimal("110000.00")) is not None
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    assert len(updates) == 1, f"the bid path issued {len(updates)} UPDATEs on auctions"
+    assert "CASE" in updates[0]

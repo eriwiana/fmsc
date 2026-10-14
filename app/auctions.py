@@ -173,6 +173,44 @@ MAX_BID = Decimal("9999999999999999.99")
 # the refusal is a 400 naming the field, not the 500 an IntegrityError becomes.
 CURRENCY_CODE = re.compile(r"[A-Z]{3}")
 
+# The increment table. A bid has to beat the leader by this much, not by a cent: penny
+# wars are what bots are for, and an auction decided by who can issue the most requests is
+# not an auction. Bands rather than a percentage so the step is a round number a bidder can
+# predict, and rather than a per-auction column so there is no knob for a seller to get
+# wrong. IDR-shaped, because IDR is the only currency in use; a second currency needs its
+# own table, which is why the numbers are here and not in the SQL.
+#
+# Chosen, not measured. The milestone records that.
+#
+# (ceiling, step): the step applies while the current bid is under the ceiling. The last
+# entry's ceiling is None, which is everything above.
+BID_INCREMENTS: tuple[tuple[Decimal | None, Decimal], ...] = (
+    (Decimal("1000000"), Decimal("10000")),
+    (Decimal("10000000"), Decimal("100000")),
+    (None, Decimal("500000")),
+)
+
+
+def bid_increment(current: Decimal) -> Decimal:
+    """The step a bid must clear to beat `current`."""
+    return next(step for ceiling, step in BID_INCREMENTS if ceiling is None or current < ceiling)
+
+
+def _increment_case(column: str) -> str:
+    """The same table as SQL, generated rather than written out twice.
+
+    Two copies would drift, and the copy that drifted would be the message rather than the
+    rule — a bidder told to bid 20,000 and then refused at 20,000. The values are Decimals
+    from the tuple above, so there is nothing here a caller can reach.
+    """
+    whens = " ".join(
+        f"WHEN {column} < {ceiling} THEN {step}"
+        for ceiling, step in BID_INCREMENTS
+        if ceiling is not None
+    )
+    return f"CASE {whens} ELSE {BID_INCREMENTS[-1][1]} END"
+
+
 # Anti-snipe. A bid inside the last SNIPE_WINDOW pushes the deadline that far out from the
 # moment it lands, so a bid placed too late to be answered cannot win on timing alone.
 # MAX_EXTENSION caps the total, via each auction's hard_ends_at.
@@ -419,6 +457,10 @@ async def cancel_auction(
 # test can tell them apart. The ordering stays as written because it is still the correct
 # one if that constraint is ever dropped.
 #
+# The increment rides in the same WHERE for the same reason as the reserve, and it only
+# applies once there is a leader: an opening bid has nothing to beat, so it may still equal
+# starting_bid.
+#
 # WHERE still reads the pre-update ends_at, so a bid that arrives after the deadline loses
 # rather than extending its way back in.
 #
@@ -428,7 +470,8 @@ async def cancel_auction(
 # case. The starting_bid guard above is kept even though the constraint
 # reserve >= starting_bid makes it redundant: if that constraint is ever dropped, a reserve
 # set below the advertised price must not become a way under the advertised price.
-_BID_SQL = text("""
+_BID_SQL = text(
+    """
     UPDATE auctions
        SET current_bid = :amount, current_winner_id = :uid, bid_count = bid_count + 1,
            event_seq = event_seq + 1,
@@ -437,9 +480,12 @@ _BID_SQL = text("""
        AND seller_id <> :uid
        AND :amount >= starting_bid
        AND :amount >= COALESCE(reserve, starting_bid)
-       AND (current_bid IS NULL OR :amount > current_bid)
+       AND (current_bid IS NULL OR :amount >= current_bid + """
+    + _increment_case("current_bid")
+    + """)
     RETURNING *
-    """)
+    """
+)
 
 
 # IETF draft-ietf-httpapi-idempotency-key-header spells it this way, and caps the key at
@@ -649,8 +695,12 @@ async def reject_reason(
         # The number is not in the message. A reserve a bidder can read is a reserve they
         # can bid exactly, which is the seller's floor turned into the seller's ceiling.
         return "the seller's reserve has not been met"
-    if auction.current_bid is not None and amount <= auction.current_bid:
-        return f"bid must be above {auction.current_bid}"
+    if auction.current_bid is not None:
+        least = auction.current_bid + bid_increment(auction.current_bid)
+        if amount < least:
+            # The number, not the rule: a bidder needs to know what to type, and working
+            # the band table out from a refusal is not their job.
+            return f"bid must be at least {least}"
     return "outbid while the bid was in flight"
 
 
