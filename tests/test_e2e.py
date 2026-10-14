@@ -655,3 +655,20 @@ def test_a_reserve_under_the_starting_bid_answers_400(client, clean_db):
         ).status_code
         == 400
     )
+
+
+def test_the_dashboard_route_shows_only_the_callers_auctions(client, clean_db):
+    """Criterion 5 over HTTP. /auctions/mine has to not be swallowed by
+    /auctions/{auction_id:int} — the unit tests call the handler directly and would not
+    notice — and it has to need a token at all."""
+    mine = _seller(client, "mine@x.com")
+    theirs = _seller(client, "theirs@x.com")
+    ours = _open_auction(client, mine)
+    not_ours = _open_auction(client, theirs)
+
+    listed = client.get("/auctions/mine", headers={"Authorization": f"Bearer {mine}"})
+    assert listed.status_code == 200, listed.text
+    assert [a["id"] for a in listed.json()] == [ours]
+    assert not_ours not in [a["id"] for a in listed.json()]
+
+    assert client.get("/auctions/mine").status_code == 401

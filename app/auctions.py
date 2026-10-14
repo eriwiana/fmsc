@@ -294,6 +294,28 @@ async def list_auctions(db_session: AsyncSession) -> list[AuctionResponse]:
     return [_to_response(a) for a in rows]
 
 
+# Registered before /auctions/{auction_id:int} would matter in a framework that matched
+# routes in order; litestar matches the literal path first either way, and the test below
+# is what says so rather than the ordering here.
+@get("/auctions/mine", dependencies=_authed)
+async def my_auctions(current_user: User, db_session: AsyncSession) -> list[AuctionResponse]:
+    """Criterion 5. Every auction this caller sells, whatever its status.
+
+    The seller's own view, which is why it is the one place drafts appear and the one
+    place the reserve is echoed back. Filtered by seller_id in the WHERE rather than by
+    reading and then checking: a filter that happens in Python is one somebody later
+    forgets to apply to a second query.
+
+    Newest first, by id. The public list is ordered by deadline because a bidder wants
+    what ends soonest; a seller wants what they just created, and a draft has no
+    meaningful deadline to sort by yet.
+    """
+    rows = await db_session.scalars(
+        select(Auction).where(Auction.seller_id == current_user.id).order_by(Auction.id.desc())
+    )
+    return [_to_response(a, reveal_reserve=True) for a in rows]
+
+
 @get("/auctions/{auction_id:int}")
 async def get_auction(auction_id: int, db_session: AsyncSession) -> AuctionResponse:
     auction = await db_session.get(Auction, auction_id)

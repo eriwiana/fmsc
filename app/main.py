@@ -130,6 +130,7 @@ app = Litestar(
         auctions.publish_auction,
         auctions.cancel_auction,
         auctions.list_auctions,
+        auctions.my_auctions,
         auctions.get_auction,
         auctions.place_bid,
         auctions.auction_ws,

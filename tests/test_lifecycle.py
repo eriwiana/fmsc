@@ -10,6 +10,7 @@ Criteria 1 and 2:
 2. Cancel is refused once a bid exists, and edit is refused after the first bid. A
    cancelled auction with bids on it is a seller walking away from money other people
    committed, and an edited one is a bait-and-switch: bidders bid on the description.
+5. The seller dashboard returns only that seller's auctions.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from app.auctions import (
     edit_auction,
     get_auction,
     list_auctions,
+    my_auctions,
     publish_auction,
     transition,
 )
@@ -320,6 +322,48 @@ async def test_a_cancelled_auction_stays_public(sm):
         assert [a.id for a in await list_auctions.fn(db_session=s)] == [cancelled]
     async with sm() as s:
         assert (await get_auction.fn(auction_id=cancelled, db_session=s)).status == "cancelled"
+
+
+async def test_the_dashboard_shows_only_the_callers_own_auctions(sm):
+    """Criterion 5. Another seller's auction is absent, which is the whole point: a
+    dashboard that leaks is worse than no dashboard, because it is trusted."""
+    mine = await _seller(sm, "mine@x.com")
+    theirs = await _seller(sm, "theirs@x.com")
+    ours = [await _auction(sm, mine.id, "open"), await _auction(sm, mine.id, "draft")]
+    not_ours = await _auction(sm, theirs.id, "open")
+
+    async with sm() as s:
+        listed = [a.id for a in await my_auctions.fn(current_user=mine, db_session=s)]
+    assert sorted(listed) == sorted(ours)
+    assert not_ours not in listed
+
+    # And the other way round, or a filter that returned nothing would pass the above.
+    async with sm() as s:
+        assert [a.id for a in await my_auctions.fn(current_user=theirs, db_session=s)] == [not_ours]
+
+
+async def test_the_dashboard_is_where_a_seller_sees_their_drafts_and_reserve(sm):
+    """The one place both appear. A draft is hidden from every public route, and the
+    reserve is withheld from everyone else, so without this the seller cannot read back
+    either of the two things only they set."""
+    seller = await _seller(sm)
+    async with sm() as s:
+        await s.execute(
+            text(
+                "INSERT INTO auctions (title, seller_id, starting_bid, reserve, currency,"
+                " bid_count, status, starts_at, ends_at, hard_ends_at, event_seq,"
+                " created_at, updated_at)"
+                " VALUES ('t', :uid, 10.00, 100.00, 'IDR', 0, 'draft', now(),"
+                " now() + interval '1 hour', now() + interval '3 hours', 0, now(), now())"
+            ),
+            {"uid": seller.id},
+        )
+        await s.commit()
+
+    async with sm() as s:
+        only = (await my_auctions.fn(current_user=seller, db_session=s))[0]
+    assert only.status == "draft"
+    assert only.reserve == Decimal("100.00")
 
 
 async def test_an_auction_cannot_be_created_into_a_state_an_edge_leads_to(sm):

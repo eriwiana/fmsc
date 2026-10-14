@@ -104,7 +104,10 @@ class LoginAttempt(BigIntBase):
 class Auction(BigIntAuditBase):
     __tablename__ = "auctions"
     title: Mapped[str] = mapped_column(String(200))
-    seller_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    # Indexed because the seller's dashboard filters on it, and Postgres does not index a
+    # foreign key for you — without this, reading one seller's listings scans every auction
+    # on the service.
+    seller_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     starting_bid: Mapped[Decimal] = mapped_column(Money)
     # NULL current_bid = no bids yet, so the opening bid may equal starting_bid.
     current_bid: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
