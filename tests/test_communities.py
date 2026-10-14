@@ -13,11 +13,20 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+import pytest
+from litestar.exceptions import HTTPException, PermissionDeniedException
 from sqlalchemy import text
 
-from app.auctions import MAX_EXTENSION, place_bid_tx, transition
-from app.communities import kick_member
+from app.auctions import (
+    _MAY_LIST_SQL,
+    MAX_EXTENSION,
+    create_auction,
+    place_bid_tx,
+    transition,
+)
+from app.communities import _LOCK_COMMUNITY_SQL, kick_member, remove_all_members
 from app.models import Auction, Community, CommunityMembership, User
+from app.schemas import CreateAuctionRequest
 
 
 async def _community(maker, owner_email: str = "owner@x.com") -> tuple[int, int]:
@@ -290,6 +299,248 @@ async def test_a_second_kick_does_not_move_the_revocation_forward(sm):
         assert await place_bid_tx(s, between, bidder, Decimal("10.00")) is None
 
 
+async def test_remove_all_bumps_the_generation_and_keeps_the_rows(sm):
+    """Criterion 3's happy path, and why it is a counter rather than a DELETE: every
+    membership stops counting at once, and the rows stay as the record of who was in the
+    community when each past lot sold."""
+    community_id, owner_id = await _community(sm)
+    member = await _member(sm, community_id, "member@x.com")
+
+    async with sm() as s:
+        assert await remove_all_members(s, community_id, owner_id=owner_id) == 1
+    async with sm() as s:
+        assert (
+            await s.scalar(
+                text("SELECT count(*) FROM community_memberships WHERE community_id = :c"),
+                {"c": community_id},
+            )
+            == 1
+        )
+    later = await _auction(sm, owner_id, community_id, starts_delta=timedelta(seconds=1))
+    async with sm() as s:
+        assert await place_bid_tx(s, later, member, Decimal("10.00")) is None
+
+
+async def test_remove_all_is_refused_while_an_auction_is_open(sm):
+    """Criterion 3. The bump would strand the bidders on a lot that is still running:
+    they bid under a membership that is suddenly history, and the seller is left with an
+    auction nobody may bid on."""
+    community_id, owner_id = await _community(sm)
+    member = await _member(sm, community_id, "member@x.com")
+    open_auction = await _auction(sm, owner_id, community_id)
+
+    async with sm() as s:
+        assert await remove_all_members(s, community_id, owner_id=owner_id) is None
+    # Nothing moved, so the member can still bid on the lot that is running.
+    async with sm() as s:
+        assert await place_bid_tx(s, open_auction, member, Decimal("10.00")) is not None
+
+
+async def test_remove_all_is_allowed_once_the_auction_is_closed(sm):
+    """The control. A guard that refused every remove-all would pass the test above."""
+    community_id, owner_id = await _community(sm)
+    await _member(sm, community_id, "member@x.com")
+    auction_id = await _auction(sm, owner_id, community_id)
+    async with sm() as s:
+        await s.execute(
+            text("UPDATE auctions SET status = 'closed' WHERE id = :id"), {"id": auction_id}
+        )
+        await s.commit()
+
+    async with sm() as s:
+        assert await remove_all_members(s, community_id, owner_id=owner_id) == 1
+
+
+async def test_only_the_owner_can_remove_all(sm):
+    """Owner rights come from communities.owner_id. A member who could do this could
+    strand every other member."""
+    community_id, _ = await _community(sm)
+    member = await _member(sm, community_id, "member@x.com")
+    async with sm() as s:
+        assert await remove_all_members(s, community_id, owner_id=member) is None
+
+
+async def test_remove_all_waits_for_a_listing_in_flight_and_then_refuses(sm):
+    """Criterion 3 under concurrency, built rather than raced.
+
+    This is the interleaving the row lock exists for, and the one a plain NOT EXISTS gets
+    wrong: a listing has taken the community row and inserted its auction, but has not
+    committed, so that auction is invisible to every other snapshot. A single UPDATE
+    carrying NOT EXISTS would bump straight past it, and the new lot would open into a
+    community whose every membership had just stopped counting.
+
+    The in-flight listing is spelled out here rather than driven through create_auction,
+    because the handler commits and a committed listing is no longer in flight. What it
+    does is the same two statements in the same order — FOR SHARE on the community, then
+    the insert — and that the handler really takes that lock is pinned separately below.
+    """
+    community_id, owner_id = await _community(sm)
+    member = await _member(sm, community_id, "member@x.com")
+    ends_at = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    async with sm() as lister:
+        await lister.execute(
+            text("SELECT 1 FROM communities WHERE id = :c FOR SHARE"), {"c": community_id}
+        )
+        auction_id = await lister.scalar(
+            text(
+                "INSERT INTO auctions (title, seller_id, community_id, starting_bid, currency,"
+                " bid_count, status, starts_at, ends_at, hard_ends_at, event_seq,"
+                " created_at, updated_at)"
+                " VALUES ('t', :uid, :c, 10.00, 'IDR', 0, 'open', now(), :ends, :hard, 0,"
+                " now(), now()) RETURNING id"
+            ),
+            {"uid": owner_id, "c": community_id, "ends": ends_at, "hard": ends_at},
+        )
+
+        async def remove():
+            async with sm() as s:
+                return await remove_all_members(s, community_id, owner_id=owner_id)
+
+        removal = asyncio.create_task(remove())
+        # Long enough to reach the lock and block on it. Were it not blocking it would
+        # have finished by now, which is what this reads.
+        await asyncio.sleep(0.2)
+        assert not removal.done(), "remove-all did not wait for the listing's lock"
+
+        await lister.commit()
+
+    assert await removal is None, "remove-all bumped past an auction it could not see"
+
+    async with sm() as s:
+        assert (
+            await s.scalar(
+                text("SELECT membership_generation FROM communities WHERE id = :c"),
+                {"c": community_id},
+            )
+            == 0
+        )
+    # And the member is still a member, so the lot that just opened is biddable.
+    async with sm() as s:
+        assert await place_bid_tx(s, auction_id, member, Decimal("10.00")) is not None
+
+
+def test_listing_into_a_community_takes_the_row_lock():
+    """What makes the test above about this code rather than about Postgres.
+
+    A lock only helps where both sides take it. remove_all_members takes the community row
+    FOR UPDATE; create_auction has to take the same row, and FOR SHARE rather than FOR
+    UPDATE so two sellers listing at once do not queue behind each other — they only queue
+    behind a remove-all. There is no way to observe it behaviourally without splitting the
+    handler's commit, so it is read off the statement.
+    """
+    assert "FOR SHARE" in str(_MAY_LIST_SQL)
+    assert "FOR UPDATE" in str(_LOCK_COMMUNITY_SQL)
+
+
+async def test_remove_all_and_create_auction_agree_whichever_lands_first(sm):
+    """The race as well, asserted as a consistency property. Whichever order the scheduler
+    picks, a listing that got in must have been listed after the bump or else the bump
+    must not have happened — never a lot opened before a bump that went through anyway.
+    """
+    community_id, owner_id = await _community(sm)
+    await _member(sm, community_id, "member@x.com")
+    ends_at = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    async def remove():
+        async with sm() as s:
+            return await remove_all_members(s, community_id, owner_id=owner_id)
+
+    async def create():
+        async with sm() as s:
+            owner = await s.get(User, owner_id)
+            try:
+                return await create_auction.fn(
+                    data=CreateAuctionRequest(
+                        title="t",
+                        starting_bid=Decimal("10.00"),
+                        ends_at=ends_at,
+                        community_id=community_id,
+                    ),
+                    current_user=owner,
+                    db_session=s,
+                )
+            except HTTPException:
+                return None
+
+    removed, created = await asyncio.gather(remove(), create())
+
+    async with sm() as s:
+        row = (
+            await s.execute(
+                text(
+                    "SELECT c.membership_generation AS generation, c.updated_at AS bumped,"
+                    " (SELECT min(a.created_at) FROM auctions a"
+                    "   WHERE a.community_id = c.id) AS listed"
+                    " FROM communities c WHERE c.id = :c"
+                ),
+                {"c": community_id},
+            )
+        ).one()
+
+    assert (removed is None) != (row.generation == 1)
+    if created is not None and row.generation == 1:
+        # The forbidden state is a lot that was already open when the bump landed.
+        assert row.listed >= row.bumped
+
+
+async def test_a_stranger_cannot_list_an_auction_into_a_community(sm):
+    """Not a criterion, and not optional: without it any verified seller could plant a lot
+    inside somebody else's community by guessing an id, and its members would be gated
+    into bidding on a stranger's auction."""
+    community_id, _ = await _community(sm)
+    async with sm() as s:
+        outsider = User(email="outsider@x.com", pw_hash="x", verified_at=datetime.now(timezone.utc))
+        s.add(outsider)
+        await s.commit()
+
+    with pytest.raises(PermissionDeniedException):
+        async with sm() as s:
+            await create_auction.fn(
+                data=CreateAuctionRequest(
+                    title="t",
+                    starting_bid=Decimal("10.00"),
+                    ends_at=datetime.now(timezone.utc) + timedelta(hours=1),
+                    community_id=community_id,
+                ),
+                current_user=outsider,
+                db_session=s,
+            )
+
+
+async def test_a_member_can_list_an_auction_into_their_community(sm):
+    """The control, and the shape a community actually runs on: members list, members
+    bid."""
+    community_id, _ = await _community(sm)
+    async with sm() as s:
+        seller = User(email="seller@x.com", pw_hash="x", verified_at=datetime.now(timezone.utc))
+        s.add(seller)
+        await s.flush()
+        s.add(CommunityMembership(community_id=community_id, user_id=seller.id, generation=0))
+        await s.commit()
+        seller_id = seller.id
+
+    async with sm() as s:
+        seller = await s.get(User, seller_id)
+        created = await create_auction.fn(
+            data=CreateAuctionRequest(
+                title="t",
+                starting_bid=Decimal("10.00"),
+                ends_at=datetime.now(timezone.utc) + timedelta(hours=1),
+                community_id=community_id,
+            ),
+            current_user=seller,
+            db_session=s,
+        )
+    async with sm() as s:
+        assert (
+            await s.scalar(
+                text("SELECT community_id FROM auctions WHERE id = :id"), {"id": created.id}
+            )
+            == community_id
+        )
+
+
 async def test_publishing_an_auction_starts_it_then(sm):
     """starts_at is what a kick is measured against, so it has to be the moment the lot
     was announced rather than the moment its draft was first saved.
@@ -321,3 +572,48 @@ async def test_publishing_an_auction_starts_it_then(sm):
             {"a": draft, "u": member},
         )
     assert started_after_the_kick is True
+
+
+async def test_remove_all_is_refused_while_a_draft_is_waiting(sm):
+    """A draft counts as an auction still open, because nothing stops its seller
+    publishing it a second after the bump and publish takes no community lock.
+
+    Without this the generation moves out from under a lot that is about to open: it
+    opens, every membership is a generation behind, and nobody may bid on it — which is
+    exactly the state remove_all_members exists to prevent.
+    """
+    community_id, owner_id = await _community(sm)
+    member = await _member(sm, community_id, "member@x.com")
+    draft = await _auction(sm, owner_id, community_id)
+    async with sm() as s:
+        await s.execute(text("UPDATE auctions SET status = 'draft' WHERE id = :id"), {"id": draft})
+        await s.commit()
+
+    async with sm() as s:
+        assert await remove_all_members(s, community_id, owner_id=owner_id) is None
+
+    # Published after the refusal, it is biddable by the member who was there all along.
+    async with sm() as s:
+        row = await transition(s, draft, "open", seller_id=owner_id)
+    assert row is not None
+    async with sm() as s:
+        assert await place_bid_tx(s, draft, member, Decimal("10.00")) is not None
+
+
+async def test_a_cancelled_or_closed_auction_does_not_block_remove_all(sm):
+    """The control. Neither can take a bid again, so neither is somebody's commitment to
+    strand — and a guard that counted them would make remove-all impossible for any
+    community that had ever run an auction."""
+    community_id, owner_id = await _community(sm)
+    await _member(sm, community_id, "member@x.com")
+    for status in ("cancelled", "closed"):
+        auction_id = await _auction(sm, owner_id, community_id)
+        async with sm() as s:
+            await s.execute(
+                text("UPDATE auctions SET status = :s WHERE id = :id"),
+                {"s": status, "id": auction_id},
+            )
+            await s.commit()
+
+    async with sm() as s:
+        assert await remove_all_members(s, community_id, owner_id=owner_id) == 1

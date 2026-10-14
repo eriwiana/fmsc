@@ -27,6 +27,7 @@ class CreateAuctionRequest(msgspec.Struct):
     currency: str = "IDR"  # ISO 4217; normalised and checked in create_auction
     status: str = "open"  # "draft" to keep it unannounced; nothing else is accepted
     reserve: Decimal | None = None  # the seller's floor, never echoed to a bidder
+    community_id: int | None = None  # None is a public auction; set it and bidding is gated
 
 
 class EditAuctionRequest(msgspec.Struct):

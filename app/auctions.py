@@ -241,6 +241,24 @@ def _channel(auction_id: int) -> str:
     return f"auction:{auction_id}"
 
 
+# Who may open an auction inside a community: its owner, or a member of the current
+# generation whose membership has not been revoked. FOR SHARE takes the community row
+# alongside the answer, which is what serialises this against a remove-all.
+_MAY_LIST_SQL = text("""
+    SELECT 1
+      FROM communities c
+     WHERE c.id = :community_id
+       AND (c.owner_id = :uid
+            OR EXISTS (SELECT 1
+                         FROM community_memberships m
+                        WHERE m.community_id = c.id
+                          AND m.user_id = :uid
+                          AND m.generation = c.membership_generation
+                          AND m.revoked_at IS NULL))
+       FOR SHARE
+    """)
+
+
 @post("/auctions", dependencies=_authed)
 async def create_auction(
     data: CreateAuctionRequest, current_user: User, db_session: AsyncSession
@@ -272,8 +290,25 @@ async def create_auction(
     # asking for a state the machine reaches by an edge, not by a POST.
     if data.status not in ("open", "draft"):
         raise ClientException("status must be open or draft")
+    community_id = data.community_id
+    if community_id is not None:
+        # FOR SHARE on the community, before the insert. remove_all_members takes the same
+        # row FOR UPDATE, so the two serialise and a bump cannot land between this check
+        # and the row arriving — a lock only helps where both sides take it.
+        #
+        # The same statement answers who may list here. Without it any verified seller
+        # could plant a lot inside somebody else's community by guessing an id, and its
+        # members would be gated into bidding on a stranger's auction.
+        allowed = (
+            await db_session.execute(
+                _MAY_LIST_SQL, {"community_id": community_id, "uid": current_user.id}
+            )
+        ).first()
+        if allowed is None:
+            raise PermissionDeniedException("only a member of that community can list in it")
     auction = Auction(
         title=data.title,
+        community_id=community_id,
         seller_id=current_user.id,
         starting_bid=data.starting_bid,
         currency=currency,
