@@ -117,9 +117,17 @@ STATUSES = tuple(LEGAL_FROM)
 # have any. The deadline is only consulted for a publish, because a draft sat on past its
 # own ends_at would open and then be closed by the very next closer tick — an auction that
 # was never biddable, announced to everyone watching.
+#
+# A publish also sets starts_at, because an auction starts when it is announced and not
+# when its draft was first saved. The community bid guard compares a kick against
+# starts_at, so leaving it at insert time means somebody kicked on Tuesday may still bid on
+# a lot drafted Monday and published Wednesday — the kick would reach backwards past its
+# own date.
 _TRANSITION_SQL = text("""
     UPDATE auctions
-       SET status = :to, event_seq = event_seq + 1
+       SET status = :to,
+           event_seq = event_seq + 1,
+           starts_at = CASE WHEN :to = 'open' THEN clock_timestamp() ELSE starts_at END
      WHERE id = :id
        AND seller_id = :seller_id
        AND status = ANY(CAST(:from_states AS varchar[]))
@@ -490,6 +498,12 @@ async def cancel_auction(
 # community_id IS NULL first, so a public auction is not a special case and costs no
 # subquery. Viewing is public either way — only bidding is gated.
 #
+# The revoked_at arm is compared against the auction's start, not against now(): a kick
+# takes effect only for auctions opened after it. Bidding on a lot somebody was entitled
+# to bid on when it opened is a commitment the seller has already relied on, and letting a
+# moderator cancel it afterwards makes a kick a way to undo other people's bids. The
+# auction they were kicked out of goes on; the next one is closed to them.
+#
 # The increment rides in the same WHERE for the same reason as the reserve, and it only
 # applies once there is a leader: an opening bid has nothing to beat, so it may still equal
 # starting_bid.
@@ -519,7 +533,8 @@ _BID_SQL = text(
                   JOIN communities c ON c.id = m.community_id
                  WHERE m.community_id = auctions.community_id
                    AND m.user_id = :uid
-                   AND m.generation = c.membership_generation))
+                   AND m.generation = c.membership_generation
+                   AND (m.revoked_at IS NULL OR auctions.starts_at < m.revoked_at)))
        AND (current_bid IS NULL OR :amount >= current_bid + """
     + _increment_case("current_bid")
     + """)
