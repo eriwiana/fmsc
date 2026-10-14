@@ -109,6 +109,33 @@ def _expire_tickets() -> None:
     asyncio.run(run())
 
 
+def _verify(email: str) -> None:
+    """Mark an address as verified, the way an operator does today.
+
+    No mail is sent yet, so nothing in the application sets verified_at; this is the
+    out-of-band UPDATE the migration describes. A seller has to be verified, so every
+    test that opens an auction goes through here.
+    """
+
+    async def run():
+        engine = create_async_engine(PG_URL, poolclass=NullPool)
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE users SET verified_at = clock_timestamp() WHERE email = :e"),
+                {"e": email},
+            )
+        await engine.dispose()
+
+    asyncio.run(run())
+
+
+def _seller(client: TestClient, email: str) -> str:
+    """Signup plus verification: what a seller needs before they can list anything."""
+    token = _signup(client, email)
+    _verify(email)
+    return token
+
+
 def _open_auction(client: TestClient, seller_token: str) -> int:
     response = client.post(
         "/auctions",
@@ -152,7 +179,7 @@ def test_an_open_socket_holds_no_database_connection(client, clean_db):
     the session is held for all of it unless the handler lets go. Postgres allows 100
     connections by default, so 500 watchers on one auction — which is what M5 is for —
     would run out long before reaching 500."""
-    seller = _signup(client, "seller@x.com")
+    seller = _seller(client, "seller@x.com")
     auction_id = _open_auction(client, seller)
     before = _held_in_transaction()
 
@@ -176,7 +203,7 @@ def test_a_socket_receives_a_snapshot_before_any_event(client, clean_db):
     """M5 criterion 1. A client joining mid-auction currently gets nothing until the next
     bid, so it cannot render a price at all. The snapshot has to arrive before live events
     and has to agree with what the HTTP endpoint would have said."""
-    seller = _signup(client, "seller@x.com")
+    seller = _seller(client, "seller@x.com")
     watcher = _signup(client, "watcher@x.com")
     bidder = _signup(client, "bidder@x.com")
     auction_id = _open_auction(client, seller)
@@ -202,7 +229,7 @@ def test_a_socket_receives_a_snapshot_before_any_event(client, clean_db):
 
 
 def test_a_watcher_receives_a_bid_over_a_real_socket(client, clean_db):
-    seller = _signup(client, "seller@x.com")
+    seller = _seller(client, "seller@x.com")
     watcher = _signup(client, "watcher@x.com")
     bidder = _signup(client, "bidder@x.com")
 
@@ -238,7 +265,7 @@ def test_a_rejected_bid_answers_400_with_the_reason(client, clean_db):
     outbid, too low, closed, self-bid, all of them. No unit test could see it: the fixture
     session and the request session expire alike, but only a real request shows the status
     code the bidder is actually handed."""
-    seller = _signup(client, "seller@x.com")
+    seller = _seller(client, "seller@x.com")
     bidder = _signup(client, "bidder@x.com")
     auction_id = _open_auction(client, seller)
     rejected = client.post(
@@ -255,7 +282,7 @@ def test_a_retried_bid_replays_the_original_response(client, clean_db):
     """M4 criterion 1. A client whose connection drops after the bid landed retries it.
     The second request must not place a second bid, and must hand back what the first one
     returned rather than a 400 saying the bidder has been outbid by themselves."""
-    seller = _signup(client, "seller@x.com")
+    seller = _seller(client, "seller@x.com")
     bidder = _signup(client, "bidder@x.com")
     auction_id = _open_auction(client, seller)
     headers = {"Authorization": f"Bearer {bidder}", "Idempotency-Key": "retry-me"}
@@ -291,7 +318,7 @@ def test_a_socket_that_fell_behind_is_dropped(client, clean_db):
     reaction to a hole in the numbering is the behaviour under test, and a real overflow
     produces exactly the same hole.
     """
-    seller = _signup(client, "seller@x.com")
+    seller = _seller(client, "seller@x.com")
     watcher = _signup(client, "watcher@x.com")
     auction_id = _open_auction(client, seller)
 
@@ -312,7 +339,7 @@ def test_a_socket_that_fell_behind_is_dropped(client, clean_db):
 def test_a_relayed_duplicate_is_not_sent_twice(client, clean_db):
     """The outbox delivers at-least-once, so a socket must drop an event it has already
     seen rather than show the same bid twice."""
-    seller = _signup(client, "seller@x.com")
+    seller = _seller(client, "seller@x.com")
     watcher = _signup(client, "watcher@x.com")
     bidder = _signup(client, "bidder@x.com")
     auction_id = _open_auction(client, seller)
@@ -352,7 +379,7 @@ def test_a_session_token_no_longer_opens_a_socket(client, clean_db):
     """M5 criterion 5. The old form has to stop working, not merely be discouraged: a
     token that still authenticates is a token that still leaks through access logs and
     browser history, and it is the long-lived one."""
-    seller = _signup(client, "seller@x.com")
+    seller = _seller(client, "seller@x.com")
     auction_id = _open_auction(client, seller)
     with (
         client.websocket_connect(f"/ws/auctions/{auction_id}?token={seller}") as socket,
@@ -364,7 +391,7 @@ def test_a_session_token_no_longer_opens_a_socket(client, clean_db):
 
 def test_a_ticket_works_once(client, clean_db):
     """Single use, so a ticket captured from a log or a Referer header is already spent."""
-    seller = _signup(client, "seller@x.com")
+    seller = _seller(client, "seller@x.com")
     watcher = _signup(client, "watcher@x.com")
     auction_id = _open_auction(client, seller)
     url = f"/ws/auctions/{auction_id}?ticket={_ticket(client, watcher)}"
@@ -383,7 +410,7 @@ def test_a_ticket_works_once(client, clean_db):
 def test_an_expired_ticket_is_rejected(client, clean_db):
     """Short-lived is the point. Without the expiry check a ticket is just a second
     long-lived credential with a different name."""
-    seller = _signup(client, "seller@x.com")
+    seller = _seller(client, "seller@x.com")
     watcher = _signup(client, "watcher@x.com")
     auction_id = _open_auction(client, seller)
     ticket = _ticket(client, watcher)

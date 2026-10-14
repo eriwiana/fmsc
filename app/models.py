@@ -36,6 +36,11 @@ class User(BigIntAuditBase):
     __tablename__ = "users"
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     pw_hash: Mapped[str] = mapped_column(String(255))
+    # NULL until the address has been proved to belong to whoever signed up. Nothing in
+    # this milestone sets it: no mail is sent yet, so it is set out of band until the
+    # verification flow lands. An auction is a promise to deliver something, and a seller
+    # nobody can reach is how a fake listing happens.
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Session(BigIntBase):

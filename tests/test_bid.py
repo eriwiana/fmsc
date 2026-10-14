@@ -13,7 +13,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
-from litestar.exceptions import ClientException, HTTPException
+from litestar.exceptions import ClientException, HTTPException, PermissionDeniedException
 from sqlalchemy import event, text
 from sqlalchemy.exc import IntegrityError
 
@@ -29,8 +29,12 @@ from app.auctions import (
     reject_reason,
     resolve_deadline,
 )
+from app.auth import signup, user_for_token
 from app.models import Auction, User
-from app.schemas import BidRequest, CreateAuctionRequest
+from app.schemas import BidRequest, CreateAuctionRequest, SignupRequest
+
+# Long enough for the signup handler's own length floor, which this file is not about.
+PASSWORD = "correct horse battery staple"
 
 
 async def _seed(
@@ -88,7 +92,7 @@ async def test_created_auction_records_its_extension_ceiling(sm):
     """create_auction is the only place hard_ends_at is ever set, and nothing downstream
     can repair a wrong ceiling: it is what stops an auction extending forever."""
     async with sm() as s:
-        seller = User(email="seller@x.com", pw_hash="x")
+        seller = User(email="seller@x.com", pw_hash="x", verified_at=datetime.now(timezone.utc))
         s.add(seller)
         await s.commit()
     ends_at = datetime.now(timezone.utc) + timedelta(hours=1)
@@ -101,6 +105,52 @@ async def test_created_auction_records_its_extension_ceiling(sm):
     # The literal 2h, not MAX_EXTENSION: comparing the constant with itself passes for any
     # value, so a ceiling quietly widened to 48h would go unnoticed.
     assert created.hard_ends_at - created.ends_at == timedelta(hours=2)
+
+
+async def test_an_unverified_seller_cannot_create_an_auction(sm):
+    """Criterion 4 of M7, which says signup then create. The account comes from the real
+    signup handler on purpose: building a `User(...)` here would assert the check works on
+    a NULL verified_at without ever proving signup leaves it NULL, and signup handing out
+    a verified account would pass every test in the suite while letting anyone sell.
+
+    An auction is a promise to deliver something, and the seller is who a buyer has to be
+    able to reach; an unreachable seller is how a fake listing happens.
+    """
+    async with sm() as s:
+        token = (
+            await signup.fn(
+                data=SignupRequest(email="unverified@x.com", password=PASSWORD), db_session=s
+            )
+        ).token
+    async with sm() as s:
+        seller = await user_for_token(s, token)
+        assert seller.verified_at is None
+    with pytest.raises(PermissionDeniedException):
+        async with sm() as s:
+            await create_auction.fn(
+                data=CreateAuctionRequest(
+                    title="t",
+                    starting_bid=Decimal("10.00"),
+                    ends_at=datetime.now(timezone.utc) + timedelta(hours=1),
+                ),
+                current_user=seller,
+                db_session=s,
+            )
+    async with sm() as s:
+        assert await s.scalar(text("SELECT count(*) FROM auctions")) == 0
+
+
+async def test_an_unverified_account_may_still_bid(sm):
+    """Deliberate, not an oversight: the money only moves at settlement, so that is where
+    to ask again. Refusing bids too would have the unverified half of the market unable to
+    take part at all, and criterion 4 is about selling."""
+    _, bidder, aid = await _seed(sm)
+    async with sm() as s:
+        assert await s.scalar(
+            text("SELECT verified_at IS NULL FROM users WHERE id = :id"), {"id": bidder}
+        )
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder, Decimal("10.00")) is not None
 
 
 async def test_opening_bid_may_equal_starting_bid(sm):

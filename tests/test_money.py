@@ -89,9 +89,13 @@ async def _seed_auction_and_bid(maker, amount: Decimal = SEEDED, currency: str =
 
 
 async def _user(maker, email: str) -> User:
-    """`expire_on_commit=False` on the fixture, so `.id` survives the commit."""
+    """`expire_on_commit=False` on the fixture, so `.id` survives the commit.
+
+    Verified, because two of these tests create an auction and an unverified account
+    cannot sell.
+    """
     async with maker() as s:
-        user = User(email=email, pw_hash="x")
+        user = User(email=email, pw_hash="x", verified_at=datetime.now(timezone.utc))
         s.add(user)
         await s.commit()
         return user
