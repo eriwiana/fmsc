@@ -10,6 +10,12 @@ dependencies = [
     "advanced-alchemy",
     "asyncpg",
     "uvicorn",
+    # Ed25519, for Discord's interaction signatures. Not optional the way redis is: Discord
+    # refuses to register an interactions endpoint that does not verify them — it sends
+    # deliberately bad signatures during validation and expects a 401 — so the slash
+    # command does not work without it, and hand-rolling the curve arithmetic to save a
+    # dependency is not a trade anybody should take.
+    "pynacl>=1.6.2",
 ]
 
 [project.optional-dependencies]
@@ -84,8 +90,16 @@ exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:"]
 # gap in the tests, so do not go looking for one.
 #
 # What remains genuinely uncovered is the idempotency key's lost race, which needs two
-# writers inside one transaction, one unreachable return in the socket handler, and four
-# of app/auth.py's own error paths. Ratchet up as tests land, never down.
+# writers inside one transaction, one unreachable return in the socket handler, four of
+# app/auth.py's own error paths, and two re-raises kept so the next constraint added to a
+# table is not swallowed and reported as a refusal.
+#
+# One more that is traced rather than untested: the handler behind link_discord's
+# uq_community_discord_guild_id refusal is reported uncovered although
+# test_a_guild_cannot_be_linked_to_two_communities drives it and a hand-run against the
+# database answered the 409. Treat it as the portal-thread case above, not as a gap.
+#
+# Ratchet up as tests land, never down.
 fail_under = 97
 
 [build-system]
