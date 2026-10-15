@@ -45,7 +45,12 @@ Jakarta wall time, responses render `+07:00`. Process runs with `TZ=Asia/Jakarta
   `{code}` **once**. **409** if a live code already exists, **400** for `max_uses` under 1,
   an over-long `label`, or an `expires_at` already past (a naive value is read as
   **Asia/Jakarta**, like every other datetime in the API)
-- `POST /communities/{id}/codes/rotate` (auth, owner) — same body, replaces the live code
+- `POST /communities/{id}/codes/rotate` (auth, owner) — same body, replaces the live code.
+  Both minting routes also answer `broadcast`, which says whether the community's Discord
+  channel was told
+- `POST /communities/{id}/discord` (auth, owner) — `{guild_id, channel_id}`; attaches a
+  guild channel, or moves the posts to another one. **409** if the guild already speaks for
+  another community, **400** for anything that is not a 17-to-20-digit snowflake
 - `POST /communities/codes/redeem` (auth) — `{code}` → `{community_id, generation}`.
   **404** with one fixed sentence for every refusal, **429** with `Retry-After` once the
   attempt limit is spent
@@ -53,6 +58,8 @@ Jakarta wall time, responses render `+07:00`. Process runs with `TZ=Asia/Jakarta
   revoked
 - `POST /communities/{id}/members/remove-all` (auth, owner) → `{membership_generation}`.
   **409** while the community has an auction open
+- `POST /discord/interactions` — Discord's own, authenticated by its Ed25519 signature
+  rather than by a session. **401** on a bad or missing signature
 - `GET /health`, `GET /schema` (OpenAPI/Swagger UI)
 
 Auth is `Authorization: Bearer <token>`. The WebSocket takes a **ticket** instead, not the
@@ -417,6 +424,74 @@ not a `kind` column on `login_attempts`, so guessing codes at somebody cannot lo
 of signing in. A 65-bit code does not fall to guessing; the limit is about the cost and the
 noise of somebody trying.
 
+## Discord
+A client, not a second way to bid. The bot posts what happened and a link back; the money
+path stays where it is.
+
+**One community, one channel.** The owner attaches a guild channel over
+`POST /communities/{id}/discord`, because that is the only place owning a community can be
+proved. Unique both ways: one channel per community, or an event arrives in it twice; one
+community per guild, or a slash command run there has no single community to answer for.
+Snowflakes are stored as the strings Discord sends — they are 64-bit unsigned, which no
+signed `BIGINT` holds all of, and nothing here does arithmetic on one.
+
+**Events ride the outbox.** The poster is a second reader of the queue the money path
+already fills, so what a channel is told cannot disagree with what the sockets were told,
+and no statement on the bid path changed to add it. `outbox.discord_at` is its own column
+rather than a share of `sent_at`: whichever reader got there first would otherwise retire
+the row for both. An event for an auction no guild follows is retired with nothing posted,
+and one this version does not recognise is skipped rather than raised — during a rolling
+deploy the queue can hold a payload written by later code, and a tick that died on one
+would stop closing auctions. `prune_outbox` now waits for both readers.
+
+Delivery to Discord is **best effort**: a 429 is honoured once, a refusal is logged, and
+nothing is retried forever behind a deleted channel. What is durable is the obligation
+rather than the delivery — the outbox row commits with the bid, so a crash before posting
+retries. Every post suppresses mentions, which is not cosmetic: the content carries an
+auction title, and a lot called `@everyone` would otherwise notify a whole guild on
+command. Times go out as Discord's timestamp markup, which each viewer reads in their own
+timezone rather than in Jakarta's.
+
+**Slash commands.** `/fmsc invite` posts the community's code if it has none; `/fmsc rotate`
+replaces it and posts the new one. Discord POSTs the interaction to
+`/discord/interactions` and the reply *is* the channel message, which is how it fits inside
+Discord's three-second budget with no outbound call and nothing to rate-limit. Every
+refusal is ephemeral instead. Register the commands once with
+`scripts/register_commands.py`.
+
+The signature check is the only authentication on that route, so it runs first and answers
+**401**. It verifies Ed25519 over the timestamp followed by the exact bytes received, never
+a re-encoding of the parsed payload. Discord enforces it too: it sends deliberately bad
+signatures while validating an endpoint and refuses to register one that answers anything
+else.
+
+What authorises a mint is **MANAGE_GUILD** in the linked guild, because the invoker is a
+Discord account with no fmsc user behind it; the mint then runs as the community's owner.
+That is a real delegation, and the owner made it when they linked the channel — the same
+trade Discord's own invite permissions make. A code posted to a channel is good for 25 uses
+and a week.
+
+**Rotation now has a broadcast path**, which is the gap M9 shipped with: rotation ends every
+membership's way back in at once, and the members holding the old code have to hear the new
+one somewhere. It is posted inline, because the owner is holding the code as they read the
+response — so a failure is something they can act on, and `broadcast` in the response says
+which happened. The log carries the row's `code_id` and never the code: there is no second
+copy of a code anywhere, so a log line holding one hands out memberships to whoever can
+read the log.
+
+**Configuration**, all optional — unset means the feature is off and the app still starts,
+unlike `FMSC_CODE_PEPPER`:
+
+| Variable | What it is |
+|---|---|
+| `DISCORD_BOT_TOKEN` | Posts messages. Without it nothing is sent and the drop is logged |
+| `DISCORD_PUBLIC_KEY` | The application's Ed25519 key. Without it every interaction is a 401 |
+| `DISCORD_APPLICATION_ID` | Only `scripts/register_commands.py` reads it |
+| `FMSC_BASE_URL` | Where the link in a post points. Defaults to `http://localhost:8000` |
+
+The interactions endpoint URL goes into the developer portal last: Discord validates it with
+a signed request, so the deployment has to be reachable first.
+
 ## Anti-snipe
 A bid inside the last **60s** (`SNIPE_WINDOW`) moves the deadline to 60s from the moment it
 lands, so a bid placed too late to be answered cannot win on timing alone. `hard_ends_at`,
@@ -509,6 +584,11 @@ Add a Postgres plugin (injects `DATABASE_URL`). Railway builds the `Dockerfile`,
 from `uv.lock` so production runs the versions CI tested. The image migrates then serves;
 healthcheck is `/health`.
 
+`FMSC_CODE_PEPPER` has to be set, to at least 32 characters, or the app refuses to start —
+see [Invite codes](#invite-codes) for why a default or a per-boot value would be worse than
+refusing. `CHANNELS_URL`, `FMSC_BASE_URL` and the three `DISCORD_*` variables are optional;
+what each one switches on is in [Scaling out](#scaling-out) and [Discord](#discord).
+
 Build and run it locally exactly as Railway does:
 
 ```bash
@@ -535,9 +615,10 @@ an answer for what to do when it is down.
 
 Then settlement and payments.
 
-**Remove-all has no broadcast path until M10.** Everyone must redeem the new code again,
-and nothing tells them to — so between these two milestones the new code reaches members
-out of band. Named rather than papered over, the same way `verified_at` was.
+Account linking and DM notifications. A Discord account is tied to no fmsc user anywhere,
+which is why a slash command is authorised by a guild permission rather than by who ran it,
+and why nothing can be sent to one person. Both need an OAuth round trip and a table, and
+neither is load-bearing for anything M10 promised.
 
 Communities have no read endpoints: nothing lists a community, its members or its codes,
 and nothing exposes a user's own id, which is why the kick route takes one from the caller.
