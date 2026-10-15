@@ -20,7 +20,7 @@ from decimal import Decimal
 import httpx
 import msgspec
 import pytest
-from litestar.exceptions import ClientException, HTTPException
+from litestar.exceptions import ClientException, HTTPException, NotAuthorizedException
 from nacl.signing import SigningKey
 from sqlalchemy import text
 
@@ -33,8 +33,8 @@ from app.auctions import (
     prune_outbox,
 )
 from app.codes import normalise
-from app.communities import issue, link_discord, rotate
-from app.discord import MANAGE_GUILD, interactions, post_pending
+from app.communities import interactions, issue, link_discord, rotate
+from app.discord import MANAGE_GUILD, post_pending
 from app.models import Community, CommunityMembership, User
 from app.schemas import CreateAuctionRequest, DiscordLinkRequest, IssueCodeRequest
 
@@ -97,13 +97,13 @@ class Interaction:
         return self._raw
 
 
-def invite(permissions: int = MANAGE_GUILD, guild_id: str = GUILD) -> dict:
-    """The payload Discord POSTs for `/fmsc invite`."""
+def command(sub: str = "invite", permissions: int = MANAGE_GUILD, guild_id: str = GUILD) -> dict:
+    """The payload Discord POSTs for `/fmsc <sub>`."""
     return {
         "type": 2,
         "guild_id": guild_id,
         "member": {"permissions": str(permissions)},
-        "data": {"name": "fmsc", "options": [{"name": "invite", "type": 1}]},
+        "data": {"name": "fmsc", "options": [{"name": sub, "type": 1}]},
     }
 
 
@@ -194,7 +194,7 @@ async def test_a_slash_command_posts_a_code_to_the_guild_and_logs_only_its_id(sm
 
     with caplog.at_level(logging.INFO):
         async with sm() as s:
-            reply = await interactions.fn(request=Interaction(signer, invite()), db_session=s)
+            reply = await interactions.fn(request=Interaction(signer, command()), db_session=s)
 
     posted = CODE_IN_A_MESSAGE.search(reply["data"]["content"])
     assert posted is not None, reply
@@ -601,3 +601,164 @@ async def test_the_broadcast_says_the_old_code_has_stopped_working(sm, fake):
     await _rotate(sm, community_id, owner_id, fake)
 
     assert "stopped working" in fake.posts[-1][1]
+
+
+async def _interact(maker, request) -> dict:
+    async with maker() as s:
+        return await interactions.fn(request=request, db_session=s)
+
+
+async def _code_rows(maker) -> list:
+    async with maker() as s:
+        return (
+            await s.execute(
+                text("SELECT id, invalidated_at IS NULL AS live FROM community_codes ORDER BY id")
+            )
+        ).all()
+
+
+async def test_an_interaction_with_no_signature_is_refused(sm, signer):
+    """The endpoint is public, unauthenticated by anything else, and mints invite codes.
+
+    Discord checks this itself: while validating an interactions URL it sends deliberately
+    bad signatures and refuses to register an endpoint that answers anything but 401.
+    """
+    await _linked(sm)
+    request = Interaction(signer, command())
+    request.headers = {}
+
+    with pytest.raises(NotAuthorizedException):
+        await _interact(sm, request)
+    assert await _code_rows(sm) == []
+
+
+async def test_a_body_that_changed_after_it_was_signed_is_refused(sm, signer):
+    """The signature covers the exact bytes received. A payload swapped underneath a valid
+    header is the attack the check exists for — raising the permissions field would
+    otherwise be free."""
+    await _linked(sm)
+    tampered = Interaction(signer, command(permissions=0))
+    tampered.headers = Interaction(signer, command()).headers
+
+    with pytest.raises(NotAuthorizedException):
+        await _interact(sm, tampered)
+
+
+async def test_a_signature_that_is_not_hex_is_refused_rather_than_raising(sm, signer):
+    """bytes.fromhex raises ValueError, which unhandled is a 500 — and a 500 is
+    distinguishable from a refusal."""
+    await _linked(sm)
+    request = Interaction(signer, command())
+    request.headers["X-Signature-Ed25519"] = "not-hex"
+
+    with pytest.raises(NotAuthorizedException):
+        await _interact(sm, request)
+
+
+async def test_a_signature_from_another_key_is_refused(sm, signer):
+    """The control for the three above: a correctly shaped signature over the right bytes,
+    made by somebody who is not Discord."""
+    await _linked(sm)
+    request = Interaction(SigningKey(b"a-different-thirty-two-byte-seed"), command())
+
+    with pytest.raises(NotAuthorizedException):
+        await _interact(sm, request)
+
+
+async def test_a_ping_is_answered_with_a_pong(sm, signer):
+    """What Discord sends to validate the URL, and its health check afterwards."""
+    assert await _interact(sm, Interaction(signer, {"type": 1})) == {"type": 1}
+
+
+async def test_an_interaction_that_is_not_a_command_is_answered_not_dropped(sm, signer):
+    """A button or a select arriving here means a version mismatch, not an attack."""
+    reply = await _interact(sm, Interaction(signer, {"type": 3}))
+
+    assert reply["data"]["flags"] == 64
+
+
+def test_the_permission_a_mint_needs_is_manage_guild():
+    """Pinned to the literal. Every test below passes `MANAGE_GUILD` itself, so comparing
+    the constant with itself would pass for any value — including a bit every member of a
+    guild is given."""
+    assert MANAGE_GUILD == 0x20
+
+
+async def test_a_member_with_other_permissions_cannot_mint(sm, signer):
+    """A literal bitfield, not the constant: this is the one that notices if the mask ever
+    becomes something most members hold. 0x800 is SEND_MESSAGES."""
+    await _linked(sm)
+
+    reply = await _interact(sm, Interaction(signer, command(permissions=0x800)))
+
+    assert "manage this guild" in reply["data"]["content"]
+    assert await _code_rows(sm) == []
+
+
+async def test_somebody_without_manage_guild_cannot_mint(sm, signer):
+    """What authorises the mint is a Discord permission, because the invoker has no fmsc
+    account behind them. Without it, every member of the guild could issue the community's
+    codes."""
+    await _linked(sm)
+
+    reply = await _interact(sm, Interaction(signer, command(permissions=0)))
+
+    assert "manage this guild" in reply["data"]["content"]
+    # Ephemeral: a guild does not need to watch somebody be told no.
+    assert reply["data"]["flags"] == 64
+    assert await _code_rows(sm) == []
+
+
+async def test_a_permissions_field_that_is_not_a_number_cannot_mint(sm, signer):
+    """int() on it would be a 500, and a 500 on this route is a 500 that mints nothing but
+    looks like a bug in fmsc rather than a refusal."""
+    payload = command()
+    payload["member"]["permissions"] = "all of them"
+
+    reply = await _interact(sm, Interaction(signer, payload))
+
+    assert "manage this guild" in reply["data"]["content"]
+
+
+async def test_an_unlinked_guild_is_told_where_the_link_is_made(sm, signer):
+    """Ownership of a community cannot be proved from inside Discord, which is the whole
+    reason the link is made on the web side."""
+    reply = await _interact(sm, Interaction(signer, command(guild_id="222222222222222222")))
+
+    assert "not linked" in reply["data"]["content"]
+    assert reply["data"]["flags"] == 64
+
+
+async def test_an_unknown_subcommand_names_the_two_that_exist(sm, signer):
+    await _linked(sm)
+
+    reply = await _interact(sm, Interaction(signer, command(sub="burn-it-down")))
+
+    assert "/fmsc invite" in reply["data"]["content"]
+    assert await _code_rows(sm) == []
+
+
+async def test_invite_refuses_a_second_code_and_names_rotate(sm, signer):
+    """The same refusal as the web route's, for the same reason: an owner who has already
+    shared a code should not invalidate it by running the wrong command."""
+    await _linked(sm)
+    await _interact(sm, Interaction(signer, command()))
+
+    reply = await _interact(sm, Interaction(signer, command()))
+
+    assert "rotate" in reply["data"]["content"]
+    assert reply["data"]["flags"] == 64
+    assert len(await _code_rows(sm)) == 1
+
+
+async def test_rotate_from_a_slash_command_replaces_the_code(sm, signer):
+    """And tombstones the one it replaced, so the code a member is holding stops working
+    rather than going back into the pool."""
+    await _linked(sm)
+    first = await _interact(sm, Interaction(signer, command()))
+
+    second = await _interact(sm, Interaction(signer, command(sub="rotate")))
+
+    assert normalise(CODE_IN_A_MESSAGE.search(first["data"]["content"]).group(0)) is not None
+    assert first["data"]["content"] != second["data"]["content"]
+    assert [row.live for row in await _code_rows(sm)] == [False, True]

@@ -3,22 +3,30 @@
 The bid guard itself lives in app.auctions, inside _BID_SQL, because it is one condition
 of the statement that accepts a bid and not a thing of its own. What is here is the
 handful of writes that move a membership around.
+
+Discord's inbound route is here too, rather than in app.discord. It mints codes, so it
+calls issue_code and rotate_code — and app.discord is what this module imports for the
+transport, so a route over there would close the cycle. app.discord keeps the protocol:
+the signature check, the reply shape, the transport and the poster.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 
+import msgspec
 from litestar import Request, post
 from litestar.di import Provide
 from litestar.exceptions import (
     ClientException,
     HTTPException,
+    NotAuthorizedException,
     NotFoundException,
     TooManyRequestsException,
 )
-from litestar.status_codes import HTTP_409_CONFLICT
+from litestar.status_codes import HTTP_200_OK, HTTP_409_CONFLICT
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,6 +45,8 @@ from app.schemas import (
     MembershipResponse,
     RedeemRequest,
 )
+
+logger = logging.getLogger(__name__)
 
 _authed = {"current_user": Provide(provide_current_user)}
 
@@ -743,6 +753,101 @@ async def link_discord(
         await db_session.rollback()
         raise _refused()
     await db_session.commit()
+
+
+# Which community a guild speaks for. One row, because the link is unique on guild_id.
+#
+# owner_id comes back with it and is what the mint runs as: the invoker is a Discord
+# account with no fmsc user behind it, and what authorises them is MANAGE_GUILD in a guild
+# the owner chose to link. That delegation is the whole of the trust model here, and it is
+# made on the web side where ownership can actually be proved.
+_COMMUNITY_FOR_GUILD_SQL = text("""
+    SELECT c.id, c.owner_id
+      FROM communities c
+      JOIN community_discord d ON d.community_id = c.id
+     WHERE d.guild_id = :guild_id
+    """)
+
+# What a code posted into a channel is worth. A single use would be wrong — the point is
+# that everybody in the guild can join — and a week is short enough that a channel
+# somebody left open does not stay an open door.
+GUILD_CODE_USES = 25
+GUILD_CODE_LIFETIME = timedelta(days=7)
+
+_NOT_LINKED = (
+    "This guild is not linked to a community. Its owner links it from the fmsc API,"
+    " which is where owning a community can be proved."
+)
+_NOT_PERMITTED = "Only somebody who can manage this guild can mint an invite code."
+_ALREADY_LIVE = "This community already has a live code. `/fmsc rotate` replaces it."
+
+
+@post("/discord/interactions", status_code=HTTP_200_OK)
+async def interactions(request: Request, db_session: AsyncSession) -> dict:
+    """Discord's end of the slash command. `/fmsc invite` and `/fmsc rotate`.
+
+    The response is the post: a non-ephemeral reply puts the code in the channel inside
+    Discord's three-second budget with no outbound call, so there is nothing to retry and
+    nothing to rate-limit. Every refusal is ephemeral instead — a guild does not need to
+    watch somebody be told no.
+
+    Unauthenticated by anything but the signature, which is why that check comes first and
+    answers 401. The endpoint mints invite codes.
+    """
+    body = await request.body()
+    if not discord.verified(request.headers, body):
+        raise NotAuthorizedException("bad request signature")
+    payload = msgspec.json.decode(body)
+    if payload.get("type") == discord.PING:
+        # Discord's own health check, and what it sends while validating the URL.
+        return {"type": discord.PONG}
+    if payload.get("type") != discord.COMMAND:
+        return discord.reply("fmsc only answers slash commands.", ephemeral=True)
+    member = payload.get("member") or {}
+    granted = member.get("permissions", "0")
+    if not (granted.isdigit() and int(granted) & discord.MANAGE_GUILD):
+        return discord.reply(_NOT_PERMITTED, ephemeral=True)
+    community = (
+        await db_session.execute(
+            _COMMUNITY_FOR_GUILD_SQL, {"guild_id": payload.get("guild_id") or ""}
+        )
+    ).first()
+    if community is None:
+        return discord.reply(_NOT_LINKED, ephemeral=True)
+    options = (payload.get("data") or {}).get("options") or [{}]
+    mint = {"invite": issue_code, "rotate": rotate_code}.get(options[0].get("name", ""))
+    if mint is None:
+        return discord.reply("Use `/fmsc invite` or `/fmsc rotate`.", ephemeral=True)
+    try:
+        shown = await mint(
+            db_session,
+            community.id,
+            owner_id=community.owner_id,
+            label="discord",
+            max_uses=GUILD_CODE_USES,
+            expires_at=datetime.now(timezone.utc) + GUILD_CODE_LIFETIME,
+        )
+    except IntegrityError as exc:
+        await db_session.rollback()
+        if getattr(exc.orig.__cause__, "constraint_name", None) == _ONE_LIVE_CODE:
+            # Not a silent rotation, for the same reason the web route refuses one: an
+            # owner who has already shared a code should not invalidate it by running the
+            # wrong command.
+            return discord.reply(_ALREADY_LIVE, ephemeral=True)
+        raise
+    # The id, never the code. A code in a log line hands out memberships to whoever can
+    # read the log, and there is no second copy of it anywhere to compare against.
+    code_id = await db_session.scalar(
+        text("SELECT id FROM community_codes WHERE community_id = :c AND invalidated_at IS NULL"),
+        {"c": community.id},
+    )
+    logger.info(
+        "minted code_id=%s for community %s from guild %s",
+        code_id,
+        community.id,
+        payload.get("guild_id"),
+    )
+    return discord.reply(discord.code_message(shown))
 
 
 @post("/communities/{community_id:int}/members/{user_id:int}/kick", dependencies=_authed)

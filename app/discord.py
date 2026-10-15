@@ -23,6 +23,8 @@ from datetime import datetime
 
 import httpx
 import msgspec
+from nacl.exceptions import BadSignatureError
+from nacl.signing import VerifyKey
 from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -35,6 +37,20 @@ PUBLIC_KEY = os.environ.get("DISCORD_PUBLIC_KEY", "")
 BASE_URL = os.environ.get("FMSC_BASE_URL", "http://localhost:8000").rstrip("/")
 
 API = "https://discord.com/api/v10"
+
+# Discord's own numbers. Named because 1, 2, 4 and 64 read as nothing at the call site.
+PING = 1
+COMMAND = 2
+PONG = 1
+MESSAGE = 4
+# Visible only to whoever ran the command. Every refusal is ephemeral: a guild does not
+# need to watch somebody be told they cannot do something.
+EPHEMERAL = 64
+
+# MANAGE_GUILD. Whoever has it in a linked guild may mint that community's invite codes —
+# the delegation the owner made when they linked the channel, and the same trade Discord's
+# own invite permissions make.
+MANAGE_GUILD = 0x20
 
 # What a caller swaps for a fake. One coroutine taking a channel and a string is the whole
 # of what the poster needs from a transport; anything larger would be a seam invented for
@@ -232,3 +248,43 @@ def code_message(code: str) -> str:
         f"`{code}`\n"
         f"Redeem it at {BASE_URL}/communities/codes/redeem"
     )
+
+
+def verified(headers, body: bytes) -> bool:
+    """Whether this request really came from Discord.
+
+    Ed25519 over the timestamp followed by the exact bytes received. The raw body, not a
+    re-encoding of the parsed payload: re-encoding changes key order and whitespace, which
+    is how an implementation starts rejecting correct requests.
+
+    Not optional, and not only a formality. The endpoint is public, unauthenticated by
+    anything else, and mints invite codes; without the check anybody who learns the URL
+    can post a forged interaction and walk out with a membership. Discord enforces it too
+    — it sends deliberately bad signatures while validating an endpoint and refuses to
+    register one that answers anything but 401.
+    """
+    signature = headers.get("X-Signature-Ed25519", "")
+    timestamp = headers.get("X-Signature-Timestamp", "")
+    if not (PUBLIC_KEY and signature and timestamp):
+        return False
+    try:
+        VerifyKey(bytes.fromhex(PUBLIC_KEY)).verify(
+            timestamp.encode() + body, bytes.fromhex(signature)
+        )
+    except (BadSignatureError, ValueError):
+        # ValueError covers a signature or a key that is not hex, and a length the curve
+        # cannot use. Both are refusals rather than 500s.
+        return False
+    return True
+
+
+def reply(content: str, *, ephemeral: bool = False) -> dict:
+    """An interaction response that is itself the channel message.
+
+    No outbound call and nothing to rate-limit: the content of this HTTP response is what
+    the guild sees, which is also the only way to answer inside Discord's three seconds.
+    """
+    data: dict = {"content": content, "allowed_mentions": {"parse": []}}
+    if ephemeral:
+        data["flags"] = EPHEMERAL
+    return {"type": MESSAGE, "data": data}
