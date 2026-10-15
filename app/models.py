@@ -101,6 +101,177 @@ class LoginAttempt(BigIntBase):
     )
 
 
+class CodeAttempt(BigIntBase):
+    """One refused redemption, counted the way a failed login is.
+
+    Its own table rather than a kind column on login_attempts, so that guessing codes at
+    somebody cannot lock them out of signing in and a login they fumbled cannot stop them
+    joining. One missing predicate on a shared table merges the two buckets, and nothing
+    would report it.
+
+    user_id rather than an email: redeeming needs a session, so there is always an account
+    to count against and no reason to key on a string the caller chose.
+    """
+
+    __tablename__ = "code_attempts"
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    ip: Mapped[str] = mapped_column(String(45))
+    failed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        # One index per bucket, and the two counts stay independent for the same reason as
+        # the login ones: a combined key hands every address its own budget per account.
+        Index("ix_code_attempts_user_failed_at", "user_id", "failed_at"),
+        Index("ix_code_attempts_ip_failed_at", "ip", "failed_at"),
+    )
+
+
+class Community(BigIntAuditBase):
+    """A group whose auctions only its members may bid on.
+
+    Owner rights come from owner_id and never from a membership row. Deriving them from
+    a membership would mean remove-all locks the owner out of their own community, which
+    is the one action they can take to recover from a leaked code.
+    """
+
+    __tablename__ = "communities"
+    name: Mapped[str] = mapped_column(String(100))
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    # Bumped by remove-all instead of deleting membership rows, so the audit trail
+    # survives the action that ends every membership. A membership counts only while its
+    # generation matches this one.
+    membership_generation: Mapped[int] = mapped_column(default=0)
+
+    __table_args__ = (
+        CheckConstraint("membership_generation >= 0", name="generation_not_negative"),
+    )
+
+
+class CommunityMembership(BigIntAuditBase):
+    """One person's membership of one community, in one generation.
+
+    Rows are never deleted. A kick sets revoked_at, a remove-all bumps the community's
+    generation and leaves every row where it is, so "who was in this community when that
+    lot sold" stays answerable.
+    """
+
+    __tablename__ = "community_memberships"
+    community_id: Mapped[int] = mapped_column(ForeignKey("communities.id"))
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    # The community's generation at the time this membership was granted. Compared against
+    # the community's current one by the bid statement.
+    generation: Mapped[int]
+    # NULL while the membership stands. A kick sets it, and the bid guard compares it with
+    # the auction's start so a kick cannot reach back into an auction already open.
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # How this membership came about. NULL means it was not created by a redemption, which
+    # today means a test or a hand-written row.
+    joined_via_code_id: Mapped[int | None] = mapped_column(
+        ForeignKey("community_codes.id"), nullable=True
+    )
+    # The community's generation when the code was redeemed. Equal to `generation` above by
+    # construction, and kept separately on purpose: that one is the key the bid guard
+    # compares, this one is the provenance record. If how a generation gets assigned ever
+    # changes, history should not be rewritten along with it.
+    joined_via_generation: Mapped[int | None] = mapped_column(nullable=True)
+
+    __table_args__ = (
+        # One *live* membership per person per generation. A second live row would be a
+        # duplicate join, and the bid guard's EXISTS would not notice.
+        #
+        # Partial, on revoked_at IS NULL, because a revoked row must not block a rejoin:
+        # a kick leaves the row at the current generation, so a plain constraint makes a
+        # mistaken kick permanent — the only remedy being remove-all, which ends everyone
+        # else's membership too. The revoked rows stay as the record of the kick.
+        Index(
+            "uq_memberships_community_user_generation",
+            "community_id",
+            "user_id",
+            "generation",
+            unique=True,
+            postgresql_where=text("revoked_at IS NULL"),
+        ),
+        # What the bid guard's EXISTS reads: a membership for this community and user.
+        Index("ix_memberships_community_user", "community_id", "user_id"),
+    )
+
+
+class CommunityCode(BigIntAuditBase):
+    """An invite code, as a row. The code itself is not in it.
+
+    code_lookup is HMAC-SHA256(payload, server pepper), so a leaked database hands nobody
+    a working code and a lookup is still one indexed equality. The code is shown to its
+    owner once, at creation; losing it means rotating it.
+
+    Rows are tombstoned with invalidated_at and never reissued. Check Point documented
+    live exploitation in 2025 of Discord returning expired invite codes to the pool, which
+    is what reissuing means in practice.
+    """
+
+    __tablename__ = "community_codes"
+    community_id: Mapped[int] = mapped_column(ForeignKey("communities.id"), index=True)
+    # For the owner's own benefit, since they cannot read the code back. "winter drop",
+    # "the one I put in the newsletter".
+    label: Mapped[str] = mapped_column(String(60), default="")
+    code_lookup: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    max_uses: Mapped[int] = mapped_column(default=1)
+    used_count: Mapped[int] = mapped_column(default=0)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Set by a rotation, and the row stays. A tombstone is the only way to be sure the old
+    # code never validates again.
+    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        # The database refuses the over-redemption rather than the application noticing
+        # it afterwards. An application-level used_count < max_uses test is CWE-837:
+        # whoever reads the count is not whoever increments it.
+        CheckConstraint("used_count <= max_uses", name="uses_within_max"),
+        CheckConstraint("max_uses > 0", name="max_uses_positive"),
+        CheckConstraint("used_count >= 0", name="used_count_not_negative"),
+        # One live code per community. Rotation is therefore invalidate-then-insert in one
+        # transaction, and two concurrent rotations cannot both leave a code behind.
+        Index(
+            "uq_one_live_code_per_community",
+            "community_id",
+            unique=True,
+            postgresql_where=text("invalidated_at IS NULL"),
+        ),
+    )
+
+
+class CodeAudit(BigIntBase):
+    """Why a redemption went the way it did. The only place the four failures differ.
+
+    A caller is told nothing beyond "no": not-found, revoked, expired and exhausted are
+    one answer, because telling them apart is how a code becomes something to enumerate —
+    OWASP calls it OAT-002. The distinction an operator needs still has to live somewhere,
+    and this is it.
+
+    The code itself is never written here. code_id is, and it is NULL for a code that was
+    never found, which is the one case with nothing to point at.
+    """
+
+    __tablename__ = "code_audit"
+    community_id: Mapped[int | None] = mapped_column(
+        ForeignKey("communities.id"), nullable=True, index=True
+    )
+    code_id: Mapped[int | None] = mapped_column(
+        ForeignKey("community_codes.id"), nullable=True, index=True
+    )
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    ip: Mapped[str] = mapped_column(String(45))
+    outcome: Mapped[str] = mapped_column(String(20))
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IN ('redeemed', 'not_found', 'revoked', 'expired', 'exhausted',"
+            " 'already_member')",
+            name="outcome_known",
+        ),
+    )
+
+
 class Auction(BigIntAuditBase):
     __tablename__ = "auctions"
     title: Mapped[str] = mapped_column(String(200))
@@ -108,6 +279,11 @@ class Auction(BigIntAuditBase):
     # foreign key for you — without this, reading one seller's listings scans every auction
     # on the service.
     seller_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    # NULL means a public auction, which is every auction that existed before communities
+    # did. Not NULL gates bidding on membership — viewing stays public either way.
+    community_id: Mapped[int | None] = mapped_column(
+        ForeignKey("communities.id"), nullable=True, index=True
+    )
     starting_bid: Mapped[Decimal] = mapped_column(Money)
     # NULL current_bid = no bids yet, so the opening bid may equal starting_bid.
     current_bid: Mapped[Decimal | None] = mapped_column(Money, nullable=True)

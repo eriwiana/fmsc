@@ -14,7 +14,7 @@ from litestar.channels.backends.base import ChannelsBackend
 from litestar.channels.backends.memory import MemoryChannelsBackend
 from litestar.channels.backends.redis import RedisChannelsPubSubBackend
 
-from app import auctions, auth
+from app import auctions, auth, communities
 
 # Railway injects DATABASE_URL as postgresql://; SQLAlchemy async needs +asyncpg.
 DATABASE_URL = os.environ.get(
@@ -131,6 +131,12 @@ app = Litestar(
         auctions.cancel_auction,
         auctions.list_auctions,
         auctions.my_auctions,
+        communities.create_community,
+        communities.issue,
+        communities.rotate,
+        communities.kick,
+        communities.remove_all,
+        communities.redeem,
         auctions.get_auction,
         auctions.place_bid,
         auctions.auction_ws,

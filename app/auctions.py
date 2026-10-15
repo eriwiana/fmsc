@@ -5,7 +5,6 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from zoneinfo import ZoneInfo
 
 import msgspec
 from litestar import Request, WebSocket, get, patch, post, websocket
@@ -30,6 +29,8 @@ from app.auth import (
     purge_expired_tickets,
     user_for_ticket,
 )
+from app.clock import APP_TZ, resolve_deadline
+from app.communities import prune_code_attempts
 from app.models import Auction, Bid, Outbox, User
 from app.schemas import (
     AuctionResponse,
@@ -41,15 +42,6 @@ from app.schemas import (
 _authed = {"current_user": Provide(provide_current_user)}
 
 logger = logging.getLogger(__name__)
-
-# The app operates in Asia/Jakarta (WIB, UTC+7). Storage stays UTC (timestamptz); this only
-# governs the boundaries — naive input is read as Jakarta wall time, output is rendered in it.
-APP_TZ = ZoneInfo("Asia/Jakarta")
-
-
-def resolve_deadline(dt: datetime) -> datetime:
-    """A naive datetime is interpreted as Jakarta wall time; an aware one is left as-is."""
-    return dt.replace(tzinfo=APP_TZ) if dt.tzinfo is None else dt
 
 
 def _to_response(a: Auction | Row, *, reveal_reserve: bool = False) -> AuctionResponse:
@@ -117,9 +109,17 @@ STATUSES = tuple(LEGAL_FROM)
 # have any. The deadline is only consulted for a publish, because a draft sat on past its
 # own ends_at would open and then be closed by the very next closer tick — an auction that
 # was never biddable, announced to everyone watching.
+#
+# A publish also sets starts_at, because an auction starts when it is announced and not
+# when its draft was first saved. The community bid guard compares a kick against
+# starts_at, so leaving it at insert time means somebody kicked on Tuesday may still bid on
+# a lot drafted Monday and published Wednesday — the kick would reach backwards past its
+# own date.
 _TRANSITION_SQL = text("""
     UPDATE auctions
-       SET status = :to, event_seq = event_seq + 1
+       SET status = :to,
+           event_seq = event_seq + 1,
+           starts_at = CASE WHEN :to = 'open' THEN clock_timestamp() ELSE starts_at END
      WHERE id = :id
        AND seller_id = :seller_id
        AND status = ANY(CAST(:from_states AS varchar[]))
@@ -233,6 +233,24 @@ def _channel(auction_id: int) -> str:
     return f"auction:{auction_id}"
 
 
+# Who may open an auction inside a community: its owner, or a member of the current
+# generation whose membership has not been revoked. FOR SHARE takes the community row
+# alongside the answer, which is what serialises this against a remove-all.
+_MAY_LIST_SQL = text("""
+    SELECT 1
+      FROM communities c
+     WHERE c.id = :community_id
+       AND (c.owner_id = :uid
+            OR EXISTS (SELECT 1
+                         FROM community_memberships m
+                        WHERE m.community_id = c.id
+                          AND m.user_id = :uid
+                          AND m.generation = c.membership_generation
+                          AND m.revoked_at IS NULL))
+       FOR SHARE
+    """)
+
+
 @post("/auctions", dependencies=_authed)
 async def create_auction(
     data: CreateAuctionRequest, current_user: User, db_session: AsyncSession
@@ -264,8 +282,25 @@ async def create_auction(
     # asking for a state the machine reaches by an edge, not by a POST.
     if data.status not in ("open", "draft"):
         raise ClientException("status must be open or draft")
+    community_id = data.community_id
+    if community_id is not None:
+        # FOR SHARE on the community, before the insert. remove_all_members takes the same
+        # row FOR UPDATE, so the two serialise and a bump cannot land between this check
+        # and the row arriving — a lock only helps where both sides take it.
+        #
+        # The same statement answers who may list here. Without it any verified seller
+        # could plant a lot inside somebody else's community by guessing an id, and its
+        # members would be gated into bidding on a stranger's auction.
+        allowed = (
+            await db_session.execute(
+                _MAY_LIST_SQL, {"community_id": community_id, "uid": current_user.id}
+            )
+        ).first()
+        if allowed is None:
+            raise PermissionDeniedException("only a member of that community can list in it")
     auction = Auction(
         title=data.title,
+        community_id=community_id,
         seller_id=current_user.id,
         starting_bid=data.starting_bid,
         currency=currency,
@@ -479,6 +514,23 @@ async def cancel_auction(
 # test can tell them apart. The ordering stays as written because it is still the correct
 # one if that constraint is ever dropped.
 #
+# Membership rides in the same WHERE as everything else, which is the whole of criterion
+# 1. A handler that read the membership and then bid would be two statements, and a
+# revocation landing in the gap between them would still see the bid accepted; this EXISTS
+# is re-read by the UPDATE under its own row lock, so a committed removal is seen. The
+# generation comparison is what makes remove-all work: it bumps the community's counter
+# rather than deleting rows, so every membership from the generation before it stops
+# counting at once while the audit trail survives.
+#
+# community_id IS NULL first, so a public auction is not a special case and costs no
+# subquery. Viewing is public either way — only bidding is gated.
+#
+# The revoked_at arm is compared against the auction's start, not against now(): a kick
+# takes effect only for auctions opened after it. Bidding on a lot somebody was entitled
+# to bid on when it opened is a commitment the seller has already relied on, and letting a
+# moderator cancel it afterwards makes a kick a way to undo other people's bids. The
+# auction they were kicked out of goes on; the next one is closed to them.
+#
 # The increment rides in the same WHERE for the same reason as the reserve, and it only
 # applies once there is a leader: an opening bid has nothing to beat, so it may still equal
 # starting_bid.
@@ -502,6 +554,14 @@ _BID_SQL = text(
        AND seller_id <> :uid
        AND :amount >= starting_bid
        AND :amount >= COALESCE(reserve, starting_bid)
+       AND (community_id IS NULL OR EXISTS (
+                SELECT 1
+                  FROM community_memberships m
+                  JOIN communities c ON c.id = m.community_id
+                 WHERE m.community_id = auctions.community_id
+                   AND m.user_id = :uid
+                   AND m.generation = c.membership_generation
+                   AND (m.revoked_at IS NULL OR auctions.starts_at < m.revoked_at)))
        AND (current_bid IS NULL OR :amount >= current_bid + """
     + _increment_case("current_bid")
     + """)
@@ -934,6 +994,7 @@ async def run_closer(
                 await purge_expired_tickets(session)
                 await purge_expired_sessions(session)
                 await prune_login_attempts(session)
+                await prune_code_attempts(session)
                 await prune_outbox(session)
         except Exception:
             # Blind on purpose: a transient database error must not kill the loop. BLE001

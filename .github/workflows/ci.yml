@@ -14,6 +14,10 @@ env:
   # The suite talks to the same engine production does; a sqlite pass is a
   # convenience, not the contract.
   DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/fmsc
+  # app.codes refuses to start without one, which is the point. Not a secret: it peppers
+  # invite codes that only exist inside a test run, and a GitHub secret here would make
+  # the suite unrunnable on a fork.
+  FMSC_CODE_PEPPER: ci-pepper-not-a-secret-0123456789abcdef
 
 jobs:
   lint:

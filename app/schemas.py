@@ -27,6 +27,7 @@ class CreateAuctionRequest(msgspec.Struct):
     currency: str = "IDR"  # ISO 4217; normalised and checked in create_auction
     status: str = "open"  # "draft" to keep it unannounced; nothing else is accepted
     reserve: Decimal | None = None  # the seller's floor, never echoed to a bidder
+    community_id: int | None = None  # None is a public auction; set it and bidding is gated
 
 
 class EditAuctionRequest(msgspec.Struct):
@@ -41,6 +42,42 @@ class EditAuctionRequest(msgspec.Struct):
 
 class BidRequest(msgspec.Struct):
     amount: Decimal
+
+
+class CreateCommunityRequest(msgspec.Struct):
+    name: str
+
+
+class CommunityResponse(msgspec.Struct):
+    id: int
+    name: str
+    owner_id: int
+    membership_generation: int
+
+
+class IssueCodeRequest(msgspec.Struct):
+    label: str = ""
+    max_uses: int = 1
+    expires_at: datetime | None = None
+
+
+class CodeResponse(msgspec.Struct):
+    """The one and only time the code is readable. Nothing stores it."""
+
+    code: str
+
+
+class GenerationResponse(msgspec.Struct):
+    membership_generation: int
+
+
+class RedeemRequest(msgspec.Struct):
+    code: str
+
+
+class MembershipResponse(msgspec.Struct):
+    community_id: int
+    generation: int
 
 
 class AuctionResponse(msgspec.Struct):
