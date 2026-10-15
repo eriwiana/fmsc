@@ -65,6 +65,10 @@ class CodeResponse(msgspec.Struct):
     """The one and only time the code is readable. Nothing stores it."""
 
     code: str
+    # Whether the community's Discord channel was told. False also means there is no
+    # channel, which is the common case — reported rather than hidden, because the owner
+    # is the only one who can then pass the code on themselves.
+    broadcast: bool = False
 
 
 class DiscordLinkRequest(msgspec.Struct):

@@ -187,3 +187,48 @@ async def post_pending(
             await session.execute(_MARK_POSTED_SQL, {"ids": [row.id for row in rows]})
         await session.commit()
     return len(rows)
+
+
+_CHANNEL_SQL = text("SELECT channel_id FROM community_discord WHERE community_id = :community_id")
+
+# The code is never stored in a form anybody can read, so the id of the live row is what a
+# log line, an audit row or an operator can point at.
+_LIVE_CODE_SQL = text(
+    "SELECT id FROM community_codes WHERE community_id = :community_id AND invalidated_at IS NULL"
+)
+
+
+async def broadcast_code(
+    session: AsyncSession, community_id: int, code: str, send: Sender = send
+) -> bool:
+    """Post a community's live invite code to its channel. True if the guild was told.
+
+    Inline rather than through the outbox. The owner is holding the code as they read the
+    response, so a failure is something they can act on, and there is nothing worth
+    replaying later: the next rotation supersedes this code anyway.
+
+    What goes in the log is the row's id. The code is a bearer credential with no second
+    copy anywhere — not in the database, not in a backup — so a log line carrying one
+    hands out memberships to whoever can read the log.
+    """
+    channel_id = await session.scalar(_CHANNEL_SQL, {"community_id": community_id})
+    code_id = await session.scalar(_LIVE_CODE_SQL, {"community_id": community_id})
+    if channel_id is None:
+        logger.info("no channel for community %s; code_id=%s not broadcast", community_id, code_id)
+        return False
+    logger.info("broadcasting code_id=%s to channel %s", code_id, channel_id)
+    return await send(channel_id, code_message(code))
+
+
+def code_message(code: str) -> str:
+    """What a channel is told when a code changes.
+
+    It says the old one is dead, because that is the part a member has to act on: rotation
+    is what M9 shipped without a way to announce, and a member holding the previous code
+    has no other way to find out it stopped working.
+    """
+    return (
+        "A new invite code for this community. Any earlier code has stopped working.\n"
+        f"`{code}`\n"
+        f"Redeem it at {BASE_URL}/communities/codes/redeem"
+    )

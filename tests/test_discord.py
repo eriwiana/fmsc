@@ -33,7 +33,7 @@ from app.auctions import (
     prune_outbox,
 )
 from app.codes import normalise
-from app.communities import link_discord, rotate
+from app.communities import issue, link_discord, rotate
 from app.discord import MANAGE_GUILD, interactions, post_pending
 from app.models import Community, CommunityMembership, User
 from app.schemas import CreateAuctionRequest, DiscordLinkRequest, IssueCodeRequest
@@ -52,8 +52,9 @@ class FakeDiscord:
     def __init__(self) -> None:
         self.posts: list[tuple[str, str]] = []
 
-    async def __call__(self, channel_id: str, content: str) -> None:
+    async def __call__(self, channel_id: str, content: str) -> bool:
         self.posts.append((channel_id, content))
+        return True
 
 
 @pytest.fixture
@@ -524,3 +525,79 @@ async def test_the_outbox_is_not_pruned_until_both_readers_have_had_it(sm, fake)
     assert await post_pending(sm, send=fake) == 1
     async with sm() as s:
         assert await prune_outbox(s) == 1
+
+
+async def _rotate(maker, community_id: int, owner_id: int, fake=None, which=rotate):
+    async with maker() as s:
+        return await which.fn(
+            community_id=community_id,
+            data=IssueCodeRequest(max_uses=5),
+            current_user=await s.get(User, owner_id),
+            db_session=s,
+            send=fake,
+        )
+
+
+async def test_the_first_code_is_broadcast_too(sm, fake):
+    """Issuing and rotating both mint a code the guild has to be able to read. Only one of
+    them is in a criterion; having the other stay quiet would be an inconsistency nobody
+    could explain to an owner."""
+    community_id, owner_id = await _linked(sm)
+
+    issued = await _rotate(sm, community_id, owner_id, fake, which=issue)
+
+    assert issued.broadcast is True
+    assert issued.code in fake.posts[-1][1]
+
+
+async def test_a_community_with_no_channel_still_gets_its_code(sm, fake, caplog):
+    """The broadcast is a notification, not a step in minting. An owner who has not linked
+    a channel — the common case — is told that nobody was told."""
+    community_id, owner_id = await _community(sm)
+
+    with caplog.at_level(logging.INFO):
+        rotated = await _rotate(sm, community_id, owner_id, fake)
+
+    assert rotated.code
+    assert rotated.broadcast is False
+    assert fake.posts == []
+    assert "not broadcast" in caplog.text
+    assert rotated.code not in caplog.text
+
+
+async def test_a_failed_broadcast_is_reported_rather_than_raised(sm):
+    """Discord being down must not cost the owner the code: it is the only copy, and the
+    row keeps nothing that can be turned back into it."""
+    community_id, owner_id = await _linked(sm)
+
+    async def refuses(channel_id: str, content: str) -> bool:
+        return False
+
+    rotated = await _rotate(sm, community_id, owner_id, refuses)
+
+    assert rotated.code
+    assert rotated.broadcast is False
+
+
+async def test_a_successful_broadcast_logs_the_code_id_and_not_the_code(sm, fake, caplog):
+    """The same rule as the slash command's, on the path that actually posts. There is no
+    second copy of a code anywhere, so a log line holding one hands out memberships to
+    whoever can read the log."""
+    community_id, owner_id = await _linked(sm)
+
+    with caplog.at_level(logging.INFO):
+        rotated = await _rotate(sm, community_id, owner_id, fake)
+
+    assert "code_id=" in caplog.text
+    assert rotated.code not in caplog.text
+    assert normalise(rotated.code) not in caplog.text
+
+
+async def test_the_broadcast_says_the_old_code_has_stopped_working(sm, fake):
+    """The part a member has to act on. Rotation ends every membership's way back in at
+    once, and somebody holding the previous code has no other way to find out."""
+    community_id, owner_id = await _linked(sm)
+
+    await _rotate(sm, community_id, owner_id, fake)
+
+    assert "stopped working" in fake.posts[-1][1]

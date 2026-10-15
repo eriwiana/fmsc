@@ -23,7 +23,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app import codes
+from app import codes, discord
 from app.auth import client_ip, provide_current_user
 from app.clock import resolve_deadline
 from app.models import CodeAttempt, Community, CommunityCode, User
@@ -39,6 +39,16 @@ from app.schemas import (
 )
 
 _authed = {"current_user": Provide(provide_current_user)}
+
+
+def provide_sender() -> discord.Sender:
+    """The transport, as a dependency, so a test hands the route a fake and the route does
+    not have to know that anything was swapped."""
+    return discord.send
+
+
+# Only the two routes that mint a code, which are the only ones with anything to announce.
+_announcing = {**_authed, "send": Provide(provide_sender, sync_to_thread=False)}
 
 # One guarded UPDATE, scoped to the owner. Ownership is in the WHERE rather than checked
 # first, for the same reason as every other guard in this project: two statements leave a
@@ -597,12 +607,16 @@ async def create_community(
     )
 
 
-@post("/communities/{community_id:int}/codes", dependencies=_authed)
+@post("/communities/{community_id:int}/codes", dependencies=_announcing)
 async def issue(
     community_id: int,
     data: IssueCodeRequest,
     current_user: User,
     db_session: AsyncSession,
+    # Defaulted as well as provided: the dependency is what the route uses, and the
+    # default is what a caller reaching past the route — a test, or another handler —
+    # gets without having to know a transport exists.
+    send: discord.Sender = discord.send,
 ) -> CodeResponse:
     """Mint the community's first code, and answer 409 if it already has a live one.
 
@@ -628,17 +642,28 @@ async def issue(
         raise
     if shown is None:
         raise _refused()
-    return CodeResponse(code=shown)
+    broadcast = await discord.broadcast_code(db_session, community_id, shown, send)
+    return CodeResponse(code=shown, broadcast=broadcast)
 
 
-@post("/communities/{community_id:int}/codes/rotate", dependencies=_authed)
+@post("/communities/{community_id:int}/codes/rotate", dependencies=_announcing)
 async def rotate(
     community_id: int,
     data: IssueCodeRequest,
     current_user: User,
     db_session: AsyncSession,
+    # Defaulted as well as provided: the dependency is what the route uses, and the
+    # default is what a caller reaching past the route — a test, or another handler —
+    # gets without having to know a transport exists.
+    send: discord.Sender = discord.send,
 ) -> CodeResponse:
-    """Replace the live code. The old one stops working the moment this answers."""
+    """Replace the live code. The old one stops working the moment this answers.
+
+    And the community's channel is told, which is the gap M9 named: rotation ends every
+    membership's only way back in at once, so the people holding the old code have to hear
+    the new one somewhere. Whether they did is in the response, because if they did not,
+    passing it on is the owner's job.
+    """
     expires_at = _checked(data)
     shown = await rotate_code(
         db_session,
@@ -650,7 +675,8 @@ async def rotate(
     )
     if shown is None:
         raise _refused()
-    return CodeResponse(code=shown)
+    broadcast = await discord.broadcast_code(db_session, community_id, shown, send)
+    return CodeResponse(code=shown, broadcast=broadcast)
 
 
 # Ownership in the WHERE rather than checked first, like every other guard here: the
