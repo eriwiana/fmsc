@@ -10,6 +10,12 @@ dependencies = [
     "advanced-alchemy",
     "asyncpg",
     "uvicorn",
+    # Ed25519, for Discord's interaction signatures. Not optional the way redis is: Discord
+    # refuses to register an interactions endpoint that does not verify them — it sends
+    # deliberately bad signatures during validation and expects a 401 — so the slash
+    # command does not work without it, and hand-rolling the curve arithmetic to save a
+    # dependency is not a trade anybody should take.
+    "pynacl>=1.6.2",
 ]
 
 [project.optional-dependencies]

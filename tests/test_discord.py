@@ -17,11 +17,13 @@ import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+import httpx
 import msgspec
 import pytest
 from nacl.signing import SigningKey
 from sqlalchemy import text
 
+from app import discord
 from app.auctions import close_due, create_auction, place_bid_tx
 from app.codes import normalise
 from app.communities import link_discord, rotate
@@ -235,3 +237,87 @@ async def test_rotating_a_code_broadcasts_the_new_one(sm, fake):
     assert channel == CHANNEL
     assert second.code in content
     assert first.code not in content
+
+
+@pytest.fixture
+def configured(monkeypatch):
+    """A bot token, and every outbound request answered by `handler` instead of Discord."""
+
+    def install(handler) -> list[httpx.Request]:
+        seen: list[httpx.Request] = []
+
+        def record(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return handler(len(seen))
+
+        # The real class, captured before the name is replaced: discord.httpx is the httpx
+        # module itself, so a lambda calling httpx.AsyncClient would call itself.
+        real = httpx.AsyncClient
+        monkeypatch.setattr(discord, "BOT_TOKEN", "a-bot-token")
+        monkeypatch.setattr(
+            discord.httpx,
+            "AsyncClient",
+            lambda **kwargs: real(transport=httpx.MockTransport(record), **kwargs),
+        )
+        return seen
+
+    return install
+
+
+async def test_a_rate_limited_message_waits_the_time_discord_asks_for_and_retries(configured):
+    """A 429 carries retry_after, and honouring it is the difference between a short wait
+    and a longer ban."""
+    seen = configured(
+        lambda nth: (
+            httpx.Response(429, json={"retry_after": 0.01})
+            if nth == 1
+            else httpx.Response(200, json={})
+        )
+    )
+
+    assert await discord.send(CHANNEL, "hello") is True
+    assert len(seen) == 2
+    assert str(seen[0].url) == f"{discord.API}/channels/{CHANNEL}/messages"
+    # Every ping suppressed. The content carries a seller's free text, so a lot titled
+    # "@everyone" would otherwise notify a whole guild on command.
+    assert msgspec.json.decode(seen[0].content)["allowed_mentions"] == {"parse": []}
+
+
+async def test_a_second_rate_limit_gives_up_instead_of_waiting_again(configured):
+    """One retry, not a loop: the poster will be back on the next tick anyway, and a tick
+    that sleeps through its rate limit is a tick that stops closing auctions."""
+    seen = configured(lambda nth: httpx.Response(429, json={"retry_after": 0.01}))
+
+    assert await discord.send(CHANNEL, "hello") is False
+    assert len(seen) == 2
+
+
+async def test_a_refused_message_is_logged_rather_than_raised(configured, caplog):
+    """A deleted channel or a revoked token answers 4xx forever. Raising it would take out
+    the closer tick that called it."""
+    configured(lambda nth: httpx.Response(403, json={"message": "Missing Access"}))
+
+    with caplog.at_level(logging.WARNING):
+        assert await discord.send(CHANNEL, "hello") is False
+    assert "403" in caplog.text
+
+
+async def test_an_unreachable_discord_is_logged_rather_than_raised(configured, caplog):
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route to host")
+
+    configured(lambda nth: boom(None))
+
+    with caplog.at_level(logging.WARNING):
+        assert await discord.send(CHANNEL, "hello") is False
+    assert "unreachable" in caplog.text
+
+
+async def test_nothing_is_posted_when_discord_is_not_configured(monkeypatch, caplog):
+    """Unset means off. A deployment with no guild has nothing to post to, and making the
+    app refuse to start over it would make Discord a dependency of selling."""
+    monkeypatch.setattr(discord, "BOT_TOKEN", "")
+
+    with caplog.at_level(logging.INFO):
+        assert await discord.send(CHANNEL, "hello") is False
+    assert "not configured" in caplog.text
