@@ -490,6 +490,65 @@ async def test_a_move_is_announced_with_the_sequence_number_it_consumed(sm):
         ) == len(rows)
 
 
+async def _created(maker, seller, status: str = "open"):
+    """Through the real handler, because what is under test is what the handler writes."""
+    async with maker() as s:
+        return await create_auction.fn(
+            data=CreateAuctionRequest(
+                title="t",
+                starting_bid=Decimal("10.00"),
+                ends_at=datetime.now(timezone.utc) + timedelta(hours=1),
+                status=status,
+            ),
+            current_user=seller,
+            db_session=s,
+        )
+
+
+async def _announced(maker, auction_id: int) -> tuple[list, int]:
+    async with maker() as s:
+        rows = (
+            await s.execute(
+                text("SELECT seq, payload FROM outbox WHERE auction_id = :id ORDER BY seq"),
+                {"id": auction_id},
+            )
+        ).all()
+        seq = await s.scalar(
+            text("SELECT event_seq FROM auctions WHERE id = :id"), {"id": auction_id}
+        )
+    return rows, seq
+
+
+async def test_an_auction_created_open_announces_that_it_is_open(sm):
+    """Publishing a draft announces it, and creating one open has to as well.
+
+    Measured before it did: the create path wrote no outbox row at all, so anything
+    following an auction heard its first bid without ever having been told the lot
+    existed — and open is the default, so that was most of them.
+    """
+    seller = await _seller(sm)
+    created = await _created(sm, seller)
+
+    rows, seq = await _announced(sm, created.id)
+    assert [row.seq for row in rows] == [1]
+    event = json.loads(rows[0].payload)
+    assert event["type"] == "status"
+    assert event["status"] == "open"
+    # One event per bump, so the first bid is seq 2 and no watcher sees a hole.
+    assert seq == 1
+
+
+async def test_a_draft_announces_nothing(sm):
+    """A draft is hidden from the listing, from the socket and from the outbox alike. An
+    event for one would describe a lot every read path answers 404 for."""
+    seller = await _seller(sm)
+    created = await _created(sm, seller, status="draft")
+
+    rows, seq = await _announced(sm, created.id)
+    assert rows == []
+    assert seq == 0
+
+
 async def test_a_refused_move_announces_nothing(sm):
     """The rollback has to take the outbox row with it, or a refused cancel would still
     tell every watcher the lot was withdrawn."""

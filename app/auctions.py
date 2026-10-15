@@ -310,6 +310,20 @@ async def create_auction(
         hard_ends_at=ends_at + MAX_EXTENSION,
     )
     db_session.add(auction)
+    # flush, not commit: the id has to exist before the event can name it, and the event
+    # has to land in this transaction rather than a second one.
+    await db_session.flush()
+    if auction.status == "open":
+        # An auction created open announces itself, the same way a published draft does.
+        # Without this the only opening anybody ever hears is a draft's, and open is the
+        # default — so a watcher attached to a channel would be told about a lot's bids
+        # with nothing having said the lot existed.
+        #
+        # The bump and the row go together for the reason transition() gives: event_seq
+        # counts events published about an auction, and a bump with no event tells a
+        # watcher it missed something that never happened.
+        auction.event_seq = 1
+        db_session.add(_owed(auction, _status_event(auction)))
     await db_session.commit()
     await db_session.refresh(auction)
     return _to_response(auction, reveal_reserve=True)
