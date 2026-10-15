@@ -239,6 +239,26 @@ class CommunityCode(BigIntAuditBase):
     )
 
 
+class CommunityDiscord(BigIntAuditBase):
+    """Which guild channel a community's events and codes are posted to.
+
+    The link is made over the web API by the community's owner, because that is the only
+    place ownership of a community can be proved. What the guild side then authorises is a
+    Discord question, answered by the invoker's MANAGE_GUILD permission.
+
+    Unique both ways. One channel per community, or the same event would arrive twice; one
+    community per guild, or `/fmsc invite` in that guild has no single answer to give.
+    """
+
+    __tablename__ = "community_discord"
+    community_id: Mapped[int] = mapped_column(ForeignKey("communities.id"), unique=True)
+    # Snowflakes, stored as the strings Discord sends. They are 64-bit unsigned, which no
+    # signed BIGINT holds all of and no JSON number survives, and nothing here does
+    # arithmetic on one — the value is only ever compared and echoed back.
+    guild_id: Mapped[str] = mapped_column(String(20), unique=True)
+    channel_id: Mapped[str] = mapped_column(String(20))
+
+
 class CodeAudit(BigIntBase):
     """Why a redemption went the way it did. The only place the four failures differ.
 

@@ -7,6 +7,7 @@ handful of writes that move a membership around.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 
 from litestar import Request, post
@@ -30,6 +31,7 @@ from app.schemas import (
     CodeResponse,
     CommunityResponse,
     CreateCommunityRequest,
+    DiscordLinkRequest,
     GenerationResponse,
     IssueCodeRequest,
     MembershipResponse,
@@ -649,6 +651,72 @@ async def rotate(
     if shown is None:
         raise _refused()
     return CodeResponse(code=shown)
+
+
+# Ownership in the WHERE rather than checked first, like every other guard here: the
+# INSERT selects from communities, so a row arrives only for the owner and nothing has to
+# be read back to find out whether it did.
+#
+# ON CONFLICT on the community, so relinking a channel is the same one call rather than a
+# delete and an insert — an owner moving the bot to another channel should not have a
+# window where the community is linked to nothing.
+_LINK_DISCORD_SQL = text("""
+    INSERT INTO community_discord
+                (community_id, guild_id, channel_id, created_at, updated_at)
+         SELECT :community_id, :guild_id, :channel_id, clock_timestamp(), clock_timestamp()
+           FROM communities
+          WHERE id = :community_id AND owner_id = :owner_id
+    ON CONFLICT (community_id) DO UPDATE
+            SET guild_id = EXCLUDED.guild_id,
+                channel_id = EXCLUDED.channel_id,
+                updated_at = clock_timestamp()
+      RETURNING id
+    """)
+
+_ONE_COMMUNITY_PER_GUILD = "uq_community_discord_guild_id"
+
+# 17 to 20 digits. Checked so a typo is a 400 naming the field rather than the 500 a
+# value too long for the column becomes — the same reasoning as max_uses and label.
+_SNOWFLAKE = re.compile(r"[0-9]{17,20}")
+
+
+@post("/communities/{community_id:int}/discord", dependencies=_authed)
+async def link_discord(
+    community_id: int,
+    data: DiscordLinkRequest,
+    current_user: User,
+    db_session: AsyncSession,
+) -> None:
+    """Point a community's posts at a guild channel, or move them to another one.
+
+    The owner does this here rather than from Discord because this is the only place
+    ownership of a community can be proved. What it delegates is real: from then on,
+    whoever manages that guild can mint invite codes for this community.
+    """
+    for field, value in (("guild_id", data.guild_id), ("channel_id", data.channel_id)):
+        if not _SNOWFLAKE.fullmatch(value):
+            raise ClientException(f"{field} must be a Discord snowflake")
+    try:
+        linked = (
+            await db_session.execute(
+                _LINK_DISCORD_SQL,
+                {
+                    "community_id": community_id,
+                    "guild_id": data.guild_id,
+                    "channel_id": data.channel_id,
+                    "owner_id": current_user.id,
+                },
+            )
+        ).first()
+    except IntegrityError as exc:
+        await db_session.rollback()
+        if getattr(exc.orig.__cause__, "constraint_name", None) == _ONE_COMMUNITY_PER_GUILD:
+            raise _refused("that guild is already linked to another community") from None
+        raise
+    if linked is None:
+        await db_session.rollback()
+        raise _refused()
+    await db_session.commit()
 
 
 @post("/communities/{community_id:int}/members/{user_id:int}/kick", dependencies=_authed)

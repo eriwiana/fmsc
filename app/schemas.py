@@ -67,6 +67,14 @@ class CodeResponse(msgspec.Struct):
     code: str
 
 
+class DiscordLinkRequest(msgspec.Struct):
+    """Snowflakes as Discord sends them: strings, because a 64-bit unsigned id does not
+    survive a JSON number."""
+
+    guild_id: str
+    channel_id: str
+
+
 class GenerationResponse(msgspec.Struct):
     membership_generation: int
 

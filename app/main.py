@@ -137,6 +137,7 @@ app = Litestar(
         communities.kick,
         communities.remove_all,
         communities.redeem,
+        communities.link_discord,
         auctions.get_auction,
         auctions.place_bid,
         auctions.auction_ws,

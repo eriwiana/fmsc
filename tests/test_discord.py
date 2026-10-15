@@ -20,6 +20,7 @@ from decimal import Decimal
 import httpx
 import msgspec
 import pytest
+from litestar.exceptions import ClientException, HTTPException
 from nacl.signing import SigningKey
 from sqlalchemy import text
 
@@ -321,3 +322,89 @@ async def test_nothing_is_posted_when_discord_is_not_configured(monkeypatch, cap
     with caplog.at_level(logging.INFO):
         assert await discord.send(CHANNEL, "hello") is False
     assert "not configured" in caplog.text
+
+
+async def _link(maker, community_id: int, user_id: int, channel_id: str = CHANNEL, **kwargs):
+    async with maker() as s:
+        return await link_discord.fn(
+            community_id=community_id,
+            data=DiscordLinkRequest(guild_id=kwargs.get("guild_id", GUILD), channel_id=channel_id),
+            current_user=await s.get(User, user_id),
+            db_session=s,
+        )
+
+
+async def _links(maker, community_id: int) -> list:
+    async with maker() as s:
+        return (
+            await s.execute(
+                text("SELECT guild_id, channel_id FROM community_discord WHERE community_id = :c"),
+                {"c": community_id},
+            )
+        ).all()
+
+
+async def test_the_owner_points_a_community_at_a_guild_channel(sm):
+    community_id, owner_id = await _community(sm)
+    await _link(sm, community_id, owner_id)
+
+    assert await _links(sm, community_id) == [(GUILD, CHANNEL)]
+
+
+async def test_relinking_moves_the_channel_rather_than_adding_one(sm):
+    """An owner moving the bot to another channel must not pass through a state where the
+    community is linked to nothing — which a delete and an insert would."""
+    community_id, owner_id = await _community(sm)
+    await _link(sm, community_id, owner_id)
+    await _link(sm, community_id, owner_id, channel_id="111111111111111111")
+
+    assert await _links(sm, community_id) == [(GUILD, "111111111111111111")]
+
+
+async def test_a_stranger_cannot_link_somebody_elses_community(sm):
+    """Ownership is in the WHERE, so the INSERT selects no row for anybody else."""
+    community_id, _ = await _community(sm)
+    async with sm() as s:
+        stranger = User(email="stranger@x.com", pw_hash="x")
+        s.add(stranger)
+        await s.commit()
+        stranger_id = stranger.id
+
+    with pytest.raises(HTTPException) as refused:
+        await _link(sm, community_id, stranger_id)
+    assert refused.value.status_code == 409
+    assert await _links(sm, community_id) == []
+
+
+async def test_a_guild_cannot_be_linked_to_two_communities(sm):
+    """A slash command run in a guild has to have one community to answer for."""
+    first, first_owner = await _community(sm)
+    await _link(sm, first, first_owner)
+    async with sm() as s:
+        owner = User(email="second@x.com", pw_hash="x", verified_at=datetime.now(timezone.utc))
+        s.add(owner)
+        await s.flush()
+        second = Community(name="second", owner_id=owner.id)
+        s.add(second)
+        await s.commit()
+        second_id, second_owner = second.id, owner.id
+
+    with pytest.raises(HTTPException) as refused:
+        await _link(sm, second_id, second_owner)
+    assert refused.value.status_code == 409
+    assert "already linked" in refused.value.detail
+
+
+async def test_a_value_that_is_not_a_snowflake_is_refused_by_name(sm):
+    """A 400 naming the field, rather than the 500 a value too long for the column
+    becomes. The same reasoning as max_uses and label."""
+    community_id, owner_id = await _community(sm)
+
+    for field, guild_id, channel_id in (
+        ("guild_id", "not-a-snowflake", CHANNEL),
+        ("channel_id", GUILD, "12"),
+    ):
+        with pytest.raises(ClientException) as refused:
+            await _link(sm, community_id, owner_id, channel_id=channel_id, guild_id=guild_id)
+        assert field in refused.value.detail
+    assert await _links(sm, community_id) == []
