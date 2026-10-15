@@ -22,6 +22,7 @@ from sqlalchemy import Row, bindparam, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app import discord
 from app.auth import (
     provide_current_user,
     prune_login_attempts,
@@ -669,8 +670,10 @@ _MARK_BATCH_SENT_SQL = text(
 
 # CAST, because inside a comparison Postgres cannot infer the parameter's type and
 # answers "operator does not exist: timestamp with time zone < interval".
+# Both readers, not just the sockets: a poster that fell a day behind would otherwise have
+# its queue deleted out from under it, and the guild would never hear what it missed.
 _PRUNE_OUTBOX_SQL = text(
-    "DELETE FROM outbox WHERE sent_at IS NOT NULL"
+    "DELETE FROM outbox WHERE sent_at IS NOT NULL AND discord_at IS NOT NULL"
     " AND sent_at < clock_timestamp() - CAST(:window AS interval)"
 )
 
@@ -1004,6 +1007,9 @@ async def run_closer(
             await close_due(session_maker, channels)
             # Anything a previous process committed but never announced.
             await relay_pending(session_maker, channels)
+            # The same queue, read for the guilds. After the relay, so a watcher on a
+            # socket is never behind a channel.
+            await discord.post_pending(session_maker)
             async with session_maker() as session:
                 await purge_expired_tickets(session)
                 await purge_expired_sessions(session)

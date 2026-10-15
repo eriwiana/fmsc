@@ -381,6 +381,10 @@ class Outbox(BigIntAuditBase):
     seq: Mapped[int]
     payload: Mapped[str] = mapped_column(Text)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # The same obligation, for the other reader. Discord is a second consumer of this queue
+    # with its own pace and its own failures, so it needs its own state: sharing sent_at
+    # would mean whichever reader got there first retired the row for both.
+    discord_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         # One row per event. The auction's own counter supplies the number, so a retried
@@ -393,6 +397,14 @@ class Outbox(BigIntAuditBase):
             "auction_id",
             "seq",
             postgresql_where=text("sent_at IS NULL"),
+        ),
+        # The same again for the poster. Partial for the same reason: unposted rows are a
+        # short queue at the head of a table that only grows.
+        Index(
+            "ix_outbox_undiscorded",
+            "auction_id",
+            "seq",
+            postgresql_where=text("discord_at IS NULL"),
         ),
     )
 

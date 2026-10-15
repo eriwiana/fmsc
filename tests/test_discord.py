@@ -25,7 +25,13 @@ from nacl.signing import SigningKey
 from sqlalchemy import text
 
 from app import discord
-from app.auctions import close_due, create_auction, place_bid_tx
+from app.auctions import (
+    cancel_auction,
+    close_due,
+    create_auction,
+    place_bid_tx,
+    prune_outbox,
+)
 from app.codes import normalise
 from app.communities import link_discord, rotate
 from app.discord import MANAGE_GUILD, interactions, post_pending
@@ -408,3 +414,113 @@ async def test_a_value_that_is_not_a_snowflake_is_refused_by_name(sm):
             await _link(sm, community_id, owner_id, channel_id=channel_id, guild_id=guild_id)
         assert field in refused.value.detail
     assert await _links(sm, community_id) == []
+
+
+async def _auction(maker, owner_id: int, community_id: int | None = None, title: str = "t"):
+    async with maker() as s:
+        return await create_auction.fn(
+            data=CreateAuctionRequest(
+                title=title,
+                starting_bid=Decimal("10.00"),
+                ends_at=datetime.now(timezone.utc) + timedelta(hours=1),
+                community_id=community_id,
+            ),
+            current_user=await s.get(User, owner_id),
+            db_session=s,
+        )
+
+
+async def _unposted(maker) -> int:
+    async with maker() as s:
+        return await s.scalar(text("SELECT count(*) FROM outbox WHERE discord_at IS NULL"))
+
+
+async def test_an_event_for_an_auction_no_guild_follows_is_retired_unposted(sm, fake):
+    """A public auction has nowhere to post to, and its events still have to leave the
+    queue — the index the poster reads is partial, so a row nobody retires is a row it
+    carries forever."""
+    community_id, owner_id = await _community(sm)
+    await _auction(sm, owner_id)
+
+    assert await post_pending(sm, send=fake) == 1
+    assert fake.posts == []
+    assert await _unposted(sm) == 0
+
+
+async def test_a_second_pass_posts_nothing(sm, fake):
+    """discord_at is the record of the attempt, so a tick that runs twice says it once."""
+    _, owner_id = await _linked(sm)
+    await _auction(sm, owner_id)
+
+    assert await post_pending(sm, send=fake) == 1
+    assert await post_pending(sm, send=fake) == 0
+
+
+async def test_an_event_this_version_does_not_understand_is_skipped_not_raised(sm, fake):
+    """During a rolling deploy the queue can hold a payload written by code this version
+    does not know. A tick that died on one would stop closing auctions."""
+    community_id, owner_id = await _linked(sm)
+    auction = await _auction(sm, owner_id, community_id)
+    async with sm() as s:
+        await s.execute(
+            text(
+                "INSERT INTO outbox (auction_id, seq, payload, created_at, updated_at)"
+                " VALUES (:a, 99, :payload, clock_timestamp(), clock_timestamp())"
+            ),
+            {"a": auction.id, "payload": '{"type": "something-later", "auction_id": 1}'},
+        )
+        await s.commit()
+
+    assert await post_pending(sm, send=fake) == 2
+    assert len(fake.posts) == 1
+    assert "is open" in fake.posts[0][1]
+    assert await _unposted(sm) == 0
+
+
+async def test_a_withdrawn_lot_is_announced_and_a_closed_one_names_the_winner(sm, fake, channels):
+    """The two events a status line has to cover beyond opening. Cancelling tells the
+    guild the lot is gone, and the closer tells it what happened to the money."""
+    community_id, owner_id = await _linked(sm)
+    cancelled = await _auction(sm, owner_id, community_id, title="withdrawn lot")
+    quiet = await _auction(sm, owner_id, community_id, title="unloved lot")
+    async with sm() as s:
+        await cancel_auction.fn(
+            auction_id=cancelled.id,
+            current_user=await s.get(User, owner_id),
+            db_session=s,
+            channels=channels,
+        )
+    async with sm() as s:
+        await s.execute(
+            text(
+                "UPDATE auctions SET ends_at = clock_timestamp() - interval '1 second'"
+                " WHERE id = :id"
+            ),
+            {"id": quiet.id},
+        )
+        await s.commit()
+    assert await close_due(sm, channels) == 1
+
+    await post_pending(sm, send=fake)
+    posted = [content for _, content in fake.posts]
+    assert any("withdrawn lot" in line and "was withdrawn" in line for line in posted)
+    assert any("unloved lot" in line and "no bids" in line for line in posted)
+
+
+async def test_the_outbox_is_not_pruned_until_both_readers_have_had_it(sm, fake):
+    """prune_outbox waits for the poster as well as for the relay. Deleting a row the
+    poster has not reached is the one way an event is lost without a crash."""
+    _, owner_id = await _linked(sm)
+    await _auction(sm, owner_id)
+    async with sm() as s:
+        await s.execute(text("UPDATE outbox SET sent_at = clock_timestamp() - interval '2 days'"))
+        await s.commit()
+
+    async with sm() as s:
+        assert await prune_outbox(s) == 0
+    assert await _unposted(sm) == 1
+
+    # The control: once the poster has had it, the same prune collects it.
+    assert await post_pending(sm, send=fake) == 1
+    async with sm() as s:
+        assert await prune_outbox(s) == 1

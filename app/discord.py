@@ -18,8 +18,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Awaitable, Callable
+from datetime import datetime
 
 import httpx
+import msgspec
+from sqlalchemy import bindparam, text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +35,11 @@ PUBLIC_KEY = os.environ.get("DISCORD_PUBLIC_KEY", "")
 BASE_URL = os.environ.get("FMSC_BASE_URL", "http://localhost:8000").rstrip("/")
 
 API = "https://discord.com/api/v10"
+
+# What a caller swaps for a fake. One coroutine taking a channel and a string is the whole
+# of what the poster needs from a transport; anything larger would be a seam invented for
+# the tests rather than the shape the code uses.
+Sender = Callable[[str, str], Awaitable[bool]]
 
 # Longer than Discord's own p99 and shorter than anything a request can afford to wait on.
 # The rotate route posts inside the request that caused it.
@@ -88,3 +98,92 @@ async def send(channel_id: str, content: str) -> bool:
         response.text[:200],
     )
     return False
+
+
+# What the poster reads. The same shape as relay_pending's: a state column rather than a
+# cursor, because the outbox's ids are allocated before commit and a transaction that
+# commits late would be skipped by anything reading in id order.
+#
+# LEFT JOIN, not JOIN: an event for an auction no guild follows still has to be retired,
+# or the partial index below grows for the life of the service.
+#
+# FOR UPDATE OF o, because the nullable side of an outer join cannot be locked — and
+# nothing here wants to lock a community's link anyway. SKIP LOCKED so a second instance
+# works the rest of the queue instead of waiting behind this one.
+_UNPOSTED_SQL = text("""
+    SELECT o.id, o.payload, a.title, a.currency, d.channel_id
+      FROM outbox o
+      JOIN auctions a ON a.id = o.auction_id
+      LEFT JOIN community_discord d ON d.community_id = a.community_id
+     WHERE o.discord_at IS NULL
+     ORDER BY o.auction_id, o.seq
+       FOR UPDATE OF o SKIP LOCKED
+     LIMIT :limit
+    """)
+
+_MARK_POSTED_SQL = text(
+    "UPDATE outbox SET discord_at = clock_timestamp() WHERE id IN :ids"
+).bindparams(bindparam("ids", expanding=True))
+
+# One tick's worth. Smaller than the relay's hundred: each row is an HTTP request to
+# somebody else's service, and a channel is rate-limited to five messages per five seconds
+# anyway.
+#
+# ponytail: a hot auction therefore posts every bid, serially, and falls behind rather than
+# coalescing. Collapse a channel's pending bids into the newest one if that ever matters —
+# the sequence number in each payload is what makes it safe to drop the older ones.
+POST_BATCH = 20
+
+
+def _when(iso: str) -> str:
+    """Discord's own timestamp markup, which each viewer reads in their own timezone.
+
+    The alternative is printing Jakarta wall time at a guild that may not be in Jakarta.
+    """
+    return f"<t:{int(datetime.fromisoformat(iso).timestamp())}:f>"
+
+
+def _message(event: dict, title: str, currency: str) -> str | None:
+    """One line for one event, or None for an event a guild has nothing to hear about.
+
+    None rather than a raise: during a rolling deploy the queue can hold a payload written
+    by a version of the code this one does not know, and a tick that died on it would stop
+    closing auctions.
+    """
+    link = f"{BASE_URL}/auctions/{event['auction_id']}"
+    kind = event["type"]
+    if kind == "bid":
+        return f"**{title}** — new bid {event['amount']} {currency}, ends {_when(event['ends_at'])}. {link}"
+    if kind == "closed":
+        if event["winner_id"] is None:
+            return f"**{title}** closed with no bids."
+        return f"**{title}** closed — won at {event['amount']} {currency}."
+    if kind == "status" and event["status"] == "open":
+        return f"**{title}** is open, ends {_when(event['ends_at'])}. Bid at {link}"
+    if kind == "status" and event["status"] == "cancelled":
+        return f"**{title}** was withdrawn."
+    return None
+
+
+async def post_pending(
+    session_maker: async_sessionmaker[AsyncSession], send: Sender = send, limit: int = POST_BATCH
+) -> int:
+    """Post whatever the guilds have not been told yet. Returns how many events it retired.
+
+    A second reader of the queue the money path already fills, so what a channel is told
+    cannot disagree with what the sockets were told. Retired after the attempt rather than
+    before: a crash in between leaves the row for the next tick, and only an answer from
+    Discord — including a refusal — retires it.
+    """
+    async with session_maker() as session:
+        rows = (await session.execute(_UNPOSTED_SQL, {"limit": limit})).all()
+        for row in rows:
+            if row.channel_id is None:
+                continue
+            message = _message(msgspec.json.decode(row.payload), row.title, row.currency)
+            if message is not None:
+                await send(row.channel_id, message)
+        if rows:
+            await session.execute(_MARK_POSTED_SQL, {"ids": [row.id for row in rows]})
+        await session.commit()
+    return len(rows)
