@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import provide_current_user
 from app.models import User
-from app.schemas import SettlementResponse
+from app.schemas import SecondChanceResponse, SettlementResponse
 
 logger = logging.getLogger(__name__)
 
@@ -47,20 +47,26 @@ SETTLEMENT_GRACE = timedelta(days=7)
 # The grace period, the status and who is allowed to call all sit in the WHERE of the
 # SELECT. Past the window the SELECT produces nothing, so there is no conflict and no
 # update — the stale row is untouchable without a second read deciding it.
+#
+# The buyer of record is the second-chance offer's recipient when there is one, and the
+# winner otherwise. LEFT JOIN rather than two statements: who owes the money is one fact
+# about the auction, and reading it separately would let an offer land in between.
 _SETTLE_SQL = text("""
     INSERT INTO settlements
                 (auction_id, buyer_id, seller_settled_at, buyer_settled_at,
                  created_at, updated_at)
-         SELECT a.id, a.current_winner_id,
+         SELECT a.id, COALESCE(o.offered_to_id, a.current_winner_id),
                 CASE WHEN a.seller_id = :uid THEN clock_timestamp() END,
-                CASE WHEN a.current_winner_id = :uid THEN clock_timestamp() END,
+                CASE WHEN COALESCE(o.offered_to_id, a.current_winner_id) = :uid
+                     THEN clock_timestamp() END,
                 clock_timestamp(), clock_timestamp()
            FROM auctions a
+           LEFT JOIN second_chance_offers o ON o.auction_id = a.id
           WHERE a.id = :aid
             AND a.status = 'closed'
-            AND a.current_winner_id IS NOT NULL
+            AND COALESCE(o.offered_to_id, a.current_winner_id) IS NOT NULL
             AND a.closed_at + :grace >= clock_timestamp()
-            AND :uid IN (a.seller_id, a.current_winner_id)
+            AND :uid IN (a.seller_id, COALESCE(o.offered_to_id, a.current_winner_id))
     ON CONFLICT (auction_id) DO UPDATE
             SET seller_settled_at = COALESCE(settlements.seller_settled_at,
                                              EXCLUDED.seller_settled_at),
@@ -75,10 +81,11 @@ _SETTLE_SQL = text("""
 # pay for an explanation nobody is going to read.
 _WHY_SQL = text("""
     SELECT a.status,
-           a.current_winner_id IS NULL AS nobody_won,
-           :uid IN (a.seller_id, a.current_winner_id) AS a_party,
+           COALESCE(o.offered_to_id, a.current_winner_id) IS NULL AS nobody_won,
+           :uid IN (a.seller_id, COALESCE(o.offered_to_id, a.current_winner_id)) AS a_party,
            a.closed_at + :grace < clock_timestamp() AS too_late
       FROM auctions a
+      LEFT JOIN second_chance_offers o ON o.auction_id = a.id
      WHERE a.id = :aid
     """)
 
@@ -160,3 +167,84 @@ async def settle(
         row.buyer_settled_at is not None,
     )
     return _response(row)
+
+
+# The whole promotion, in one insert. No UPDATE of auctions: the lot stays closed and keeps
+# the winner it closed on, which is what "without reopening" means — a reopened auction
+# would also become biddable again, and the closer would have to decide what to do with it.
+#
+# The runner-up and the price come off the auction row rather than from the caller, so a
+# seller cannot offer the lot to somebody who never bid, or at a price nobody offered.
+#
+# ON CONFLICT DO NOTHING, then the row is read back below: a second click is the same offer,
+# not a new one, and answering it with the existing row keeps the endpoint idempotent.
+_OFFER_SQL = text("""
+    INSERT INTO second_chance_offers
+                (auction_id, offered_to_id, amount, created_at, updated_at)
+         SELECT a.id, a.runner_up_id, a.runner_up_bid, clock_timestamp(), clock_timestamp()
+           FROM auctions a
+          WHERE a.id = :aid
+            AND a.seller_id = :uid
+            AND a.status = 'closed'
+            AND a.runner_up_id IS NOT NULL
+    ON CONFLICT (auction_id) DO NOTHING
+      RETURNING auction_id, offered_to_id, amount
+    """)
+
+_EXISTING_OFFER_SQL = text("""
+    SELECT o.auction_id, o.offered_to_id, o.amount
+      FROM second_chance_offers o
+      JOIN auctions a ON a.id = o.auction_id
+     WHERE o.auction_id = :aid AND a.seller_id = :uid
+    """)
+
+_WHY_NO_OFFER_SQL = text("""
+    SELECT a.status,
+           a.seller_id = :uid AS is_seller,
+           a.runner_up_id IS NULL AS nobody_second
+      FROM auctions a
+     WHERE a.id = :aid
+    """)
+
+
+@post("/auctions/{auction_id:int}/second-chance", dependencies=_authed)
+async def offer_second_chance(
+    auction_id: int, current_user: User, db_session: AsyncSession
+) -> SecondChanceResponse:
+    """Offer the lot to the runner-up, at the runner-up's own last bid.
+
+    The seller's only move when a winner goes quiet, and the reason the closing statement
+    records who was second. The auction stays closed throughout.
+    """
+    user_id = current_user.id
+    params = {"aid": auction_id, "uid": user_id}
+    row = (await db_session.execute(_OFFER_SQL, params)).first()
+    if row is None:
+        # Either there is nothing to offer, or the offer already exists — DO NOTHING returns
+        # no row for both. The read tells them apart, and only on this path.
+        row = (await db_session.execute(_EXISTING_OFFER_SQL, params)).first()
+        if row is None:
+            await db_session.rollback()
+            raise await _explain_offer(db_session, auction_id, user_id)
+    await db_session.commit()
+    logger.info("second chance on auction %s offered to user %s", row.auction_id, row.offered_to_id)
+    return SecondChanceResponse(
+        auction_id=row.auction_id, offered_to_id=row.offered_to_id, amount=row.amount
+    )
+
+
+async def _explain_offer(session: AsyncSession, auction_id: int, user_id: int) -> HTTPException:
+    row = (await session.execute(_WHY_NO_OFFER_SQL, {"aid": auction_id, "uid": user_id})).first()
+    if row is None:
+        return NotFoundException(detail="no such auction")
+    if not row.is_seller:
+        return _refused("no such auction, or you are not its seller")
+    if row.status != "closed":
+        return _refused(f"this auction is {row.status}, not closed")
+    if row.nobody_second:
+        # Includes every auction that closed before the runner-up was recorded. Inventing
+        # one now would mean deciding from bids who was second after the fact, which is
+        # the deferred query the closing statement exists to avoid.
+        return _refused("this auction has no runner-up to offer it to")
+    # Unreached today, for the same reason as the settle path's fallthrough.
+    return _refused("no such auction, or you are not its seller")

@@ -87,6 +87,15 @@ class SettlementResponse(msgspec.Struct):
     settled: bool
 
 
+class SecondChanceResponse(msgspec.Struct):
+    """An offer made to the runner-up. The auction is not mentioned as reopened because it
+    is not: it stays closed, with the winner it closed on."""
+
+    auction_id: int
+    offered_to_id: int
+    amount: Decimal
+
+
 class DiscordLinkRequest(msgspec.Struct):
     """Snowflakes as Discord sends them: strings, because a 64-bit unsigned id does not
     survive a JSON number."""

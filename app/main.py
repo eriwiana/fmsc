@@ -140,6 +140,7 @@ app = Litestar(
         communities.link_discord,
         communities.interactions,
         settlement.settle,
+        settlement.offer_second_chance,
         auctions.get_auction,
         auctions.place_bid,
         auctions.auction_ws,

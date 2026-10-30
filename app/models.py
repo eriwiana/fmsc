@@ -501,3 +501,26 @@ class Settlement(BigIntAuditBase):
     buyer_settled_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+
+class SecondChanceOffer(BigIntAuditBase):
+    """The seller reaching the runner-up after a winner went quiet.
+
+    A record, not a reopening. The auction stays closed and keeps the winner it had, which
+    is what makes the history honest: the lot was won at one price and then offered on at
+    another, rather than retroactively won by somebody else.
+    """
+
+    __tablename__ = "second_chance_offers"
+    # One per auction. A seller who clicks twice has made the same offer, not a second one,
+    # and the insert leans on this to say so without reading first.
+    auction_id: Mapped[int] = mapped_column(ForeignKey("auctions.id"), unique=True)
+    # Copied from auctions.runner_up_id when the offer is made. Held here rather than read
+    # back through the auction because this is who the deal is now with, and the settlement
+    # record has to agree with it even if the auction row is later corrected.
+    offered_to_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    # The runner-up's own highest bid. They never offered more than this, so it is the only
+    # price they can be held to without being asked again.
+    amount: Mapped[Decimal] = mapped_column(Money)
+
+    __table_args__ = (CheckConstraint("amount > 0", name="amount_positive"),)

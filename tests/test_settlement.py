@@ -353,3 +353,122 @@ async def test_settling_an_auction_that_does_not_exist_is_a_404(sm, channels):
             )
 
     assert refused.value.status_code == 404
+
+
+# --- criterion 3: the second-chance offer in detail --------------------------------------
+
+
+async def test_the_offer_is_priced_at_the_runner_ups_own_bid(sm, channels):
+    """Not the winning price. The runner-up never offered more than their own last bid, so
+    it is the only number they can be held to without being asked again."""
+    aid, seller_id, _ = await _seed_closed(sm, channels)
+
+    async with sm() as s:
+        offer = await offer_second_chance.fn(
+            auction_id=aid, current_user=await s.get(User, seller_id), db_session=s
+        )
+
+    assert offer.amount == _BIDS[-2]
+
+
+async def test_offering_twice_is_the_same_offer(sm, channels):
+    """ON CONFLICT DO NOTHING, then read the row back: a second click answers with the
+    offer that already exists rather than refusing or making another."""
+    aid, seller_id, bidders = await _seed_closed(sm, channels)
+
+    async def offer():
+        async with sm() as s:
+            return await offer_second_chance.fn(
+                auction_id=aid, current_user=await s.get(User, seller_id), db_session=s
+            )
+
+    first, again = await offer(), await offer()
+
+    assert (first.auction_id, first.offered_to_id) == (again.auction_id, bidders[-2])
+    async with sm() as s:
+        assert (
+            await s.scalar(
+                text("SELECT count(*) FROM second_chance_offers WHERE auction_id = :id"),
+                {"id": aid},
+            )
+            == 1
+        )
+
+
+async def test_only_the_seller_may_offer_a_second_chance(sm, channels):
+    aid, _, bidders = await _seed_closed(sm, channels)
+
+    async with sm() as s:
+        with pytest.raises(HTTPException) as refused:
+            await offer_second_chance.fn(
+                auction_id=aid, current_user=await s.get(User, bidders[-1]), db_session=s
+            )
+
+    assert refused.value.status_code == 409
+    assert "not its seller" in refused.value.detail
+
+
+async def test_an_auction_with_no_runner_up_cannot_be_offered_on(sm, channels):
+    """One bidder, so there is nobody second. Includes every auction that closed before the
+    runner-up was recorded — deciding from bids who was second after the fact is exactly
+    the deferred query the closing statement exists to avoid."""
+    async with sm() as s:
+        seller = User(email="solo@x.com", pw_hash="x", verified_at=datetime.now(timezone.utc))
+        bidder = User(email="solo-bidder@x.com", pw_hash="x")
+        s.add_all([seller, bidder])
+        await s.flush()
+        ends_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        auction = Auction(
+            title="one bidder",
+            seller_id=seller.id,
+            currency="IDR",
+            starting_bid=Decimal("10000.00"),
+            status="open",
+            ends_at=ends_at,
+            hard_ends_at=ends_at + MAX_EXTENSION,
+        )
+        s.add(auction)
+        await s.commit()
+        aid, seller_id, bidder_id = auction.id, seller.id, bidder.id
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder_id, Decimal("100000.00")) is not None
+    async with sm() as s:
+        await s.execute(
+            text("UPDATE auctions SET ends_at = now() - interval '5 seconds' WHERE id = :id"),
+            {"id": aid},
+        )
+        await s.commit()
+    assert await close_due(sm, channels) == 1
+
+    async with sm() as s:
+        with pytest.raises(HTTPException) as refused:
+            await offer_second_chance.fn(
+                auction_id=aid, current_user=await s.get(User, seller_id), db_session=s
+            )
+
+    assert refused.value.status_code == 409
+    assert "no runner-up" in refused.value.detail
+
+
+async def test_the_runner_up_settles_once_the_offer_is_made(sm, channels):
+    """What the offer is for. The buyer of record moves to the runner-up, so they are the
+    one who can mark the deal done — and the original winner no longer can."""
+    aid, seller_id, bidders = await _seed_closed(sm, channels)
+    winner, runner_up = bidders[-1], bidders[-2]
+
+    async with sm() as s:
+        await offer_second_chance.fn(
+            auction_id=aid, current_user=await s.get(User, seller_id), db_session=s
+        )
+
+    async with sm() as s:
+        marked = await settle.fn(
+            auction_id=aid, current_user=await s.get(User, runner_up), db_session=s
+        )
+    assert marked.buyer_id == runner_up
+    assert marked.buyer_settled is True
+
+    async with sm() as s:
+        with pytest.raises(HTTPException) as refused:
+            await settle.fn(auction_id=aid, current_user=await s.get(User, winner), db_session=s)
+    assert refused.value.status_code == 409, "the winner who went quiet is no longer the buyer"
