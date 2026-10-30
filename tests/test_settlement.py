@@ -6,8 +6,8 @@ deal completed and only inside the grace period, that a seller can reach the run
 without the auction reopening, and that trust is counted from those rows rather than stored
 in a number somebody could inflate.
 
-One test per criterion, and nothing else — the behaviour each one leans on is covered in
-the commit that adds it.
+The four acceptance tests come first, one per criterion. The behaviour each of them leans
+on is pinned below it, in the commit that added that behaviour.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from sqlalchemy import text
 
 from app.auctions import MAX_EXTENSION, close_due, place_bid_tx
 from app.models import Auction, User
-from app.settlement import offer_second_chance, reputation, settle
+from app.settlement import SETTLEMENT_GRACE, offer_second_chance, reputation, settle
 
 # Three bidders, so there is a winner and a runner-up and the two are plainly different
 # people. IDR-scale amounts, each clearing the 10,000 increment the bid statement enforces
@@ -29,15 +29,20 @@ from app.settlement import offer_second_chance, reputation, settle
 _BIDS = (Decimal("100000.00"), Decimal("200000.00"), Decimal("300000.00"))
 
 
-async def _seed_closed(sm, channels) -> tuple[int, int, list[int]]:
+async def _seed_closed(sm, channels, tag: str = "") -> tuple[int, int, list[int]]:
     """An auction closed by the closer itself, with three bidders. Returns the auction id,
     the seller's id and the bidders in the order they bid.
+
+    `tag` distinguishes the users, because emails are unique and a test that needs a second
+    closed auction beside the first would otherwise collide on the seller.
 
     Closed by `close_due` rather than by an UPDATE, because criterion 1 is a claim about
     what the closing statement captures — setting the columns by hand would assert nothing.
     """
     async with sm() as s:
-        seller = User(email="seller@x.com", pw_hash="x", verified_at=datetime.now(timezone.utc))
+        seller = User(
+            email=f"seller{tag}@x.com", pw_hash="x", verified_at=datetime.now(timezone.utc)
+        )
         s.add(seller)
         await s.flush()
         ends_at = datetime.now(timezone.utc) + timedelta(hours=1)
@@ -56,7 +61,7 @@ async def _seed_closed(sm, channels) -> tuple[int, int, list[int]]:
 
         bidders = []
         for n in range(len(_BIDS)):
-            bidder = User(email=f"bidder{n}@x.com", pw_hash="x")
+            bidder = User(email=f"bidder{tag}{n}@x.com", pw_hash="x")
             s.add(bidder)
             await s.flush()
             bidders.append(bidder.id)
@@ -76,12 +81,32 @@ async def _seed_closed(sm, channels) -> tuple[int, int, list[int]]:
     return aid, seller_id, bidders
 
 
+async def _expire(sm, aid: int) -> None:
+    """Move a deadline into the past in Postgres, not from the host clock.
+
+    close_due compares ends_at against clock_timestamp(), so a deadline computed here is
+    measured against a clock that can be seconds behind this machine's — on the Docker VM
+    the suite runs against, far enough behind that a lot seeded five seconds ago is not yet
+    due and the closer correctly finds nothing.
+    """
+    async with sm() as s:
+        await s.execute(
+            text("UPDATE auctions SET ends_at = now() - interval '5 seconds' WHERE id = :id"),
+            {"id": aid},
+        )
+        await s.commit()
+
+
 async def _age_the_close(sm, aid: int, by: timedelta) -> None:
     """Push the recorded close instant into the past. Postgres does the arithmetic, so the
     host clock does not get a vote on which side of the grace period the row is on."""
     async with sm() as s:
         await s.execute(
-            text("UPDATE auctions SET closed_at = closed_at - :by WHERE id = :id"),
+            # CAST, because an untyped parameter lets Postgres read `closed_at - $1` as
+            # timestamptz minus timestamptz, which is an interval and not a close instant.
+            text(
+                "UPDATE auctions SET closed_at = closed_at - CAST(:by AS interval) WHERE id = :id"
+            ),
             {"by": by, "id": aid},
         )
         await s.commit()
@@ -118,7 +143,7 @@ async def test_a_settlement_past_the_grace_period_is_refused(sm, channels):
     assert marked.settled is True, "both sides marked it"
 
     # A second auction, left to go stale, is the one the grace period has to refuse.
-    stale, stale_seller, _ = await _seed_closed(sm, channels)
+    stale, stale_seller, _ = await _seed_closed(sm, channels, tag="-stale")
     await _age_the_close(sm, stale, timedelta(days=8))
     async with sm() as s:
         with pytest.raises(HTTPException) as refused:
@@ -170,3 +195,161 @@ async def test_reputation_is_recomputed_from_the_records(sm, channels):
     async with sm() as s:
         assert (await reputation(s, seller_id)).as_seller_settled == 0
         assert (await reputation(s, winner_id)).as_buyer_settled == 0
+
+
+# --- criterion 2: the settle route in detail ---------------------------------------------
+
+
+async def test_a_stranger_cannot_settle_somebody_elses_deal(sm, channels):
+    aid, _, _ = await _seed_closed(sm, channels)
+    async with sm() as s:
+        stranger = User(email="stranger@x.com", pw_hash="x")
+        s.add(stranger)
+        await s.commit()
+        stranger_id = stranger.id
+
+    async with sm() as s:
+        with pytest.raises(HTTPException) as refused:
+            await settle.fn(
+                auction_id=aid, current_user=await s.get(User, stranger_id), db_session=s
+            )
+
+    assert refused.value.status_code == 409
+    # The same answer an auction that does not exist gets. Telling them apart would let
+    # anyone enumerate which auctions closed with a winner.
+    assert "not a party" in refused.value.detail
+
+
+async def test_settling_twice_keeps_the_first_mark(sm, channels):
+    """Idempotent, so a double-tapped button is not a second, later settlement."""
+    aid, seller_id, _ = await _seed_closed(sm, channels)
+
+    async def mark(uid):
+        async with sm() as s:
+            return await settle.fn(
+                auction_id=aid, current_user=await s.get(User, uid), db_session=s
+            )
+
+    await mark(seller_id)
+    async with sm() as s:
+        first = await s.scalar(
+            text("SELECT seller_settled_at FROM settlements WHERE auction_id = :id"), {"id": aid}
+        )
+    await mark(seller_id)
+    async with sm() as s:
+        again = await s.scalar(
+            text("SELECT seller_settled_at FROM settlements WHERE auction_id = :id"), {"id": aid}
+        )
+
+    assert again == first
+
+
+async def test_one_side_marking_does_not_erase_the_other(sm, channels):
+    """Why the upsert COALESCEs instead of assigning. EXCLUDED carries NULL for whichever
+    column the caller is not filling, so plain assignment would have each side wipe the
+    other's mark and the deal would never read as settled."""
+    aid, seller_id, bidders = await _seed_closed(sm, channels)
+
+    for uid in (bidders[-1], seller_id):
+        async with sm() as s:
+            marked = await settle.fn(
+                auction_id=aid, current_user=await s.get(User, uid), db_session=s
+            )
+
+    assert marked.buyer_settled is True, "the buyer's earlier mark survived"
+    assert marked.seller_settled is True
+    assert marked.settled is True
+
+
+async def test_an_auction_still_open_cannot_be_settled(sm, channels):
+    """The seed closes one auction; this is a second one left open beside it.
+
+    It has a bid, deliberately. Without one the auction has no current_winner_id and the
+    statement would refuse it for having nobody to settle with, which would leave the
+    status guard itself untested — a mutation pass caught exactly that.
+    """
+    await _seed_closed(sm, channels)
+    async with sm() as s:
+        seller = User(
+            email="open-seller@x.com", pw_hash="x", verified_at=datetime.now(timezone.utc)
+        )
+        bidder = User(email="open-bidder@x.com", pw_hash="x")
+        s.add_all([seller, bidder])
+        await s.flush()
+        ends_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        auction = Auction(
+            title="still running",
+            seller_id=seller.id,
+            currency="IDR",
+            starting_bid=Decimal("10000.00"),
+            status="open",
+            ends_at=ends_at,
+            hard_ends_at=ends_at + MAX_EXTENSION,
+        )
+        s.add(auction)
+        await s.commit()
+        aid, seller_id, bidder_id = auction.id, seller.id, bidder.id
+    async with sm() as s:
+        assert await place_bid_tx(s, aid, bidder_id, Decimal("100000.00")) is not None
+
+    async with sm() as s:
+        with pytest.raises(HTTPException) as refused:
+            await settle.fn(auction_id=aid, current_user=await s.get(User, seller_id), db_session=s)
+
+    assert refused.value.status_code == 409
+    assert "not closed" in refused.value.detail
+
+
+async def test_an_auction_that_closed_with_no_winner_has_nothing_to_settle(sm, channels):
+    async with sm() as s:
+        seller = User(email="lonely@x.com", pw_hash="x", verified_at=datetime.now(timezone.utc))
+        s.add(seller)
+        await s.flush()
+        ends_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        auction = Auction(
+            title="nobody bid",
+            seller_id=seller.id,
+            currency="IDR",
+            starting_bid=Decimal("10000.00"),
+            status="open",
+            ends_at=ends_at,
+            hard_ends_at=ends_at + MAX_EXTENSION,
+        )
+        s.add(auction)
+        await s.commit()
+        aid, seller_id = auction.id, seller.id
+    await _expire(sm, aid)
+    assert await close_due(sm, channels) == 1
+
+    async with sm() as s:
+        with pytest.raises(HTTPException) as refused:
+            await settle.fn(auction_id=aid, current_user=await s.get(User, seller_id), db_session=s)
+
+    assert refused.value.status_code == 409
+    assert "no winner" in refused.value.detail
+
+
+async def test_a_settlement_on_the_last_day_of_the_grace_period_is_accepted(sm, channels):
+    """The control for the refusal in criterion 2. Without it, a guard that refused
+    everything would pass that test."""
+    aid, seller_id, _ = await _seed_closed(sm, channels)
+    await _age_the_close(sm, aid, SETTLEMENT_GRACE - timedelta(hours=1))
+
+    async with sm() as s:
+        marked = await settle.fn(
+            auction_id=aid, current_user=await s.get(User, seller_id), db_session=s
+        )
+
+    assert marked.seller_settled is True
+
+
+async def test_settling_an_auction_that_does_not_exist_is_a_404(sm, channels):
+    _, seller_id, _ = await _seed_closed(sm, channels)
+
+    async with sm() as s:
+        with pytest.raises(HTTPException) as refused:
+            await settle.fn(
+                auction_id=9_999_999, current_user=await s.get(User, seller_id), db_session=s
+            )
+
+    assert refused.value.status_code == 404

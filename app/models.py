@@ -476,3 +476,28 @@ class Bid(BigIntAuditBase):
             "(idempotency_key IS NULL) = (response IS NULL)", name="key_and_response_together"
         ),
     )
+
+
+class Settlement(BigIntAuditBase):
+    """What the two sides of a closed auction say happened after the hammer.
+
+    Money never moves through fmsc, so this is a record and not a transfer. Two nullable
+    timestamps rather than one status column: each side speaks only for itself, and
+    "settled" is then both of them being present — derived at read time, so it cannot
+    disagree with itself the way a third column would.
+    """
+
+    __tablename__ = "settlements"
+    # One per auction, which is what makes the upsert in app.settlement a single statement:
+    # whichever side marks first creates the row and the other fills its own column.
+    auction_id: Mapped[int] = mapped_column(ForeignKey("auctions.id"), unique=True)
+    # Who owed the money. Copied off the auction when the row is created rather than joined
+    # on every read, because a second-chance offer moves who that is and the record has to
+    # keep naming the person the deal was actually with.
+    buyer_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    seller_settled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    buyer_settled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
