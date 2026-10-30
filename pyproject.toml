@@ -94,6 +94,11 @@ exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:"]
 # app/auth.py's own error paths, and two re-raises kept so the next constraint added to a
 # table is not swallowed and reported as a refusal.
 #
+# M11 adds two of its own, both deliberate: the fallthrough refusal at the end of each of
+# app/settlement.py's two _explain helpers. The guards above them are the whole WHERE clause
+# of the statement each one explains, so neither is reachable today. They are kept so that a
+# guard added to a statement without a matching reason is a refusal rather than a 500.
+#
 # One more that is traced rather than untested: the handler behind link_discord's
 # uq_community_discord_guild_id refusal is reported uncovered although
 # test_a_guild_cannot_be_linked_to_two_communities drives it and a hand-run against the
