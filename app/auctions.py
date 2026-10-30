@@ -22,6 +22,7 @@ from sqlalchemy import Row, bindparam, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app import discord
 from app.auth import (
     provide_current_user,
     prune_login_attempts,
@@ -310,6 +311,20 @@ async def create_auction(
         hard_ends_at=ends_at + MAX_EXTENSION,
     )
     db_session.add(auction)
+    # flush, not commit: the id has to exist before the event can name it, and the event
+    # has to land in this transaction rather than a second one.
+    await db_session.flush()
+    if auction.status == "open":
+        # An auction created open announces itself, the same way a published draft does.
+        # Without this the only opening anybody ever hears is a draft's, and open is the
+        # default — so a watcher attached to a channel would be told about a lot's bids
+        # with nothing having said the lot existed.
+        #
+        # The bump and the row go together for the reason transition() gives: event_seq
+        # counts events published about an auction, and a bump with no event tells a
+        # watcher it missed something that never happened.
+        auction.event_seq = 1
+        db_session.add(_owed(auction, _status_event(auction)))
     await db_session.commit()
     await db_session.refresh(auction)
     return _to_response(auction, reveal_reserve=True)
@@ -655,8 +670,10 @@ _MARK_BATCH_SENT_SQL = text(
 
 # CAST, because inside a comparison Postgres cannot infer the parameter's type and
 # answers "operator does not exist: timestamp with time zone < interval".
+# Both readers, not just the sockets: a poster that fell a day behind would otherwise have
+# its queue deleted out from under it, and the guild would never hear what it missed.
 _PRUNE_OUTBOX_SQL = text(
-    "DELETE FROM outbox WHERE sent_at IS NOT NULL"
+    "DELETE FROM outbox WHERE sent_at IS NOT NULL AND discord_at IS NOT NULL"
     " AND sent_at < clock_timestamp() - CAST(:window AS interval)"
 )
 
@@ -990,6 +1007,9 @@ async def run_closer(
             await close_due(session_maker, channels)
             # Anything a previous process committed but never announced.
             await relay_pending(session_maker, channels)
+            # The same queue, read for the guilds. After the relay, so a watcher on a
+            # socket is never behind a channel.
+            await discord.post_pending(session_maker)
             async with session_maker() as session:
                 await purge_expired_tickets(session)
                 await purge_expired_sessions(session)

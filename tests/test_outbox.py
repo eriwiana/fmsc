@@ -162,7 +162,14 @@ async def test_sent_events_are_pruned_once_they_are_old_enough(sm, channels):
     bidder, _, aid = await _seed(sm)
     await _post_bid(sm, aid, bidder, "10.00", channels)
     async with sm() as s:
-        await s.execute(text("UPDATE outbox SET sent_at = clock_timestamp() - interval '2 days'"))
+        # Both readers, because the window is what this test is about. That the prune
+        # waits for the poster as well as the relay is tested in test_discord.py.
+        await s.execute(
+            text(
+                "UPDATE outbox SET sent_at = clock_timestamp() - interval '2 days',"
+                " discord_at = clock_timestamp()"
+            )
+        )
         await s.commit()
 
     async with sm() as s:

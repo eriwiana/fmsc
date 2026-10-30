@@ -65,6 +65,18 @@ class CodeResponse(msgspec.Struct):
     """The one and only time the code is readable. Nothing stores it."""
 
     code: str
+    # Whether the community's Discord channel was told. False also means there is no
+    # channel, which is the common case — reported rather than hidden, because the owner
+    # is the only one who can then pass the code on themselves.
+    broadcast: bool = False
+
+
+class DiscordLinkRequest(msgspec.Struct):
+    """Snowflakes as Discord sends them: strings, because a 64-bit unsigned id does not
+    survive a JSON number."""
+
+    guild_id: str
+    channel_id: str
 
 
 class GenerationResponse(msgspec.Struct):

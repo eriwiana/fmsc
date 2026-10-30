@@ -257,7 +257,10 @@ def test_a_socket_receives_a_snapshot_before_any_event(client, clean_db):
     assert snapshot["auction"] == current
     # The number the client resumes from: without it, the first live event's seq could be
     # 1 or 500 and the client has no way to know whether it missed anything.
-    assert snapshot["seq"] == 1
+    #
+    # Two, not one: creating the auction announced that it was open, and the bid above is
+    # the second thing to have happened to it.
+    assert snapshot["seq"] == 2
 
 
 def test_a_watcher_receives_a_bid_over_a_real_socket(client, clean_db):
@@ -357,8 +360,8 @@ def test_a_socket_that_fell_behind_is_dropped(client, clean_db):
     with client.websocket_connect(
         f"/ws/auctions/{auction_id}?ticket={_ticket(client, watcher)}"
     ) as socket:
-        assert socket.receive_json(timeout=READ_TIMEOUT)["seq"] == 0
-        # Events 1 and 2 never arrive; 3 does.
+        assert socket.receive_json(timeout=READ_TIMEOUT)["seq"] == 1
+        # Event 2 never arrives; 3 does.
         channels.publish(
             {"type": "bid", "auction_id": auction_id, "seq": 3}, f"auction:{auction_id}"
         )
@@ -386,11 +389,11 @@ def test_a_relayed_duplicate_is_not_sent_twice(client, clean_db):
             json={"amount": "12.00"},
         )
         assert placed.status_code == 201, placed.text
-        assert socket.receive_json(timeout=READ_TIMEOUT)["seq"] == 1
+        assert socket.receive_json(timeout=READ_TIMEOUT)["seq"] == 2
 
         # What the relay would send after a crash between publish and mark-sent.
         channels.publish(
-            {"type": "bid", "auction_id": auction_id, "seq": 1}, f"auction:{auction_id}"
+            {"type": "bid", "auction_id": auction_id, "seq": 2}, f"auction:{auction_id}"
         )
         with pytest.raises(Empty):
             socket.receive(timeout=1.0)
