@@ -472,3 +472,144 @@ async def test_the_runner_up_settles_once_the_offer_is_made(sm, channels):
         with pytest.raises(HTTPException) as refused:
             await settle.fn(auction_id=aid, current_user=await s.get(User, winner), db_session=s)
     assert refused.value.status_code == 409, "the winner who went quiet is no longer the buyer"
+
+
+async def test_offering_a_second_chance_on_an_auction_that_does_not_exist_is_a_404(sm, channels):
+    _, seller_id, _ = await _seed_closed(sm, channels)
+
+    async with sm() as s:
+        with pytest.raises(HTTPException) as refused:
+            await offer_second_chance.fn(
+                auction_id=9_999_999, current_user=await s.get(User, seller_id), db_session=s
+            )
+
+    assert refused.value.status_code == 404
+
+
+async def test_an_auction_still_open_cannot_be_offered_on(sm, channels):
+    """The runner-up is only known once the closing statement has run, so there is nothing
+    to offer while the lot is still live."""
+    await _seed_closed(sm, channels)
+    async with sm() as s:
+        seller = User(
+            email="live-seller@x.com", pw_hash="x", verified_at=datetime.now(timezone.utc)
+        )
+        s.add(seller)
+        await s.flush()
+        ends_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        auction = Auction(
+            title="live",
+            seller_id=seller.id,
+            currency="IDR",
+            starting_bid=Decimal("10000.00"),
+            status="open",
+            ends_at=ends_at,
+            hard_ends_at=ends_at + MAX_EXTENSION,
+        )
+        s.add(auction)
+        await s.commit()
+        aid, seller_id = auction.id, seller.id
+
+    async with sm() as s:
+        with pytest.raises(HTTPException) as refused:
+            await offer_second_chance.fn(
+                auction_id=aid, current_user=await s.get(User, seller_id), db_session=s
+            )
+
+    assert refused.value.status_code == 409
+    assert "not closed" in refused.value.detail
+
+
+# --- criterion 4: reputation in detail ----------------------------------------------------
+
+
+async def test_nobody_with_no_closed_deals_has_any_record(sm, channels):
+    aid, _, _ = await _seed_closed(sm, channels)
+    async with sm() as s:
+        nobody = User(email="nobody@x.com", pw_hash="x")
+        s.add(nobody)
+        await s.commit()
+        nobody_id = nobody.id
+
+    async with sm() as s:
+        counts = await reputation(s, nobody_id)
+
+    assert counts == (0, 0, 0, 0)
+
+
+async def test_a_deal_nobody_marked_counts_against_both_once_the_window_goes(sm, channels):
+    """A default is the absence of a mark after the grace period, which is why it is
+    counted against the same window the settle route enforces."""
+    aid, seller_id, bidders = await _seed_closed(sm, channels)
+
+    # Inside the window nobody has defaulted yet: it is merely still pending.
+    async with sm() as s:
+        assert (await reputation(s, seller_id)).as_seller_defaulted == 0
+        assert (await reputation(s, bidders[-1])).as_buyer_defaulted == 0
+
+    await _age_the_close(sm, aid, SETTLEMENT_GRACE + timedelta(hours=1))
+
+    async with sm() as s:
+        assert (await reputation(s, seller_id)).as_seller_defaulted == 1
+        assert (await reputation(s, bidders[-1])).as_buyer_defaulted == 1
+
+
+async def test_only_the_side_that_never_marked_is_the_defaulter(sm, channels):
+    """The asymmetry that makes the record worth keeping: a seller who did their part is
+    not tarred by a buyer who did not."""
+    aid, seller_id, bidders = await _seed_closed(sm, channels)
+    winner = bidders[-1]
+
+    async with sm() as s:
+        await settle.fn(auction_id=aid, current_user=await s.get(User, seller_id), db_session=s)
+    await _age_the_close(sm, aid, SETTLEMENT_GRACE + timedelta(hours=1))
+
+    async with sm() as s:
+        seller_counts = await reputation(s, seller_id)
+        buyer_counts = await reputation(s, winner)
+
+    assert (seller_counts.as_seller_settled, seller_counts.as_seller_defaulted) == (0, 0)
+    assert buyer_counts.as_buyer_defaulted == 1
+
+
+async def test_an_auction_that_closed_with_no_winner_counts_for_nobody(sm, channels):
+    """There is no deal, so there is nothing anyone failed to do."""
+    async with sm() as s:
+        seller = User(email="unsold@x.com", pw_hash="x", verified_at=datetime.now(timezone.utc))
+        s.add(seller)
+        await s.flush()
+        ends_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        auction = Auction(
+            title="unsold",
+            seller_id=seller.id,
+            currency="IDR",
+            starting_bid=Decimal("10000.00"),
+            status="open",
+            ends_at=ends_at,
+            hard_ends_at=ends_at + MAX_EXTENSION,
+        )
+        s.add(auction)
+        await s.commit()
+        aid, seller_id = auction.id, seller.id
+    await _expire(sm, aid)
+    assert await close_due(sm, channels) == 1
+    await _age_the_close(sm, aid, SETTLEMENT_GRACE + timedelta(hours=1))
+
+    async with sm() as s:
+        assert await reputation(s, seller_id) == (0, 0, 0, 0)
+
+
+async def test_the_runner_up_carries_the_record_once_the_offer_is_made(sm, channels):
+    """The offer moves who the deal is with, so it moves whose record it lands on."""
+    aid, seller_id, bidders = await _seed_closed(sm, channels)
+    winner, runner_up = bidders[-1], bidders[-2]
+
+    async with sm() as s:
+        await offer_second_chance.fn(
+            auction_id=aid, current_user=await s.get(User, seller_id), db_session=s
+        )
+    await _age_the_close(sm, aid, SETTLEMENT_GRACE + timedelta(hours=1))
+
+    async with sm() as s:
+        assert (await reputation(s, runner_up)).as_buyer_defaulted == 1
+        assert await reputation(s, winner) == (0, 0, 0, 0), "no longer the buyer of record"

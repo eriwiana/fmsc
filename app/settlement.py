@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 from datetime import timedelta
+from typing import NamedTuple
 
 from litestar import post
 from litestar.di import Provide
@@ -248,3 +249,72 @@ async def _explain_offer(session: AsyncSession, auction_id: int, user_id: int) -
         return _refused("this auction has no runner-up to offer it to")
     # Unreached today, for the same reason as the settle path's fallthrough.
     return _refused("no such auction, or you are not its seller")
+
+
+class Reputation(NamedTuple):
+    """What the rows say about one person, counted fresh every time.
+
+    Not a model and not stored anywhere. The criterion is that these cannot drift, and the
+    only way a count cannot drift from the records is to not keep it.
+    """
+
+    as_seller_settled: int
+    as_seller_defaulted: int
+    as_buyer_settled: int
+    as_buyer_defaulted: int
+
+
+# One statement, counting the same set of closed auctions four ways.
+#
+# A default is the absence of a mark once the window has gone, which is why it is computed
+# against the same grace period the settle route enforces: anything inside the window is
+# still pending and nobody is a defaulter yet. FILTER reads a NULL condition as false, so a
+# LEFT JOIN that matched nothing counts as unmarked rather than dropping the row.
+#
+# "Settled" is both marks, on the same definition the response uses. Deriving it twice from
+# the two timestamps is what makes it impossible for a count and a row to disagree.
+_REPUTATION_SQL = text("""
+    SELECT count(*) FILTER (WHERE is_seller AND settled) AS as_seller_settled,
+           count(*) FILTER (WHERE is_seller AND seller_missed) AS as_seller_defaulted,
+           count(*) FILTER (WHERE is_buyer AND settled) AS as_buyer_settled,
+           count(*) FILTER (WHERE is_buyer AND buyer_missed) AS as_buyer_defaulted
+      FROM (
+        SELECT a.seller_id = :uid AS is_seller,
+               COALESCE(o.offered_to_id, a.current_winner_id) = :uid AS is_buyer,
+               s.seller_settled_at IS NOT NULL
+                   AND s.buyer_settled_at IS NOT NULL AS settled,
+               a.closed_at + :grace < clock_timestamp()
+                   AND s.seller_settled_at IS NULL AS seller_missed,
+               a.closed_at + :grace < clock_timestamp()
+                   AND s.buyer_settled_at IS NULL AS buyer_missed
+          FROM auctions a
+          LEFT JOIN second_chance_offers o ON o.auction_id = a.id
+          LEFT JOIN settlements s ON s.auction_id = a.id
+         -- Nothing observable rests on the status today, and a mutation pass proved it:
+         -- a non-closed auction has a NULL closed_at, which makes both *_missed NULL and
+         -- so false, and it cannot carry a settlement row because the settle statement
+         -- requires 'closed' itself. Kept because this counts closed deals, and a later
+         -- edge that sets closed_at on anything else would otherwise be counted silently.
+         WHERE a.status = 'closed'
+           AND COALESCE(o.offered_to_id, a.current_winner_id) IS NOT NULL
+           AND (a.seller_id = :uid
+                OR COALESCE(o.offered_to_id, a.current_winner_id) = :uid)
+      ) deals
+    """)
+
+
+async def reputation(session: AsyncSession, user_id: int) -> Reputation:
+    """What this person's closed deals came to, as seller and as buyer.
+
+    Recomputed on every call. A stored total would be one write away from disagreeing with
+    the rows it claims to summarise, and the row is the thing anyone would be shown.
+    """
+    row = (
+        await session.execute(_REPUTATION_SQL, {"uid": user_id, "grace": SETTLEMENT_GRACE})
+    ).one()
+    return Reputation(
+        as_seller_settled=row.as_seller_settled,
+        as_seller_defaulted=row.as_seller_defaulted,
+        as_buyer_settled=row.as_buyer_settled,
+        as_buyer_defaulted=row.as_buyer_defaulted,
+    )
