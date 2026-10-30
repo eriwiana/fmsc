@@ -316,6 +316,16 @@ class Auction(BigIntAuditBase):
     # the only floor. Evaluated inside the bid statement, never in the handler.
     reserve: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
     current_winner_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    # Who the seller may fall back on, and at their own highest bid. Both written by the
+    # closing UPDATE rather than worked out afterwards: a later query would read the bids of
+    # an auction that has already been announced as over, and two readers could disagree
+    # about who was second. NULL means nobody was — a lot with one bidder or none.
+    runner_up_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    runner_up_bid: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
+    # When the closing statement shut it, which is what the settlement grace period counts
+    # from. Not ends_at: an auction closes when the closer gets to it, and on a busy tick or
+    # after a restart that is measurably later than the deadline it was due at.
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     bid_count: Mapped[int] = mapped_column(default=0)
     # draft | open | closed | cancelled. A draft is unannounced, cancelled is withdrawn
     # before anybody committed. The legal edges between them live in app.auctions.
@@ -356,6 +366,16 @@ class Auction(BigIntAuditBase):
             "reserve IS NULL OR reserve >= starting_bid", name="reserve_at_least_starting"
         ),
         CheckConstraint("event_seq >= 0", name="event_seq_not_negative"),
+        # A seller offered a second chance to the person who already won has been told
+        # nothing useful, and the runner-up's own bid is what that offer is priced at — so
+        # the two columns are either both set or both absent.
+        CheckConstraint(
+            "runner_up_id IS NULL OR runner_up_id <> current_winner_id",
+            name="runner_up_is_not_the_winner",
+        ),
+        CheckConstraint(
+            "(runner_up_id IS NULL) = (runner_up_bid IS NULL)", name="runner_up_has_a_bid"
+        ),
         CheckConstraint(CURRENCY_IS_A_CODE, name="currency_is_a_code"),
         # What the bid's composite foreign key points at. Postgres requires a unique
         # constraint on the referenced columns, and this one also means an auction cannot

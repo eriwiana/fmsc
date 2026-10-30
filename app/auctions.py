@@ -956,17 +956,44 @@ async def auction_ws(
 #
 # ponytail: the batch is unbounded. Add `ORDER BY ends_at LIMIT n` to the CTE if a single
 # tick ever closes enough auctions for one transaction to matter.
+#
+# The runner-up is settled here rather than looked up later, for the same reason the winner
+# is: once this statement commits the auction is announced as over, and a second reader of
+# `bids` could decide a different person was second. `due` has to carry current_winner_id
+# because Postgres will not let the LATERAL reference the UPDATE's own target table.
+#
+# Grouped by bidder, so a bidder outbid by their own later bid is not their own runner-up.
+# `bids` holds accepted bids only — place_bid_tx writes one after the money statement
+# matched — so there are no rejected attempts to filter out. The tie-break on user_id is
+# arbitrary but fixed, which matters only for two equal top bids by different people; the
+# bid statement makes that unreachable today, and a stable order is cheaper than reasoning
+# about whether it stays unreachable.
 _CLOSE_SQL = text("""
     WITH due AS (
-        SELECT id FROM auctions
+        SELECT id, current_winner_id FROM auctions
          WHERE status = 'open' AND ends_at <= clock_timestamp()
            FOR UPDATE SKIP LOCKED
+    ), next_best AS (
+        SELECT due.id, ru.user_id, ru.amount
+          FROM due
+          LEFT JOIN LATERAL (
+              SELECT b.user_id, max(b.amount) AS amount
+                FROM bids b
+               WHERE b.auction_id = due.id
+                 AND b.user_id IS DISTINCT FROM due.current_winner_id
+               GROUP BY b.user_id
+               ORDER BY max(b.amount) DESC, b.user_id
+               LIMIT 1
+          ) ru ON true
     )
-    UPDATE auctions a SET status = 'closed', event_seq = a.event_seq + 1
-      FROM due
-     WHERE a.id = due.id
-    RETURNING a.id, a.current_winner_id, a.current_bid, a.ends_at, a.event_seq,
-              clock_timestamp() - a.ends_at AS late_by
+    UPDATE auctions a SET status = 'closed', event_seq = a.event_seq + 1,
+                          closed_at = clock_timestamp(),
+                          runner_up_id = next_best.user_id,
+                          runner_up_bid = next_best.amount
+      FROM next_best
+     WHERE a.id = next_best.id
+    RETURNING a.id, a.current_winner_id, a.runner_up_id, a.current_bid, a.ends_at,
+              a.event_seq, clock_timestamp() - a.ends_at AS late_by
     """)
 
 
