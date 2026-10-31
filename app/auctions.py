@@ -5,6 +5,7 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from typing import NamedTuple
 
 import msgspec
 from litestar import Request, WebSocket, get, patch, post, websocket
@@ -768,9 +769,22 @@ async def place_bid_tx(
     return row
 
 
+class Rejection(NamedTuple):
+    """Why a bid was refused, said twice: once for the bidder and once for the logs.
+
+    `detail` is the sentence the client is shown and may be reworded whenever it reads
+    badly. `guard` is a stable token that may not, because a log query groups by it — and
+    "the absence of a double-win is provable from the logs" stops being true the moment a
+    copy edit changes what the logs say.
+    """
+
+    guard: str
+    detail: str
+
+
 async def reject_reason(
     session: AsyncSession, auction_id: int, user_id: int, amount: Decimal
-) -> str:
+) -> Rejection:
     """Why the bid statement matched nothing. One extra read, on the reject path only.
 
     The row it reads is a moment newer than the one the statement saw, so this is a
@@ -778,29 +792,39 @@ async def reject_reason(
     order mirrors the guards in _BID_SQL so the wording matches what actually failed.
     """
     if not _is_valid_amount(amount):
-        return f"amount must be between 0.01 and {MAX_BID}, to at most 2 decimal places"
+        return Rejection(
+            "amount_invalid",
+            f"amount must be between 0.01 and {MAX_BID}, to at most 2 decimal places",
+        )
     auction = await session.get(Auction, auction_id)
     if auction is None:
-        return "auction not found"
+        return Rejection("auction_missing", "auction not found")
     if auction.status != "open":
-        return "auction is closed"
+        return Rejection("auction_closed", "auction is closed")
     if auction.ends_at <= datetime.now(timezone.utc):
-        return "auction has ended"
+        return Rejection("auction_ended", "auction has ended")
     if auction.seller_id == user_id:
-        return "a seller cannot bid on their own auction"
+        return Rejection("seller_is_bidder", "a seller cannot bid on their own auction")
     if amount < auction.starting_bid:
-        return f"bid must be at least {auction.starting_bid}"
+        return Rejection("below_starting_bid", f"bid must be at least {auction.starting_bid}")
     if auction.reserve is not None and amount < auction.reserve:
         # The number is not in the message. A reserve a bidder can read is a reserve they
         # can bid exactly, which is the seller's floor turned into the seller's ceiling.
-        return "the seller's reserve has not been met"
+        return Rejection("reserve_not_met", "the seller's reserve has not been met")
     if auction.current_bid is not None:
         least = auction.current_bid + bid_increment(auction.current_bid)
         if amount < least:
             # The number, not the rule: a bidder needs to know what to type, and working
             # the band table out from a refusal is not their job.
-            return f"bid must be at least {least}"
-    return "outbid while the bid was in flight"
+            return Rejection("below_increment", f"bid must be at least {least}")
+    return Rejection("outbid_in_flight", "outbid while the bid was in flight")
+
+
+# The three outcomes that place no bid, in the same shape as the accepted line above, so a
+# log query reads every outcome of one auction without knowing which it is looking at. A
+# replay has no guard to name and says "-" rather than leaving the field out, because a
+# line of a different shape is a line the query misses.
+_BID_LOG = "bid auction_id=%s user_id=%s amount=%s result=%s guard=%s"
 
 
 @post("/auctions/{auction_id:int}/bids", dependencies=_authed)
@@ -843,19 +867,39 @@ async def place_bid(
                 # ponytail: the request body is one field, so the stored amount is the
                 # whole fingerprint. Hash the body if BidRequest ever grows.
                 if first.amount != data.amount:
+                    logger.info(
+                        _BID_LOG, auction_id, user_id, data.amount, "rejected", "key_reused"
+                    )
                     raise HTTPException(
                         status_code=HTTP_409_CONFLICT,
                         detail=f"{IDEMPOTENCY_HEADER} was already used with a different amount",
                     )
+                # Its own result: a replay placed no bid, so counting it as accepted would
+                # overstate the bids and counting it as rejected would overstate refusals.
+                logger.info(_BID_LOG, auction_id, user_id, data.amount, "replayed", "-")
                 # Decoded back into the struct so the reply goes through the same encoder
                 # litestar used the first time and the two bodies are identical.
                 return msgspec.json.decode(first.response, type=AuctionResponse)
-        raise ClientException(await reject_reason(db_session, auction_id, user_id, data.amount))
+        rejection = await reject_reason(db_session, auction_id, user_id, data.amount)
+        logger.info(_BID_LOG, auction_id, user_id, data.amount, "rejected", rejection.guard)
+        raise ClientException(rejection.detail)
     # Published here rather than left to the relay: a bid that waited for the next tick
     # would reach watchers a second late. The outbox row is the safety net, not the path.
     #
     # The event carries ends_at because a bid inside the window moves the deadline —
     # without it a watcher's countdown runs out on a deadline that no longer exists.
+    # The accepted half of criterion 2. event_seq is what makes a double-win disprovable:
+    # the bid statement assigns it in the same UPDATE that moves the winner, so two bidders
+    # cannot hold the same number on one auction, and winner_id says who leads after this
+    # bid. Both are read off the row the statement returned, not re-queried.
+    logger.info(
+        "bid auction_id=%s user_id=%s amount=%s result=accepted event_seq=%s winner_id=%s",
+        auction_id,
+        user_id,
+        data.amount,
+        auction.event_seq,
+        auction.current_winner_id,
+    )
     channels.publish(_bid_event(auction, data.amount), _channel(auction_id))
     await mark_sent(db_session, auction_id, auction.event_seq)
     return _to_response(auction)
@@ -1012,10 +1056,19 @@ async def close_due(
         session.add_all([_owed(row, event) for row, event in zip(rows, events, strict=True)])
         await session.commit()
     for row, event in zip(rows, events, strict=True):
-        # How far past its deadline an auction actually closed. The interval is measured
-        # by Postgres, so it covers the poll interval and any time the tick spent queued.
+        # The line a double-win would show up on. The bid lines say who led after each
+        # bid; this says who the auction was actually declared to, at which event_seq, so
+        # the two can be checked against each other without trusting either alone.
+        #
+        # late_by is how far past its deadline the auction actually closed, measured by
+        # Postgres: it covers the poll interval and any time the tick spent queued.
         logger.info(
-            "closed auction %s %.3fs after its deadline", row.id, row.late_by.total_seconds()
+            "closed auction_id=%s winner_id=%s runner_up_id=%s event_seq=%s late_by=%.3f",
+            row.id,
+            row.current_winner_id,
+            row.runner_up_id,
+            row.event_seq,
+            row.late_by.total_seconds(),
         )
         channels.publish(event, _channel(row.id))
     if rows:
