@@ -15,7 +15,8 @@ Jakarta wall time, responses render `+07:00`. Process runs with `TZ=Asia/Jakarta
 
 ## API
 - `POST /auth/signup`, `POST /auth/login` → `{token}`. A password under **12 characters**
-  is refused; repeated failed logins answer **429** with `Retry-After`
+  is refused; repeated failed logins answer **429** with `Retry-After`, and so does any
+  route over the per-address budget — see [Hardening](#hardening)
 - `POST /auth/logout` → **204**, revokes the token it was given. `POST /auth/logout-all`
   (auth) → **204**, revokes every session the user has
 - `POST /auctions` (auth, **verified address only**) — `{title, starting_bid, ends_at, currency?, reserve?, status?}`
@@ -140,10 +141,13 @@ it who mistypes and then succeeds. Keeping the address count intact would need a
 `cleared_at` column filtered on in both buckets, which is more machinery than the leak is
 worth today.
 
-`X-Forwarded-For` is read from the **right**. Only the rightmost entry was appended by the
-proxy in front of the app; everything to its left is whatever the client typed. Reading
-from the left would let an attacker have a new address per request and spend the budget of
-an address they do not hold.
+`X-Forwarded-For` is read from the **right**, and only when the request arrived through a
+private or loopback hop. The rightmost entry is the one a proxy in front appended;
+everything to its left is whatever the client typed, so reading from the left would let an
+attacker have a new address per request and spend the budget of an address they do not hold.
+Reached without a proxy the whole header is the caller's to choose, which is why a public
+peer is counted as itself instead — see [Hardening](#hardening) for the switch that
+overrides that.
 
 ### Verification
 `users.verified_at` is NULL until the address has been proved — signup never sets it, which
@@ -588,6 +592,92 @@ psql has no referent and is refused, and an auction cannot be redenominated whil
 at the pair. Settling an IDR auction against an amount read as USD is an error of four
 orders of magnitude in what is owed, so it is not left to the application to remember.
 
+## Hardening
+**Every HTTP route is rate limited per address.** 120 requests a minute by default,
+`FMSC_RATE_LIMIT_PER_MINUTE` to change it, `0` to turn it off. Over the budget the answer
+is **429** with `Retry-After` and the `RateLimit-*` headers from the IETF draft. The
+address is the *rightmost* `X-Forwarded-For` entry, the same one the login lockout counts
+against — the leftmost is whatever the client claimed, and the socket peer behind a proxy
+is one address for everybody.
+
+**The header is only believed through a hop that could be the proxy** — a private or loopback
+peer. Reached directly, every entry in it is the caller's to choose, which makes it worse
+than useless: a fresh value per request dodges every budget, and a victim's address in the
+last position spends theirs, five of which locks that address out of logins for the window.
+A public peer is counted as itself. `FMSC_TRUST_PROXY_HEADERS=1` forces the header to be read
+anyway, for a platform whose own router reaches the app from a public address — carrier-grade
+NAT, `100.64.0.0/10`, is one such case, because Python's `ipaddress` calls that range public.
+
+`/health` is excluded so an uptime monitor does not spend the budget of whatever address it
+arrives from. WebSocket connections are not counted: a socket is one request, and it is
+already gated by a single-use ticket. **Unmatched paths are not counted either**, because
+Litestar's limiter keys its budget off the matched route handler and there is nothing to read
+on a path that matches none. A flood of 404s is therefore unbudgeted — it costs routing and
+no handler, no query and no session, which is cheap but not free, and it is the one gap in
+"every route is limited".
+
+The budget is held in memory, per process, so two instances allow two budgets. The upgrade
+is a `RedisStore` named `rate_limit`, at the same point the single-instance migration note
+in the `Dockerfile` applies.
+
+**Every bid leaves one log line, and that is what makes "no double-win" checkable.** logfmt
+on stdout, which is what Railway captures:
+
+```
+bid auction_id=7 user_id=3 amount=200000.00 currency=IDR result=accepted event_seq=4 winner_id=3
+bid auction_id=7 user_id=9 amount=200000.01 result=rejected guard=below_increment
+bid auction_id=7 user_id=9 amount=200000.00 result=replayed guard=-
+closed auction_id=7 winner_id=3 runner_up_id=9 event_seq=5 late_by=0.412
+```
+
+Only the accepted line carries a `currency`: a refused bid never reached the auction row, and
+the currency is the auction's rather than anything the client sent.
+
+`event_seq` is assigned by the bid statement in the same `UPDATE` that moves the winner, so
+two accepted bids on one auction can never carry the same number. Two bidders both told
+they won would therefore show as a repeated `event_seq`, or as a `closed` line naming
+somebody other than the last `result=accepted` bidder:
+
+```
+grep 'auction_id=7 ' app.log | grep -c 'result=accepted event_seq=4'   # must be 1
+```
+
+`guard` is a stable token — `below_increment`, `reserve_not_met`, `outbid_in_flight` and so
+on — not the sentence the bidder is shown. The sentence is free to be reworded; a log query
+grouping by the token is not. A replay is its own result rather than an accepted bid or a
+refused one: it placed no bid, so counting it either way would overstate something.
+
+**Security headers are on every response**, including the ones no route built:
+
+| Header | Value |
+|---|---|
+| `X-Content-Type-Options` | `nosniff` |
+| `X-Frame-Options` | `DENY` |
+| `Referrer-Policy` | `no-referrer` |
+| `Content-Security-Policy` | `default-src 'none'; frame-ancestors 'none'` |
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` |
+
+This service answers JSON and nothing else — no page, no form, no script, no cookie — so
+each one is the strictest form available rather than a compromise with something the project
+serves. They are set by a middleware wrapped around the whole application, not by Litestar's
+`response_headers`: both that and app-level middleware are layers on a *route*, and a 404
+matches no route, so neither reached it. A header set that stops at the error paths is a
+header set with a hole in it.
+
+**CI fails on a dependency with a published advisory.** `pip-audit`, pinned, over the lock
+exported with the same flags the image installs with — so the subject is the artifact
+production runs, not the range `pyproject.toml` would permit. An advisory with no fix
+available is handled with `--ignore-vuln <id>` and a dated reason in the workflow, never by
+dropping the step.
+
+**The container runs as uid 10001 with no toolchain.** Two stages: `uv` builds the
+virtualenv, and the final image is a plain `python:3.12-slim-bookworm` with the venv copied
+in — no `uv`, no package cache, no compiler, 394MB against the 594MB it replaced. The
+application's own files are owned by root and only readable, so it cannot overwrite its own
+code. CI asserts the uid and the absence of a compiler on the built image rather than
+reading them off the `Dockerfile`, because a base image can hand either back without this
+repo changing a line.
+
 ## Guardrails
 The invariants the bid path assumes are enforced by the schema, not only by Python —
 `update`, a migration and psql all bypass the handlers:
@@ -647,8 +737,11 @@ healthcheck is `/health`.
 
 `FMSC_CODE_PEPPER` has to be set, to at least 32 characters, or the app refuses to start —
 see [Invite codes](#invite-codes) for why a default or a per-boot value would be worse than
-refusing. `CHANNELS_URL`, `FMSC_BASE_URL` and the three `DISCORD_*` variables are optional;
-what each one switches on is in [Scaling out](#scaling-out) and [Discord](#discord).
+refusing. `CHANNELS_URL`, `FMSC_BASE_URL`, `FMSC_RATE_LIMIT_PER_MINUTE`, `FMSC_TRUST_PROXY_HEADERS`
+and the three `DISCORD_*` variables are optional; what each one switches on is in
+[Scaling out](#scaling-out), [Hardening](#hardening) and [Discord](#discord). Unset means a rate limit of 120 a minute,
+not none — forgetting the variable leaves the limit on, and a value that is not a number
+stops the process at startup rather than leaving it serving with a budget nobody can read.
 
 Build and run it locally exactly as Railway does:
 
@@ -685,10 +778,13 @@ money in Indonesia is Bank Indonesia's territory, and separately unresolved — 
 already ships, not just for escrow — is whether an online *lelang* needs a *balai lelang*
 licence. All five models need the same substrate, which is why it was built first.
 
-The donation link, for the same family of reasons. It is a third-party account handled
-deliberately outside this codebase, and the provider is not chosen: a local-only service
-reaches fewer regions than the auctions do, so an internationally usable one has to be
-picked before the column is.
+The donation link, for the same family of reasons, and now deferred twice — out of M11 and
+then out of M12, which was the last milestone, so no milestone carries it. It is a tip jar
+for the project and it is deliberately only a link: a URL hands every amount, webhook,
+ledger and custody question to the third party, which is the same wall the escrow question
+runs into. What is unresolved is the provider, not the column — a local-only service reaches
+fewer regions than the auctions do, so an internationally usable one has to be picked first,
+and nothing renders a link yet either.
 
 Disputes and arbitration, which is what any custody model would need next. Nothing
 announces a settlement or an offer either, over sockets or to a guild — the seam is `_owed`.
