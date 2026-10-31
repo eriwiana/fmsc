@@ -179,6 +179,17 @@ async def settle(
 #
 # ON CONFLICT DO NOTHING, then the row is read back below: a second click is the same offer,
 # not a new one, and answering it with the existing row keeps the endpoint idempotent.
+#
+# The same grace period as settling, because an offer outside it is worse than useless: the
+# runner-up could not mark it done anyway, and the offer would still move who the buyer of
+# record is — which is to say it would clear the record of a winner who never paid and plant
+# one on somebody who was never asked while there was time to answer.
+#
+# And not once either side has gone on record. A settlement row names the buyer it was
+# created for and keeps that name, so an offer landing afterwards would leave the record
+# claiming one person and the auction implying another, with the new buyer's own mark
+# discarded by the upsert's COALESCE. A seller who marked a deal done cannot then vacate it;
+# there is no un-marking anywhere in this project, by design.
 _OFFER_SQL = text("""
     INSERT INTO second_chance_offers
                 (auction_id, offered_to_id, amount, created_at, updated_at)
@@ -188,6 +199,8 @@ _OFFER_SQL = text("""
             AND a.seller_id = :uid
             AND a.status = 'closed'
             AND a.runner_up_id IS NOT NULL
+            AND a.closed_at + :grace >= clock_timestamp()
+            AND NOT EXISTS (SELECT 1 FROM settlements s WHERE s.auction_id = a.id)
     ON CONFLICT (auction_id) DO NOTHING
       RETURNING auction_id, offered_to_id, amount
     """)
@@ -202,7 +215,9 @@ _EXISTING_OFFER_SQL = text("""
 _WHY_NO_OFFER_SQL = text("""
     SELECT a.status,
            a.seller_id = :uid AS is_seller,
-           a.runner_up_id IS NULL AS nobody_second
+           a.runner_up_id IS NULL AS nobody_second,
+           a.closed_at + :grace < clock_timestamp() AS too_late,
+           EXISTS (SELECT 1 FROM settlements s WHERE s.auction_id = a.id) AS on_record
       FROM auctions a
      WHERE a.id = :aid
     """)
@@ -218,7 +233,7 @@ async def offer_second_chance(
     records who was second. The auction stays closed throughout.
     """
     user_id = current_user.id
-    params = {"aid": auction_id, "uid": user_id}
+    params = {"aid": auction_id, "uid": user_id, "grace": SETTLEMENT_GRACE}
     row = (await db_session.execute(_OFFER_SQL, params)).first()
     if row is None:
         # Either there is nothing to offer, or the offer already exists — DO NOTHING returns
@@ -235,7 +250,11 @@ async def offer_second_chance(
 
 
 async def _explain_offer(session: AsyncSession, auction_id: int, user_id: int) -> HTTPException:
-    row = (await session.execute(_WHY_NO_OFFER_SQL, {"aid": auction_id, "uid": user_id})).first()
+    row = (
+        await session.execute(
+            _WHY_NO_OFFER_SQL, {"aid": auction_id, "uid": user_id, "grace": SETTLEMENT_GRACE}
+        )
+    ).first()
     if row is None:
         return NotFoundException(detail="no such auction")
     if not row.is_seller:
@@ -247,6 +266,13 @@ async def _explain_offer(session: AsyncSession, auction_id: int, user_id: int) -
         # one now would mean deciding from bids who was second after the fact, which is
         # the deferred query the closing statement exists to avoid.
         return _refused("this auction has no runner-up to offer it to")
+    if row.on_record:
+        return _refused("this auction already has a settlement record")
+    if row.too_late:
+        return _refused(
+            f"the grace period for offering this auction on passed"
+            f" ({SETTLEMENT_GRACE.days} days after it closed)"
+        )
     # Unreached today, for the same reason as the settle path's fallthrough.
     return _refused("no such auction, or you are not its seller")
 

@@ -450,6 +450,54 @@ async def test_an_auction_with_no_runner_up_cannot_be_offered_on(sm, channels):
     assert "no runner-up" in refused.value.detail
 
 
+async def test_an_offer_past_the_grace_period_is_refused(sm, channels):
+    """The same window as settling, and for a sharper reason: past it the runner-up could
+    not mark the deal done anyway, so all the offer would still do is move who the buyer of
+    record is — clearing the record of a winner who never paid and planting one on somebody
+    who was never asked while there was time to answer."""
+    aid, seller_id, bidders = await _seed_closed(sm, channels)
+    await _age_the_close(sm, aid, SETTLEMENT_GRACE + timedelta(hours=1))
+
+    async with sm() as s:
+        with pytest.raises(HTTPException) as refused:
+            await offer_second_chance.fn(
+                auction_id=aid, current_user=await s.get(User, seller_id), db_session=s
+            )
+
+    assert refused.value.status_code == 409
+    assert "grace period" in refused.value.detail
+    async with sm() as s:
+        assert (await reputation(s, bidders[-1])).as_buyer_unsettled == 1, "still the buyer"
+
+
+async def test_an_offer_is_refused_once_the_deal_is_on_record(sm, channels):
+    """A settlement row names the buyer it was created for and keeps that name. An offer
+    landing afterwards would leave the record claiming one person and the auction implying
+    another, with the later mark of whoever is now the buyer of record silently discarded by
+    the upsert's COALESCE."""
+    aid, seller_id, bidders = await _seed_closed(sm, channels)
+    winner, runner_up = bidders[-1], bidders[-2]
+
+    async with sm() as s:
+        await settle.fn(auction_id=aid, current_user=await s.get(User, winner), db_session=s)
+
+    async with sm() as s:
+        with pytest.raises(HTTPException) as refused:
+            await offer_second_chance.fn(
+                auction_id=aid, current_user=await s.get(User, seller_id), db_session=s
+            )
+
+    assert refused.value.status_code == 409
+    assert "settlement record" in refused.value.detail
+    async with sm() as s:
+        marked = await settle.fn(
+            auction_id=aid, current_user=await s.get(User, seller_id), db_session=s
+        )
+        assert (marked.buyer_id, marked.settled) == (winner, True)
+        with pytest.raises(HTTPException):
+            await settle.fn(auction_id=aid, current_user=await s.get(User, runner_up), db_session=s)
+
+
 async def test_the_runner_up_settles_once_the_offer_is_made(sm, channels):
     """What the offer is for. The buyer of record moves to the runner-up, so they are the
     one who can mark the deal done — and the original winner no longer can."""
