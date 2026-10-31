@@ -8,12 +8,16 @@ put there is untestable by construction, and a limit nobody tested is a limit no
 
 from __future__ import annotations
 
+from litestar.datastructures import MutableScopeHeaders
+from litestar.enums import ScopeType
+from litestar.middleware.base import AbstractMiddleware
 from litestar.middleware.rate_limit import (
     CacheObject,
     DurationUnit,
     RateLimitConfig,
     RateLimitMiddleware,
 )
+from litestar.types import Message, Receive, Scope, Send
 
 from app.auth import client_ip
 
@@ -57,6 +61,54 @@ class RateLimitWithRetryAfter(RateLimitMiddleware):
         # no header. Same flooring as login_retry_after, for the same reason.
         headers["Retry-After"] = str(max(int(headers[self.config.rate_limit_reset_header_key]), 1))
         return headers
+
+
+# Set on every response, which rules out Litestar's own response_headers: those are a
+# layer on a route handler, and a 404 reaches no handler. A header set that stops at the
+# error paths is a header set with a hole in it, so these go on in a middleware that wraps
+# everything — see SecurityHeaders below.
+#
+# This service answers JSON and nothing else. No page, no form, no script, no cookie — so
+# the policy can be the strictest version of each header rather than a compromise with
+# something the project serves. If a browser-facing page ever lands here, the CSP is the
+# line to revisit, not to delete.
+SECURITY_HEADERS = {
+    # No content sniffing: a JSON body that something coaxes a browser into reading as HTML
+    # is the cheapest cross-site scripting there is.
+    "X-Content-Type-Options": "nosniff",
+    # Nothing here belongs in a frame, so clickjacking has nothing to aim at. Kept beside
+    # the CSP's frame-ancestors because the browsers that ignore one honour the other.
+    "X-Frame-Options": "DENY",
+    # Referrers leak paths, and the paths here carry auction and community ids.
+    "Referrer-Policy": "no-referrer",
+    # Nothing may load, frame or be framed. An API that serves no document has no use for a
+    # looser default, and 'none' is what makes a stray HTML response inert.
+    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+    # A year, which is the floor every preload list asks for. Harmless over plain http —
+    # browsers ignore it there — so it needs no deployment-dependent switch.
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+}
+
+
+class SecurityHeaders(AbstractMiddleware):
+    """Puts SECURITY_HEADERS on every HTTP response, whoever built it.
+
+    Outermost in the stack, so a 404 from the router and a 429 from the rate limiter carry
+    them as surely as a 200 from a handler. WebSocket connections are out of scope: there
+    is no response for a header to go on, and the handshake is not a document.
+    """
+
+    scopes = {ScopeType.HTTP}
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        async def with_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableScopeHeaders(message)
+                for name, value in SECURITY_HEADERS.items():
+                    headers[name] = value
+            await send(message)
+
+        await self.app(scope, receive, with_headers)
 
 
 def rate_limit_config(rate_limit: tuple[DurationUnit, int]) -> RateLimitConfig:

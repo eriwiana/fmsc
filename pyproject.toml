@@ -99,6 +99,13 @@ exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:"]
 # of the statement each one explains, so neither is reachable today. They are kept so that a
 # guard added to a statement without a matching reason is a refusal rather than a 500.
 #
+# M12 adds two more of the portal-thread kind, in app/edge.py: the two lines that hand a
+# non-HTTP scope straight on. A WebSocket and a lifespan both take that branch and
+# test_a_socket_passes_through_the_wrapper_untouched drives it, but litestar's test client
+# runs the socket in a portal thread and coverage does not credit it through a plain ASGI
+# wrapper. Exercised, not traced; the same reason tests/test_e2e.py drives the Litestar
+# application rather than the wrapper.
+#
 # One more that is traced rather than untested: the handler behind link_discord's
 # uq_community_discord_guild_id refusal is reported uncovered although
 # test_a_guild_cannot_be_linked_to_two_communities drives it and a hand-run against the

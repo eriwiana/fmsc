@@ -20,7 +20,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
-from litestar import Litestar, get
+from litestar import Litestar, WebSocket, get, websocket
 from litestar.exceptions import ClientException
 from litestar.testing import TestClient
 
@@ -206,6 +206,32 @@ def test_the_security_headers_are_on_every_response():
         missing = client.get("/no-such-route")
     assert (ok.status_code, missing.status_code) == (200, 404)
 
+    # Named here rather than read off SECURITY_HEADERS: a test that iterates the set it is
+    # checking passes just as happily when a header is deleted from it, which a mutation
+    # pass proved. The values still come from the module — those are policy and may be
+    # tightened — but which headers exist at all is pinned where it cannot drift.
+    assert set(edge.SECURITY_HEADERS) == {
+        "X-Content-Type-Options",
+        "X-Frame-Options",
+        "Referrer-Policy",
+        "Content-Security-Policy",
+        "Strict-Transport-Security",
+    }
     for name, value in edge.SECURITY_HEADERS.items():
         assert ok.headers[name] == value
         assert missing.headers[name] == value, f"{name} missing from a 404"
+
+
+def test_a_socket_passes_through_the_wrapper_untouched():
+    """The other half of the wrapper: a WebSocket's frames are not a response, and neither
+    is a lifespan, so both are handed straight on rather than inspected per message."""
+
+    @websocket("/echo")
+    async def echo(socket: WebSocket) -> None:
+        await socket.accept()
+        await socket.send_text("through")
+        await socket.close()
+
+    wrapped = edge.SecurityHeaders(Litestar(route_handlers=[echo]))
+    with TestClient(app=wrapped) as client, client.websocket_connect("/echo") as socket:
+        assert socket.receive_text() == "through"
