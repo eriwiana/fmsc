@@ -142,8 +142,14 @@ async def login_retry_after(db_session: AsyncSession, email: str, ip: str) -> in
 
 async def record_failed_login(db_session: AsyncSession, email: str, ip: str) -> None:
     """Both buckets are fed by one row; which bucket a row counts towards is decided by
-    the query, not by what is written."""
-    db_session.add(LoginAttempt(email=email, ip=ip, failed_at=datetime.now(timezone.utc)))
+    the query, not by what is written.
+
+    clock_timestamp(), not this process's clock. login_retry_after does its arithmetic in
+    Postgres, so a host clock running ahead writes an attempt in the future and the answer
+    comes back longer than the window itself — a container whose clock had drifted a second
+    answered Retry-After: 901 on a 900-second window. Written where it is compared.
+    """
+    db_session.add(LoginAttempt(email=email, ip=ip, failed_at=func.clock_timestamp()))
     await db_session.commit()
 
 

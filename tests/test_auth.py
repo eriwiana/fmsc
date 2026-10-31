@@ -13,7 +13,7 @@ account. These are criteria 1 and 2:
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -308,6 +308,33 @@ async def test_the_lockout_says_how_long_to_wait(sm):
         await _login(sm, "waiting@x.com", PASSWORD)
     retry_after = int(caught.value.headers["Retry-After"])
     assert 0 < retry_after <= LOGIN_WINDOW.total_seconds()
+
+
+async def test_the_wait_never_exceeds_the_window_on_a_drifting_clock(sm):
+    """The invariant the lockout rests on: whatever the host clock says, an attempt is
+    never recorded in the future, so the wait it implies cannot outlast the window.
+
+    The patch is a host clock running five seconds ahead of the database — the drift that
+    answered Retry-After: 901 on a 900-second window and failed a test for a reason that
+    had nothing to do with logins. Postgres writes the timestamp now, so the clock this
+    process believes in does not get a vote.
+    """
+    await _user_with_password(sm, "drifting@x.com")
+
+    class _Ahead:
+        @staticmethod
+        def now(tz=None):
+            return datetime.now(tz) + timedelta(seconds=5)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(auth, "datetime", _Ahead)
+        for _ in range(MAX_FAILURES_PER_ACCOUNT):
+            await _fail_login(sm, "drifting@x.com")
+
+        with pytest.raises(TooManyRequestsException) as caught:
+            await _login(sm, "drifting@x.com", PASSWORD)
+
+    assert 0 < int(caught.value.headers["Retry-After"]) <= LOGIN_WINDOW.total_seconds()
 
 
 async def test_a_locked_account_is_refused_before_the_password_is_checked(sm):
