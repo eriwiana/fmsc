@@ -21,9 +21,15 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest",
- "pytest-asyncio",
- "pytest-cov",
- "pytest-timeout>=2.4.0",
+    "pytest-asyncio",
+    "pytest-cov",
+    "pytest-timeout>=2.4.0",
+    # Pinned, and the only pin: the pre-commit hook runs this one through `uv run` rather
+    # than fetching its own copy, so a formatter that changes its mind cannot disagree with
+    # itself between a local commit and CI.
+    "ruff==0.16.10",
+    # So `uv run pre-commit install` works from a fresh clone without anything global.
+    "pre-commit",
 ]
 redis = [
     "redis>=8.1.0",
