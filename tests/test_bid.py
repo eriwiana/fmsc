@@ -591,8 +591,10 @@ async def test_the_bid_and_its_extension_are_one_statement(sm):
 
 
 async def _reason(sm, aid: int, uid: int, amount: str = "10.00") -> str:
+    """The sentence the bidder is shown. The guard token beside it is a log field, pinned
+    where the log line is, in tests/test_edge.py."""
     async with sm() as s:
-        return await reject_reason(s, aid, uid, Decimal(amount))
+        return (await reject_reason(s, aid, uid, Decimal(amount))).detail
 
 
 async def test_reason_names_a_missing_auction(sm):

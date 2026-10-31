@@ -299,8 +299,8 @@ async def test_logs_how_late_each_close_was(sm, channels, caplog):
     await _seed(sm, ends_delta=timedelta(seconds=-5))
     with caplog.at_level(logging.INFO, logger="app.auctions"):
         await close_due(sm, channels)
-    record = next(r for r in caplog.records if r.msg.startswith("closed auction"))
-    _, late = record.args
+    record = next(r for r in caplog.records if r.msg.startswith("closed auction_id="))
+    *_, late = record.args
     # It ended 5s ago. The margin is for clock precision, not for slack: ends_at is
     # computed by Python and late_by is measured by Postgres, so a bound of exactly 5
     # fails whenever the two clocks disagree by a hair. Anything near zero still means

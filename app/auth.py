@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -48,6 +49,13 @@ MIN_PASSWORD_LENGTH = 12
 # The account budget is the tight one because it is the one protecting a specific person.
 # The address budget is looser because an office, a school or a mobile carrier can put many
 # honest people behind one address.
+# Read once, at import, like every other switch here. Off means the X-Forwarded-For
+# header is believed only when the request came through a private or loopback hop — see
+# client_ip for why believing it from anywhere else hands an attacker somebody else's
+# budget.
+TRUST_PROXY_ENV = "FMSC_TRUST_PROXY_HEADERS"
+TRUST_FORWARDED_ALWAYS = os.environ.get(TRUST_PROXY_ENV) == "1"
+
 LOGIN_WINDOW = timedelta(minutes=15)
 MAX_FAILURES_PER_ACCOUNT = 5
 MAX_FAILURES_PER_IP = 20
@@ -102,22 +110,58 @@ def verify_password(password: str, stored: str) -> bool:
 _DUMMY_HASH = hash_password(secrets.token_urlsafe(32))
 
 
+def _hop_is_a_proxy(request: Request) -> bool:
+    """Whether the connection came from something that could be the proxy in front.
+
+    A private or loopback peer is a hop inside the deployment: the platform's router, a
+    sidecar, a local reverse proxy. A public peer is the internet talking to this process
+    directly, and nothing it says about who it is forwarding for can be believed.
+
+    An unparseable peer — a unix socket, a test client, nothing at all — is not a proxy
+    either. Refusing to guess is the safe direction: the fallback is to count the request
+    against the peer, which is at worst a bucket shared by everything behind one hop.
+
+    Two surprises in `is_private` worth knowing before changing this. It counts the three
+    documentation ranges (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) as private, so a
+    test wanting a public peer has to use a routable address. And it counts 100.64.0.0/10,
+    the carrier-grade NAT range, as *public* — a platform whose router sits there is
+    exactly the case FMSC_TRUST_PROXY_HEADERS exists for.
+    """
+    host = getattr(getattr(request, "client", None), "host", None)
+    try:
+        hop = ipaddress.ip_address(host)
+    except (ValueError, TypeError):
+        return False
+    return hop.is_private or hop.is_loopback
+
+
 def client_ip(request: Request) -> str:
-    """The address a failed login is counted against.
+    """The address a failed login, a code attempt or a rate-limited request is counted
+    against.
 
     The *rightmost* X-Forwarded-For entry, not the leftmost: a client can send whatever it
-    likes in that header, and a trusted proxy appends the peer it actually saw. With one
-    proxy in front — Railway — the last entry is the real client and the first is whatever
-    was claimed. Taking the leftmost would let an attacker have a new address per request,
-    and let them spend someone else's budget.
+    likes in that header, and a proxy appends the peer it actually saw. With one proxy in
+    front — Railway — the last entry is the real client and the first is whatever was
+    claimed. Taking the leftmost would let an attacker have a new address per request, and
+    let them spend someone else's budget.
 
-    Falling back to the socket peer matters locally and in tests, where there is no proxy.
+    The header is only believed when the request arrived through a hop that could be that
+    proxy. Reached directly, every entry in it is the client's to choose, which makes the
+    header worse than useless: a new value per request dodges every budget, and a victim's
+    address in the last position spends theirs — five of those and that address is locked
+    out of logins for the window. So a public peer is counted as itself and the header is
+    ignored.
+
+    FMSC_TRUST_PROXY_HEADERS=1 forces the header to be read anyway, for a deployment whose
+    own proxy reaches the app from a public address. Set it only where something in front
+    is known to overwrite the header rather than pass it through.
     """
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    if forwarded:
-        # `or "unknown"`: a trailing comma leaves the rightmost entry empty, and an empty
-        # string is a bucket of its own that every malformed header would share.
-        return forwarded.rsplit(",", 1)[-1].strip() or "unknown"
+    if TRUST_FORWARDED_ALWAYS or _hop_is_a_proxy(request):
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            # `or "unknown"`: a trailing comma leaves the rightmost entry empty, and an
+            # empty string is a bucket of its own that every malformed header would share.
+            return forwarded.rsplit(",", 1)[-1].strip() or "unknown"
     client = getattr(request, "client", None)
     return client.host if client else "unknown"
 
@@ -142,8 +186,14 @@ async def login_retry_after(db_session: AsyncSession, email: str, ip: str) -> in
 
 async def record_failed_login(db_session: AsyncSession, email: str, ip: str) -> None:
     """Both buckets are fed by one row; which bucket a row counts towards is decided by
-    the query, not by what is written."""
-    db_session.add(LoginAttempt(email=email, ip=ip, failed_at=datetime.now(timezone.utc)))
+    the query, not by what is written.
+
+    clock_timestamp(), not this process's clock. login_retry_after does its arithmetic in
+    Postgres, so a host clock running ahead writes an attempt in the future and the answer
+    comes back longer than the window itself — a container whose clock had drifted a second
+    answered Retry-After: 901 on a 900-second window. Written where it is compared.
+    """
+    db_session.add(LoginAttempt(email=email, ip=ip, failed_at=func.clock_timestamp()))
     await db_session.commit()
 
 

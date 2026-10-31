@@ -107,6 +107,43 @@ jobs:
           CHANNELS_URL: postgresql://postgres:postgres@localhost:5432/fmsc
         run: uv run pytest --no-cov -q tests/test_e2e.py
 
+  # A dependency with a published advisory is a vulnerability this project ships, whoever
+  # wrote the code. Its own job, so it fails loudly rather than as a line inside the test
+  # output, and on every run — not only when a PR happens to touch the lock.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v6
+        with:
+          python-version-file: .python-version
+
+      - name: Export what production installs
+        # The lock, with the same flags the image uses, so this audits the artifact that
+        # runs rather than the range pyproject.toml would permit. Every pin is in the file
+        # already, which is why --no-deps is correct below: nothing needs resolving, and a
+        # resolver would quietly audit a different set.
+        run: |
+          uv export --frozen --no-dev --extra redis --no-emit-project --no-hashes \
+            --format requirements-txt > requirements.audit.txt
+          wc -l requirements.audit.txt
+
+      - name: Audit it
+        # Pinned, because a scanner that changes under you turns a red build into a
+        # mystery. --strict fails on a dependency it cannot check at all, which is the
+        # answer that looks most like a pass and means least.
+        #
+        # An advisory with no fix available is handled with --ignore-vuln <id> and a dated
+        # reason in a comment here, never by dropping the step or widening the pin.
+        #
+        # A PyPI outage fails this step the same way a finding does, and that is the
+        # intended direction: "we could not check" is not "there is nothing to find". The
+        # answer to a red job is to read it, and the output says which of the two it is.
+        run: uvx pip-audit==2.10.1 -r requirements.audit.txt --no-deps --strict
+
   image:
     runs-on: ubuntu-latest
     steps:
@@ -117,6 +154,20 @@ jobs:
       # drifted from pyproject.toml, which is what keeps production on the lock.
       - name: Build the production image
         run: docker build -t fmsc:ci .
+
+      - name: Image runs as a non-root user with no toolchain
+        # Root in a container is root on the host the moment anything escapes it, and a
+        # compiler is what turns a shell into a foothold. Both are asserted on the real
+        # image rather than read off the Dockerfile, because a base image can hand either
+        # of them back without this repo changing a line.
+        run: |
+          uid=$(docker run --rm fmsc:ci id -u)
+          if [ "$uid" = "0" ]; then echo "::error::image runs as root"; exit 1; fi
+          if ! docker run --rm fmsc:ci sh -c '! command -v gcc && ! command -v cc && ! command -v uv'; then
+            echo "::error::a build toolchain survived into the final image"
+            exit 1
+          fi
+          echo "image runs as uid $uid, with no compiler and no package manager"
 
       - name: Image interpreter matches .python-version
         # The base image tag states the version a second time. This is what stops the

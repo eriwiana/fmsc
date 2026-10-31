@@ -17,6 +17,17 @@ import os
 # suite to be surprised by. A fixed value, because the tests assert on lookups.
 os.environ.setdefault("FMSC_CODE_PEPPER", "test-pepper-not-a-secret-0123456789abcdef")
 
+# And off with the rate limit. The suite makes a few hundred requests from one address in
+# seconds, which is the burst the limit exists to refuse, and a budget high enough to ignore
+# is not free either: with the middleware installed, coverage stops tracing the WebSocket
+# handler through litestar's test client, which costs a point of coverage and the evidence
+# that the socket paths are tested at all.
+#
+# So the limit is tested where it can be seen instead: the refusal and the refill against an
+# app built for it, and the wiring of the one that ships by reloading app.main under a real
+# budget. Both are in tests/test_edge.py.
+os.environ.setdefault("FMSC_RATE_LIMIT_PER_MINUTE", "0")
+
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
