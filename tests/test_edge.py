@@ -214,6 +214,9 @@ async def test_a_bid_logs_one_line_each_way_naming_the_guard(sm, channels, caplo
     assert f"auction_id={aid}" in accepted and f"user_id={uid}" in accepted
     assert "result=accepted" in accepted
     assert "event_seq=1" in accepted
+    # Every amount in this project names its unit, logs included: two auctions priced in
+    # different currencies otherwise read alike in one query.
+    assert "currency=IDR" in accepted
 
     assert f"auction_id={aid}" in rejected and f"user_id={uid}" in rejected
     assert "result=rejected" in rejected
