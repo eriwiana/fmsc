@@ -101,6 +101,20 @@ class SecurityHeaders(AbstractMiddleware):
     scopes = {ScopeType.HTTP}
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # Hand every other scope straight on, untouched and unwrapped. A lifespan has no
+        # response and a WebSocket's messages are not one either, so there is nothing here
+        # to add — and a wrapper in the socket path is a wrapper on every frame of every
+        # subscription. `scopes` above does not do this on its own: the base class honours
+        # it in the __call__ this one replaces.
+        #
+        # No test can tell this branch from its absence, and a mutation pass confirmed it:
+        # wrapping a socket's frames changes nothing observable, because none of them is an
+        # http.response.start. It is here for the cost and for the clarity, and because the
+        # day a frame type does collide with that name is not a day to find out.
+        if scope["type"] != ScopeType.HTTP:
+            await self.app(scope, receive, send)
+            return
+
         async def with_headers(message: Message) -> None:
             if message["type"] == "http.response.start":
                 headers = MutableScopeHeaders(message)
