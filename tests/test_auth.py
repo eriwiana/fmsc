@@ -201,10 +201,20 @@ async def test_logout_without_a_token_is_refused(sm):
     assert await provide_token(SimpleNamespace(headers={"Authorization": "Bearer abc"})) == "abc"
 
 
+# The hop a forwarded header has to arrive through to be believed. A private address, as
+# the platform's own router is; see client_ip and the tests at the bottom of this file.
+PROXY_HOP = SimpleNamespace(host="10.0.0.254")
+
+# A peer from the open internet. Not one of the documentation ranges — ipaddress counts
+# 192.0.2.0/24, 198.51.100.0/24 and 203.0.113.0/24 as private, so a test using one of them
+# as the peer proves the opposite of what it reads like.
+OPEN_INTERNET_HOP = SimpleNamespace(host="93.184.216.34")
+
+
 def _request(ip: str) -> SimpleNamespace:
     """Just enough Request for the handler: the header it reads and the peer it falls
     back to."""
-    return SimpleNamespace(headers={"X-Forwarded-For": ip}, client=None)
+    return SimpleNamespace(headers={"X-Forwarded-For": ip}, client=PROXY_HOP)
 
 
 async def _login(maker, email: str, password: str, ip: str = "10.0.0.1"):
@@ -391,9 +401,10 @@ async def test_a_forged_forwarded_header_cannot_buy_a_fresh_budget(sm):
             async with sm() as s:
                 await login.fn(
                     data=SignupRequest(email=f"spread{n}@x.com", password="wrong"),
-                    # What a client sends, plus what the proxy appends.
+                    # What a client sends, plus what the proxy appends — arriving through
+                    # the proxy, which is what makes the header evidence at all.
                     request=SimpleNamespace(
-                        headers={"X-Forwarded-For": f"{claimed}, {real}"}, client=None
+                        headers={"X-Forwarded-For": f"{claimed}, {real}"}, client=PROXY_HOP
                     ),
                     db_session=s,
                 )
@@ -444,12 +455,54 @@ async def test_an_empty_forwarded_entry_is_not_an_address(sm):
     """A trailing comma leaves the rightmost entry empty. An empty string would be a
     bucket of its own that every malformed header on the service shares, which is both a
     way to spend somebody else's budget and a way to dodge one's own."""
-    assert client_ip(SimpleNamespace(headers={"X-Forwarded-For": "1.2.3.4, "}, client=None)) == (
-        "unknown"
-    )
+    assert client_ip(
+        SimpleNamespace(headers={"X-Forwarded-For": "1.2.3.4, "}, client=PROXY_HOP)
+    ) == ("unknown")
     assert client_ip(SimpleNamespace(headers={}, client=SimpleNamespace(host="10.1.2.3"))) == (
         "10.1.2.3"
     )
+
+
+async def test_a_forwarded_header_from_the_open_internet_is_ignored(sm):
+    """The header is only evidence when something trustworthy appended it.
+
+    Reached directly, every entry is the caller's to choose: a fresh value per request
+    dodges every budget there is, and a victim's address in the last position spends
+    theirs — five of those and that address is locked out of logins for the window. A
+    public peer is therefore counted as itself.
+    """
+    direct = SimpleNamespace(headers={"X-Forwarded-For": "203.0.113.9"}, client=OPEN_INTERNET_HOP)
+    assert client_ip(direct) == OPEN_INTERNET_HOP.host
+
+    # Through the deployment's own hop, the same header is the answer.
+    forwarded = SimpleNamespace(headers={"X-Forwarded-For": "203.0.113.9"}, client=PROXY_HOP)
+    assert client_ip(forwarded) == "203.0.113.9"
+
+    # Loopback counts: a reverse proxy on the same host, and the local dev setup.
+    local = SimpleNamespace(
+        headers={"X-Forwarded-For": "203.0.113.9"}, client=SimpleNamespace(host="127.0.0.1")
+    )
+    assert client_ip(local) == "203.0.113.9"
+
+
+async def test_a_peer_that_is_not_an_address_is_not_a_proxy(sm):
+    """A unix socket, a test client, nothing at all. Refusing to guess is the safe
+    direction — the request is counted against the peer, or against nothing."""
+    unparseable = SimpleNamespace(
+        headers={"X-Forwarded-For": "203.0.113.9"}, client=SimpleNamespace(host="testclient")
+    )
+    assert client_ip(unparseable) == "testclient"
+    assert client_ip(SimpleNamespace(headers={"X-Forwarded-For": "203.0.113.9"}, client=None)) == (
+        "unknown"
+    )
+
+
+async def test_the_proxy_switch_forces_the_header_to_be_read(sm, monkeypatch):
+    """For a deployment whose own proxy reaches the app from a public address. Off by
+    default, because the cost of being wrong in that direction is somebody else's budget."""
+    direct = SimpleNamespace(headers={"X-Forwarded-For": "203.0.113.9"}, client=OPEN_INTERNET_HOP)
+    monkeypatch.setattr(auth, "TRUST_FORWARDED_ALWAYS", True)
+    assert client_ip(direct) == "203.0.113.9"
 
 
 async def test_a_login_for_an_unknown_address_still_pays_for_a_hash(sm, monkeypatch):

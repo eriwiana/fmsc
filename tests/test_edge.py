@@ -27,7 +27,7 @@ from litestar.testing import TestClient
 
 # edge as a module, not its names: each criterion lands in its own commit, and a missing
 # attribute should fail one test rather than stop the file from importing at all.
-from app import edge
+from app import auth, edge
 from app.auctions import IDEMPOTENCY_HEADER, MAX_EXTENSION, place_bid
 from app.models import Auction, User
 from app.schemas import BidRequest
@@ -177,10 +177,17 @@ def test_the_health_check_is_not_counted_against_the_budget():
         assert [client.get("/health").status_code for _ in range(5)] == [200] * 5
 
 
-def test_each_address_has_its_own_budget():
+def test_each_address_has_its_own_budget(monkeypatch):
     """Which is only true because the identifier is this project's client_ip. Litestar's
     default reads the socket peer, and behind a proxy that is one address for everybody —
-    so the first busy minute would lock out every client at once."""
+    so the first busy minute would lock out every client at once.
+
+    The switch is on because the test client's peer is the string "testclient", which is
+    not an address and so not a hop a forwarded header is believed through. What that
+    gating does is pinned in tests/test_auth.py; what it means here is only that these
+    requests are treated as proxied.
+    """
+    monkeypatch.setattr(auth, "TRUST_FORWARDED_ALWAYS", True)
     with TestClient(app=_limited_app(("second", 1))) as client:
         assert client.get("/ping", headers={"X-Forwarded-For": "198.51.100.7"}).status_code == 200
         assert client.get("/ping", headers={"X-Forwarded-For": "198.51.100.7"}).status_code == 429

@@ -835,7 +835,10 @@ async def test_the_audit_log_never_holds_the_code(sm):
 
 
 def _request(ip: str = "10.0.0.1") -> SimpleNamespace:
-    return SimpleNamespace(headers={"X-Forwarded-For": ip}, client=None)
+    # A private peer, because a forwarded header is only believed through one; see client_ip.
+    return SimpleNamespace(
+        headers={"X-Forwarded-For": ip}, client=SimpleNamespace(host="10.0.0.254")
+    )
 
 
 async def _try_code(sm, user_id: int, code: str, ip: str = "10.0.0.1"):
