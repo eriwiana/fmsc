@@ -256,28 +256,36 @@ class Reputation(NamedTuple):
 
     Not a model and not stored anywhere. The criterion is that these cannot drift, and the
     only way a count cannot drift from the records is to not keep it.
+
+    "Unsettled" rather than "defaulted", because that is all these rows can show: a side
+    that never marked once the window had gone. Where one side marked and the other did not
+    the count is already one-sided and reads like fault, but a deal nobody marked counts
+    against both, and nothing here can tell a buyer who vanished from a seller who never
+    shipped. Deciding which of the two was at fault is what a dispute flow is for, and that
+    is deferred — so this does not claim it.
     """
 
     as_seller_settled: int
-    as_seller_defaulted: int
+    as_seller_unsettled: int
     as_buyer_settled: int
-    as_buyer_defaulted: int
+    as_buyer_unsettled: int
 
 
 # One statement, counting the same set of closed auctions four ways.
 #
-# A default is the absence of a mark once the window has gone, which is why it is computed
-# against the same grace period the settle route enforces: anything inside the window is
-# still pending and nobody is a defaulter yet. FILTER reads a NULL condition as false, so a
-# LEFT JOIN that matched nothing counts as unmarked rather than dropping the row.
+# A side is unsettled when the window has gone and no mark of theirs is in the row, which is
+# why it is computed against the same grace period the settle route enforces: anything inside
+# the window is still pending and nobody is behind on anything yet. FILTER reads a NULL
+# condition as false, so a LEFT JOIN that matched nothing counts as unmarked rather than
+# dropping the row.
 #
 # "Settled" is both marks, on the same definition the response uses. Deriving it twice from
 # the two timestamps is what makes it impossible for a count and a row to disagree.
 _REPUTATION_SQL = text("""
     SELECT count(*) FILTER (WHERE is_seller AND settled) AS as_seller_settled,
-           count(*) FILTER (WHERE is_seller AND seller_missed) AS as_seller_defaulted,
+           count(*) FILTER (WHERE is_seller AND seller_missed) AS as_seller_unsettled,
            count(*) FILTER (WHERE is_buyer AND settled) AS as_buyer_settled,
-           count(*) FILTER (WHERE is_buyer AND buyer_missed) AS as_buyer_defaulted
+           count(*) FILTER (WHERE is_buyer AND buyer_missed) AS as_buyer_unsettled
       FROM (
         SELECT a.seller_id = :uid AS is_seller,
                COALESCE(o.offered_to_id, a.current_winner_id) = :uid AS is_buyer,
@@ -314,7 +322,7 @@ async def reputation(session: AsyncSession, user_id: int) -> Reputation:
     ).one()
     return Reputation(
         as_seller_settled=row.as_seller_settled,
-        as_seller_defaulted=row.as_seller_defaulted,
+        as_seller_unsettled=row.as_seller_unsettled,
         as_buyer_settled=row.as_buyer_settled,
-        as_buyer_defaulted=row.as_buyer_defaulted,
+        as_buyer_unsettled=row.as_buyer_unsettled,
     )

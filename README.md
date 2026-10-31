@@ -534,11 +534,15 @@ offered on at another. Once the offer exists the buyer of record is the runner-u
 are the one who can settle and the winner who went quiet cannot.
 
 **Reputation is counted, never stored.** `reputation(session, user_id)` returns settled and
-defaulted counts as seller and as buyer, from one statement over the same rows. A default is
-the absence of a mark once the window has gone, so inside it a deal is pending and nobody is
-a defaulter. Only the side that never marked is counted against: a seller who did their part
-is not tarred by a buyer who did not. There is no endpoint — the first route exposing another
-user's record needs a privacy decision, and nothing serialises it yet.
+unsettled counts as seller and as buyer, from one statement over the same rows. A side is
+unsettled when the window has gone and no mark of theirs is in the row, so inside the window
+a deal is pending and nobody is behind on anything. Where one side marked and the other did
+not, only the one that never marked is counted: a seller who did their part is not tarred by
+a buyer who did not. A deal **nobody** marked counts against both, which is why the number is
+called unsettled and not defaulted — these rows cannot tell a buyer who vanished from a
+seller who never shipped, and saying which was at fault is what the deferred dispute flow is
+for. There is no endpoint either: the first route exposing another user's record needs a
+privacy decision, and nothing serialises it yet.
 
 Auctions that closed before this landed keep `closed_at` backfilled from `ends_at` and no
 runner-up. Working out who was second after the fact is exactly the deferred query the

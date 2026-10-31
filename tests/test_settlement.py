@@ -538,23 +538,24 @@ async def test_nobody_with_no_closed_deals_has_any_record(sm, channels):
 
 
 async def test_a_deal_nobody_marked_counts_against_both_once_the_window_goes(sm, channels):
-    """A default is the absence of a mark after the grace period, which is why it is
-    counted against the same window the settle route enforces."""
+    """A side is unsettled when the window has gone and no mark of theirs is in the row,
+    which is why it is counted against the same window the settle route enforces. Both are
+    counted here, because nothing in these rows says which of the two let it lapse."""
     aid, seller_id, bidders = await _seed_closed(sm, channels)
 
-    # Inside the window nobody has defaulted yet: it is merely still pending.
+    # Inside the window nobody is behind on anything: the deal is merely still pending.
     async with sm() as s:
-        assert (await reputation(s, seller_id)).as_seller_defaulted == 0
-        assert (await reputation(s, bidders[-1])).as_buyer_defaulted == 0
+        assert (await reputation(s, seller_id)).as_seller_unsettled == 0
+        assert (await reputation(s, bidders[-1])).as_buyer_unsettled == 0
 
     await _age_the_close(sm, aid, SETTLEMENT_GRACE + timedelta(hours=1))
 
     async with sm() as s:
-        assert (await reputation(s, seller_id)).as_seller_defaulted == 1
-        assert (await reputation(s, bidders[-1])).as_buyer_defaulted == 1
+        assert (await reputation(s, seller_id)).as_seller_unsettled == 1
+        assert (await reputation(s, bidders[-1])).as_buyer_unsettled == 1
 
 
-async def test_only_the_side_that_never_marked_is_the_defaulter(sm, channels):
+async def test_only_the_side_that_never_marked_is_counted(sm, channels):
     """The asymmetry that makes the record worth keeping: a seller who did their part is
     not tarred by a buyer who did not."""
     aid, seller_id, bidders = await _seed_closed(sm, channels)
@@ -568,8 +569,8 @@ async def test_only_the_side_that_never_marked_is_the_defaulter(sm, channels):
         seller_counts = await reputation(s, seller_id)
         buyer_counts = await reputation(s, winner)
 
-    assert (seller_counts.as_seller_settled, seller_counts.as_seller_defaulted) == (0, 0)
-    assert buyer_counts.as_buyer_defaulted == 1
+    assert (seller_counts.as_seller_settled, seller_counts.as_seller_unsettled) == (0, 0)
+    assert buyer_counts.as_buyer_unsettled == 1
 
 
 async def test_an_auction_that_closed_with_no_winner_counts_for_nobody(sm, channels):
@@ -611,5 +612,5 @@ async def test_the_runner_up_carries_the_record_once_the_offer_is_made(sm, chann
     await _age_the_close(sm, aid, SETTLEMENT_GRACE + timedelta(hours=1))
 
     async with sm() as s:
-        assert (await reputation(s, runner_up)).as_buyer_defaulted == 1
+        assert (await reputation(s, runner_up)).as_buyer_unsettled == 1
         assert await reputation(s, winner) == (0, 0, 0, 0), "no longer the buyer of record"
