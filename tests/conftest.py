@@ -23,6 +23,8 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from app.models import User
+
 PG_URL = os.environ.get(
     "DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/fmsc"
 )
@@ -52,6 +54,13 @@ _TABLES = (
     "users",
 )
 TRUNCATE_ALL = text(f"TRUNCATE {', '.join(_TABLES)} RESTART IDENTITY CASCADE")
+
+# The list above is only visible if it stays complete. A table nobody adds to it is reached
+# by CASCADE instead, which is the widening this commit exists to stop, and silently. Asserted
+# at import so the suite says so at collection rather than deadlocking on CI months later.
+# The other direction needs no check: TRUNCATE on a table that is gone fails on its own.
+_UNWIPED = set(User.metadata.tables) - set(_TABLES)
+assert not _UNWIPED, f"tables missing from the wipe list, so only CASCADE reaches them: {_UNWIPED}"
 
 
 async def wipe(session) -> None:
