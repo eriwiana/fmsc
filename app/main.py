@@ -122,7 +122,7 @@ async def _stop_closer(app: Litestar) -> None:
             await task
 
 
-app = Litestar(
+litestar_app = Litestar(
     debug=os.environ.get("DEBUG") == "1",
     route_handlers=[
         health,
@@ -151,8 +151,18 @@ app = Litestar(
         auctions.place_bid,
         auctions.auction_ws,
     ],
+    # Route-scoped, which is where Litestar's limiter has to live: it keys its budget off
+    # the matched route handler, so there is nothing for it to read on a path that matches
+    # nothing. Unmatched paths are therefore not counted — they cost routing and no more.
     middleware=[edge.rate_limit_config(RATE_LIMIT).middleware] if RATE_LIMIT else [],
     plugins=[SQLAlchemyPlugin(db_config), channels],
     on_startup=[_start_closer],
     on_shutdown=[_stop_closer, _close_channels_client],
 )
+
+# What uvicorn serves. Wrapped rather than configured, because Litestar's own middleware and
+# response_headers are layers on a *route* — and a 404 matches no route, so neither reaches
+# it. The header set has to hold on every response or it is not a header set, so it goes on
+# outside everything: the router's 404s, the limiter's 429s and a handler's 500s included.
+# Non-HTTP scopes, lifespan and WebSocket alike, pass straight through.
+app = edge.SecurityHeaders(litestar_app)
