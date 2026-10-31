@@ -36,8 +36,8 @@ from app.auth import LOGIN_WINDOW, MAX_FAILURES_PER_ACCOUNT
 from app.main import (
     SUBSCRIBER_BACKLOG_STRATEGY,
     SUBSCRIBER_MAX_BACKLOG,
-    app,
     channels,
+    litestar_app,
 )
 
 PG_URL = os.environ.get(
@@ -61,8 +61,15 @@ def client():
     A client per test means a lifespan per test, and a channels backend built once at
     import cannot survive being started and stopped repeatedly — Redis leaves its pub/sub
     connection behind and the next test hangs on it. Production starts once too.
+
+    The Litestar application, not the security-header wrapper that app.main exports as
+    `app`: coverage stops tracing the WebSocket handler through the wrapper, which costs a
+    point of coverage and hides whether the socket paths are tested at all. The tests pass
+    either way — the wrapper only adds response headers, and it hands every non-HTTP scope
+    straight on — and the wrapper itself is asserted in tests/test_edge.py against the
+    object app.main actually exports, on a 200 and on a 404.
     """
-    with TestClient(app=app) as started:
+    with TestClient(app=litestar_app) as started:
         yield started
 
 
