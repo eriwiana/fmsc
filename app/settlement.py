@@ -223,32 +223,6 @@ _WHY_NO_OFFER_SQL = text("""
     """)
 
 
-@post("/auctions/{auction_id:int}/second-chance", dependencies=_authed)
-async def offer_second_chance(
-    auction_id: int, current_user: User, db_session: AsyncSession
-) -> SecondChanceResponse:
-    """Offer the lot to the runner-up, at the runner-up's own last bid.
-
-    The seller's only move when a winner goes quiet, and the reason the closing statement
-    records who was second. The auction stays closed throughout.
-    """
-    user_id = current_user.id
-    params = {"aid": auction_id, "uid": user_id, "grace": SETTLEMENT_GRACE}
-    row = (await db_session.execute(_OFFER_SQL, params)).first()
-    if row is None:
-        # Either there is nothing to offer, or the offer already exists — DO NOTHING returns
-        # no row for both. The read tells them apart, and only on this path.
-        row = (await db_session.execute(_EXISTING_OFFER_SQL, params)).first()
-        if row is None:
-            await db_session.rollback()
-            raise await _explain_offer(db_session, auction_id, user_id)
-    await db_session.commit()
-    logger.info("second chance on auction %s offered to user %s", row.auction_id, row.offered_to_id)
-    return SecondChanceResponse(
-        auction_id=row.auction_id, offered_to_id=row.offered_to_id, amount=row.amount
-    )
-
-
 async def _explain_offer(session: AsyncSession, auction_id: int, user_id: int) -> HTTPException:
     row = (
         await session.execute(
@@ -275,6 +249,32 @@ async def _explain_offer(session: AsyncSession, auction_id: int, user_id: int) -
         )
     # Unreached today, for the same reason as the settle path's fallthrough.
     return _refused("no such auction, or you are not its seller")
+
+
+@post("/auctions/{auction_id:int}/second-chance", dependencies=_authed)
+async def offer_second_chance(
+    auction_id: int, current_user: User, db_session: AsyncSession
+) -> SecondChanceResponse:
+    """Offer the lot to the runner-up, at the runner-up's own last bid.
+
+    The seller's only move when a winner goes quiet, and the reason the closing statement
+    records who was second. The auction stays closed throughout.
+    """
+    user_id = current_user.id
+    params = {"aid": auction_id, "uid": user_id, "grace": SETTLEMENT_GRACE}
+    row = (await db_session.execute(_OFFER_SQL, params)).first()
+    if row is None:
+        # Either there is nothing to offer, or the offer already exists — DO NOTHING returns
+        # no row for both. The read tells them apart, and only on this path.
+        row = (await db_session.execute(_EXISTING_OFFER_SQL, params)).first()
+        if row is None:
+            await db_session.rollback()
+            raise await _explain_offer(db_session, auction_id, user_id)
+    await db_session.commit()
+    logger.info("second chance on auction %s offered to user %s", row.auction_id, row.offered_to_id)
+    return SecondChanceResponse(
+        auction_id=row.auction_id, offered_to_id=row.offered_to_id, amount=row.amount
+    )
 
 
 class Reputation(NamedTuple):
