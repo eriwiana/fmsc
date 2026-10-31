@@ -37,6 +37,13 @@ Jakarta wall time, responses render `+07:00`. Process runs with `TZ=Asia/Jakarta
   deadline when it lands inside the anti-snipe window. A refused bid answers **400** with
   the guard that refused it in `detail` (too low, under the increment, under the reserve,
   outbid, closed, ended, self-bid). Send `Idempotency-Key: <string>` to make a retry safe
+- `POST /auctions/{id}/settle` (auth, seller or buyer) — marks your own side of a closed
+  deal done → `{auction_id, buyer_id, seller_settled, buyer_settled, settled}`. Idempotent.
+  **409** past the 7-day grace period, if the auction is not closed, if it closed with no
+  winner, or if you are not a party to it; **404** for an unknown auction
+- `POST /auctions/{id}/second-chance` (auth, seller) — offers the lot to the runner-up at
+  their own last bid → `{auction_id, offered_to_id, amount}`. Idempotent; the auction stays
+  **closed**. **409** if it is not closed, has no runner-up, or is not yours
 - `POST /ws/tickets` (auth) → `{ticket, expires_at}` — single-use, 30s
 - `GET /ws/auctions/{id}?ticket=...` — snapshot, then live `bid`, `status` and `closed`
   events. **4404** for an unknown auction or a draft
@@ -492,6 +499,56 @@ unlike `FMSC_CODE_PEPPER`:
 The interactions endpoint URL goes into the developer portal last: Discord validates it with
 a signed request, so the deployment has to be reachable first.
 
+## Settlement and trust
+Money never touches fmsc. There is no escrow and no payment licence — and so no lever to
+pull on a winner who never pays, which is why the record is the product.
+
+**The closing statement decides who was second.** `_CLOSE_SQL` writes `runner_up_id`,
+`runner_up_bid` and `closed_at` in the same UPDATE that flips the status, via a
+`LEFT JOIN LATERAL` over `bids` for the highest bid by anyone other than the winner. It is
+grouped by bidder, so somebody outbid by their own later bid is not their own runner-up. A
+later query would read an auction already announced as over, and two readers could name
+different people.
+
+`closed_at` is not `ends_at`: the deadline is when an auction was due, and `closed_at` is
+when the closer got to it — after a restart those are measurably apart, and the grace period
+counts from the real one.
+
+**Both sides mark their own.** `settlements` holds one row per auction with
+`seller_settled_at` and `buyer_settled_at`, both nullable. Settled is both of them being
+present, derived when the row is read, so there is no third column that can contradict them.
+The first side to mark inserts the row and the second conflicts on `auction_id` and fills
+its own column — one statement, `COALESCE` on the update rather than assignment, because
+`EXCLUDED` carries NULL for the side that is not calling and plain assignment would have
+each party erase the other's mark.
+
+**The grace period is `SETTLEMENT_GRACE`, 7 days, and it lives in the WHERE clause.** Past
+the window the statement matches nothing, so a stale settlement is unreachable rather than
+refused by a second read that could be raced. A refusal then costs one extra read, on the
+refusal path only, to say which guard turned it down.
+
+**A second chance, not a reopening.** `POST /auctions/{id}/second-chance` records an offer
+to the runner-up at their own last bid and leaves `status` alone. A reopened auction would
+become biddable again, and the history would stop saying the lot was won at one price and
+offered on at another. Once the offer exists the buyer of record is the runner-up, so they
+are the one who can settle and the winner who went quiet cannot.
+
+**Reputation is counted, never stored.** `reputation(session, user_id)` returns settled and
+unsettled counts as seller and as buyer, from one statement over the same rows. A side is
+unsettled when the window has gone and no mark of theirs is in the row, so inside the window
+a deal is pending and nobody is behind on anything. Where one side marked and the other did
+not, only the one that never marked is counted: a seller who did their part is not tarred by
+a buyer who did not. A deal **nobody** marked counts against both, which is why the number is
+called unsettled and not defaulted — these rows cannot tell a buyer who vanished from a
+seller who never shipped, and saying which was at fault is what the deferred dispute flow is
+for. There is no endpoint either: the first route exposing another user's record needs a
+privacy decision, and nothing serialises it yet.
+
+Auctions that closed before this landed keep `closed_at` backfilled from `ends_at` and no
+runner-up. Working out who was second after the fact is exactly the deferred query the
+closing statement exists to avoid, so a second-chance offer on one of them is refused rather
+than invented.
+
 ## Anti-snipe
 A bid inside the last **60s** (`SNIPE_WINDOW`) moves the deadline to 60s from the moment it
 lands, so a bid placed too late to be answered cannot win on timing alone. `hard_ends_at`,
@@ -547,6 +604,10 @@ The invariants the bid path assumes are enforced by the schema, not only by Pyth
 | `uq_memberships_community_user_generation` | one **live** membership per person per generation, `WHERE revoked_at IS NULL` |
 | `ck_code_audit_outcome_known` | the six outcomes and nothing else |
 | `ck_auctions_current_bid_at_least_starting` | `current_bid IS NULL OR current_bid >= starting_bid` |
+| `ck_auctions_runner_up_is_not_the_winner` | `runner_up_id IS NULL OR runner_up_id <> current_winner_id` |
+| `ck_auctions_runner_up_has_a_bid` | `(runner_up_id IS NULL) = (runner_up_bid IS NULL)` |
+| `uq_settlements_auction_id` | one settlement row per auction, which is what makes the mark one upsert |
+| `uq_second_chance_offers_auction_id` | one offer per auction, so a second click is the same offer |
 | `ck_bids_amount_positive` | `amount > 0` |
 | `ck_auctions_currency_is_a_code` | `currency ~ '^[A-Z]{3}$'` |
 | `ck_bids_currency_is_a_code` | `currency ~ '^[A-Z]{3}$'` |
@@ -613,7 +674,24 @@ A breached-password check is deliberately absent: the useful version is a k-anon
 lookup against Have I Been Pwned, which puts an outbound call on the signup path and needs
 an answer for what to do when it is down.
 
-Then settlement and payments.
+Payments, and whether fmsc should hold the money at all. Settlement now has a record —
+who won, who was next, who confirmed, when the window closed — but no custody: the money
+still moves off-platform. The models considered are record-only (what ships today), a bid
+bond, courier COD, provider-held escrow through a licensed payment provider, and
+community-held escrow where the community owner holds the funds and fmsc keeps the ledger.
+
+What gates that choice is custody and regulation rather than code. Holding other people's
+money in Indonesia is Bank Indonesia's territory, and separately unresolved — for what
+already ships, not just for escrow — is whether an online *lelang* needs a *balai lelang*
+licence. All five models need the same substrate, which is why it was built first.
+
+The donation link, for the same family of reasons. It is a third-party account handled
+deliberately outside this codebase, and the provider is not chosen: a local-only service
+reaches fewer regions than the auctions do, so an internationally usable one has to be
+picked before the column is.
+
+Disputes and arbitration, which is what any custody model would need next. Nothing
+announces a settlement or an offer either, over sockets or to a guild — the seam is `_owed`.
 
 Account linking and DM notifications. A Discord account is tied to no fmsc user anywhere,
 which is why a slash command is authorised by a guild permission rather than by who ran it,

@@ -71,6 +71,31 @@ class CodeResponse(msgspec.Struct):
     broadcast: bool = False
 
 
+class SettlementResponse(msgspec.Struct):
+    """Where a closed auction has got to, as the caller left it.
+
+    Booleans rather than the timestamps themselves: the only question either side asks is
+    whether the other has marked it, and an exact instant is the counterparty's business.
+    """
+
+    auction_id: int
+    buyer_id: int
+    seller_settled: bool
+    buyer_settled: bool
+    # Both sides, which is the only definition of settled there is. Derived here rather
+    # than stored, so there is no third value that can contradict the other two.
+    settled: bool
+
+
+class SecondChanceResponse(msgspec.Struct):
+    """An offer made to the runner-up. The auction is not mentioned as reopened because it
+    is not: it stays closed, with the winner it closed on."""
+
+    auction_id: int
+    offered_to_id: int
+    amount: Decimal
+
+
 class DiscordLinkRequest(msgspec.Struct):
     """Snowflakes as Discord sends them: strings, because a 64-bit unsigned id does not
     survive a JSON number."""

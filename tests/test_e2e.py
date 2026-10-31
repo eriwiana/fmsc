@@ -25,10 +25,11 @@ from datetime import datetime, timedelta, timezone
 from queue import Empty
 
 import pytest
+from conftest import wipe
 from litestar.exceptions import WebSocketDisconnect
 from litestar.testing import TestClient
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.auth import LOGIN_WINDOW, MAX_FAILURES_PER_ACCOUNT
@@ -69,18 +70,16 @@ def client():
 def clean_db():
     """The async `sm` fixture cannot be used here: this test is synchronous."""
 
-    async def wipe():
+    async def run():
         engine = create_async_engine(PG_URL, poolclass=NullPool)
-        async with engine.begin() as conn:
-            await conn.execute(
-                text(
-                    "TRUNCATE outbox, bids, auctions, ws_tickets, sessions,"
-                    " login_attempts, users RESTART IDENTITY CASCADE"
-                )
-            )
+        async with async_sessionmaker(engine)() as session:
+            # conftest's, so the table list lives in one place. This module is where the
+            # deadlock it retries actually happens: the client fixture is module-scoped, so
+            # a closer is ticking through auctions and the outbox for every test here.
+            await wipe(session)
         await engine.dispose()
 
-    asyncio.run(wipe())
+    asyncio.run(run())
     yield
 
 

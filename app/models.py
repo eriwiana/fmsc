@@ -316,6 +316,16 @@ class Auction(BigIntAuditBase):
     # the only floor. Evaluated inside the bid statement, never in the handler.
     reserve: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
     current_winner_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    # Who the seller may fall back on, and at their own highest bid. Both written by the
+    # closing UPDATE rather than worked out afterwards: a later query would read the bids of
+    # an auction that has already been announced as over, and two readers could disagree
+    # about who was second. NULL means nobody was — a lot with one bidder or none.
+    runner_up_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    runner_up_bid: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
+    # When the closing statement shut it, which is what the settlement grace period counts
+    # from. Not ends_at: an auction closes when the closer gets to it, and on a busy tick or
+    # after a restart that is measurably later than the deadline it was due at.
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     bid_count: Mapped[int] = mapped_column(default=0)
     # draft | open | closed | cancelled. A draft is unannounced, cancelled is withdrawn
     # before anybody committed. The legal edges between them live in app.auctions.
@@ -356,6 +366,16 @@ class Auction(BigIntAuditBase):
             "reserve IS NULL OR reserve >= starting_bid", name="reserve_at_least_starting"
         ),
         CheckConstraint("event_seq >= 0", name="event_seq_not_negative"),
+        # A seller offered a second chance to the person who already won has been told
+        # nothing useful, and the runner-up's own bid is what that offer is priced at — so
+        # the two columns are either both set or both absent.
+        CheckConstraint(
+            "runner_up_id IS NULL OR runner_up_id <> current_winner_id",
+            name="runner_up_is_not_the_winner",
+        ),
+        CheckConstraint(
+            "(runner_up_id IS NULL) = (runner_up_bid IS NULL)", name="runner_up_has_a_bid"
+        ),
         CheckConstraint(CURRENCY_IS_A_CODE, name="currency_is_a_code"),
         # What the bid's composite foreign key points at. Postgres requires a unique
         # constraint on the referenced columns, and this one also means an auction cannot
@@ -456,3 +476,51 @@ class Bid(BigIntAuditBase):
             "(idempotency_key IS NULL) = (response IS NULL)", name="key_and_response_together"
         ),
     )
+
+
+class Settlement(BigIntAuditBase):
+    """What the two sides of a closed auction say happened after the hammer.
+
+    Money never moves through fmsc, so this is a record and not a transfer. Two nullable
+    timestamps rather than one status column: each side speaks only for itself, and
+    "settled" is then both of them being present — derived at read time, so it cannot
+    disagree with itself the way a third column would.
+    """
+
+    __tablename__ = "settlements"
+    # One per auction, which is what makes the upsert in app.settlement a single statement:
+    # whichever side marks first creates the row and the other fills its own column.
+    auction_id: Mapped[int] = mapped_column(ForeignKey("auctions.id"), unique=True)
+    # Who owed the money. Copied off the auction when the row is created rather than joined
+    # on every read, because a second-chance offer moves who that is and the record has to
+    # keep naming the person the deal was actually with.
+    buyer_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    seller_settled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    buyer_settled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class SecondChanceOffer(BigIntAuditBase):
+    """The seller reaching the runner-up after a winner went quiet.
+
+    A record, not a reopening. The auction stays closed and keeps the winner it had, which
+    is what makes the history honest: the lot was won at one price and then offered on at
+    another, rather than retroactively won by somebody else.
+    """
+
+    __tablename__ = "second_chance_offers"
+    # One per auction. A seller who clicks twice has made the same offer, not a second one,
+    # and the insert leans on this to say so without reading first.
+    auction_id: Mapped[int] = mapped_column(ForeignKey("auctions.id"), unique=True)
+    # Copied from auctions.runner_up_id when the offer is made. Held here rather than read
+    # back through the auction because this is who the deal is now with, and the settlement
+    # record has to agree with it even if the auction row is later corrected.
+    offered_to_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    # The runner-up's own highest bid. They never offered more than this, so it is the only
+    # price they can be held to without being asked again.
+    amount: Mapped[Decimal] = mapped_column(Money)
+
+    __table_args__ = (CheckConstraint("amount > 0", name="amount_positive"),)

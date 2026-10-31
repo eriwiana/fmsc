@@ -366,3 +366,85 @@ async def test_the_closer_still_closes_an_open_auction_beside_them(sm, channels)
     assert await close_due(sm, channels) == 1
     assert await _status(sm, due) == "closed"
     assert await _status(sm, draft) == "draft"
+
+
+async def _bidder(sm, email: str) -> int:
+    async with sm() as s:
+        bidder = User(email=email, pw_hash="x")
+        s.add(bidder)
+        await s.commit()
+        return bidder.id
+
+
+async def _expire(sm, aid: int) -> None:
+    """Bid first, then move the deadline back: an auction cannot be bid on once it is due."""
+    async with sm() as s:
+        await s.execute(
+            text("UPDATE auctions SET ends_at = now() - interval '5 seconds' WHERE id = :id"),
+            {"id": aid},
+        )
+        await s.commit()
+
+
+async def test_the_close_records_who_was_second(sm, channels):
+    """M11 criterion 1. The seller's fallback has to come from the closing statement, or
+    two readers of the same finished auction could name different people."""
+    aid = await _seed(sm, ends_delta=timedelta(hours=1))
+    first = await _bidder(sm, "first@x.com")
+    second = await _bidder(sm, "second@x.com")
+    for uid, amount in ((first, Decimal("100000.00")), (second, Decimal("200000.00"))):
+        async with sm() as s:
+            assert await place_bid_tx(s, aid, uid, amount) is not None
+    await _expire(sm, aid)
+
+    assert await close_due(sm, channels) == 1
+
+    async with sm() as s:
+        row = await s.get(Auction, aid)
+    assert row.current_winner_id == second
+    assert row.runner_up_id == first
+    assert row.runner_up_bid == Decimal("100000.00"), "priced at the runner-up's own bid"
+
+
+async def test_a_bidder_outbid_by_themselves_is_not_their_own_runner_up(sm, channels):
+    """The reason the statement groups by bidder. One person bidding twice leaves two rows
+    in `bids`, and the lower of them is not a second bidder."""
+    aid = await _seed(sm, ends_delta=timedelta(hours=1))
+    alone = await _bidder(sm, "alone@x.com")
+    # Clearing the 10,000 increment each time, which is why these are not 25 and 50.
+    for amount in (Decimal("100000.00"), Decimal("200000.00")):
+        async with sm() as s:
+            assert await place_bid_tx(s, aid, alone, amount) is not None
+    await _expire(sm, aid)
+
+    assert await close_due(sm, channels) == 1
+
+    async with sm() as s:
+        row = await s.get(Auction, aid)
+    assert row.current_winner_id == alone
+    assert row.runner_up_id is None
+    assert row.runner_up_bid is None
+
+
+async def test_an_auction_with_no_bids_closes_with_nobody_on_it(sm, channels):
+    aid = await _seed(sm)
+
+    assert await close_due(sm, channels) == 1
+
+    async with sm() as s:
+        row = await s.get(Auction, aid)
+    assert row.current_winner_id is None
+    assert row.runner_up_id is None
+    assert row.closed_at is not None, "it still closed, and said when"
+
+
+async def test_the_close_instant_is_recorded_and_is_not_the_deadline(sm, channels):
+    """What the settlement grace period counts from. ends_at is when it was due; closed_at
+    is when the closer actually got to it, which after a restart is measurably later."""
+    aid = await _seed(sm, ends_delta=timedelta(seconds=-5))
+
+    assert await close_due(sm, channels) == 1
+
+    async with sm() as s:
+        row = await s.get(Auction, aid)
+    assert row.closed_at > row.ends_at
