@@ -648,6 +648,37 @@ async def test_an_auction_that_closed_with_no_winner_counts_for_nobody(sm, chann
         assert await reputation(s, seller_id) == (0, 0, 0, 0)
 
 
+async def test_the_settlement_row_decides_whose_record_it_is(sm, channels):
+    """Where a settlement exists, its own buyer_id is the name its marks belong to.
+
+    The route refuses an offer once a deal is on record, so the two cannot disagree through
+    the API. This pins which source wins if they ever do — a hand-written row here, as a
+    later correction or a migration might leave behind. Counting one row's timestamps
+    against somebody who was never in it is the drift criterion 4 exists to rule out.
+    """
+    aid, seller_id, bidders = await _seed_closed(sm, channels)
+    winner, runner_up = bidders[-1], bidders[-2]
+
+    for uid in (seller_id, winner):
+        async with sm() as s:
+            await settle.fn(auction_id=aid, current_user=await s.get(User, uid), db_session=s)
+
+    async with sm() as s:
+        await s.execute(
+            text(
+                "INSERT INTO second_chance_offers"
+                " (auction_id, offered_to_id, amount, created_at, updated_at)"
+                " VALUES (:aid, :uid, 1000, now(), now())"
+            ),
+            {"aid": aid, "uid": runner_up},
+        )
+        await s.commit()
+
+    async with sm() as s:
+        assert (await reputation(s, winner)).as_buyer_settled == 1, "it was their deal"
+        assert await reputation(s, runner_up) == (0, 0, 0, 0), "they were never in that row"
+
+
 async def test_the_runner_up_carries_the_record_once_the_offer_is_made(sm, channels):
     """The offer moves who the deal is with, so it moves whose record it lands on."""
     aid, seller_id, bidders = await _seed_closed(sm, channels)

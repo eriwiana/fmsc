@@ -307,6 +307,11 @@ class Reputation(NamedTuple):
 #
 # "Settled" is both marks, on the same definition the response uses. Deriving it twice from
 # the two timestamps is what makes it impossible for a count and a row to disagree.
+#
+# The buyer comes off the settlement row where there is one, and is worked out from the offer
+# and the winner only where there is not. The settlement names the person the deal was with
+# when it was created, and that is the name the marks in that row belong to — counting them
+# against anybody else would be reading one row's timestamps as another person's record.
 _REPUTATION_SQL = text("""
     SELECT count(*) FILTER (WHERE is_seller AND settled) AS as_seller_settled,
            count(*) FILTER (WHERE is_seller AND seller_missed) AS as_seller_unsettled,
@@ -314,7 +319,7 @@ _REPUTATION_SQL = text("""
            count(*) FILTER (WHERE is_buyer AND buyer_missed) AS as_buyer_unsettled
       FROM (
         SELECT a.seller_id = :uid AS is_seller,
-               COALESCE(o.offered_to_id, a.current_winner_id) = :uid AS is_buyer,
+               COALESCE(s.buyer_id, o.offered_to_id, a.current_winner_id) = :uid AS is_buyer,
                s.seller_settled_at IS NOT NULL
                    AND s.buyer_settled_at IS NOT NULL AS settled,
                a.closed_at + :grace < clock_timestamp()
@@ -330,9 +335,9 @@ _REPUTATION_SQL = text("""
          -- requires 'closed' itself. Kept because this counts closed deals, and a later
          -- edge that sets closed_at on anything else would otherwise be counted silently.
          WHERE a.status = 'closed'
-           AND COALESCE(o.offered_to_id, a.current_winner_id) IS NOT NULL
+           AND COALESCE(s.buyer_id, o.offered_to_id, a.current_winner_id) IS NOT NULL
            AND (a.seller_id = :uid
-                OR COALESCE(o.offered_to_id, a.current_winner_id) = :uid)
+                OR COALESCE(s.buyer_id, o.offered_to_id, a.current_winner_id) = :uid)
       ) deals
     """)
 
