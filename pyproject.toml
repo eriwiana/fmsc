@@ -16,6 +16,8 @@ dependencies = [
     # command does not work without it, and hand-rolling the curve arithmetic to save a
     # dependency is not a trade anybody should take.
     "pynacl>=1.6.2",
+    # Scratch branch only: a pin with published advisories, to watch the audit job fail.
+    "urllib3==1.26.4",
 ]
 
 [project.optional-dependencies]
