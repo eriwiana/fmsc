@@ -17,6 +17,11 @@ import os
 # suite to be surprised by. A fixed value, because the tests assert on lookups.
 os.environ.setdefault("FMSC_CODE_PEPPER", "test-pepper-not-a-secret-0123456789abcdef")
 
+# And off with the rate limit: the suite makes a few hundred requests from one address in
+# seconds, which is the burst the limit exists to refuse. The budget itself is tested
+# against an app built for it, in tests/test_edge.py, including that the default is on.
+os.environ.setdefault("FMSC_RATE_LIMIT_PER_MINUTE", "0")
+
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError

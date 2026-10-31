@@ -24,10 +24,10 @@ from litestar import Litestar, get
 from litestar.exceptions import ClientException
 from litestar.testing import TestClient
 
-from app.auctions import IDEMPOTENCY_HEADER, MAX_EXTENSION, bid_increment, place_bid
-# The module, not its names: each criterion lands in its own commit, and a missing
+# edge as a module, not its names: each criterion lands in its own commit, and a missing
 # attribute should fail one test rather than stop the file from importing at all.
 from app import edge
+from app.auctions import IDEMPOTENCY_HEADER, MAX_EXTENSION, place_bid
 from app.models import Auction, User
 from app.schemas import BidRequest
 
@@ -41,6 +41,13 @@ def ping() -> str:
     return "pong"
 
 
+@get("/health", sync_to_thread=False)
+def health() -> str:
+    """The real app's health check is excluded from the budget. This stands in for it, at
+    the same path, because the exclusion is a path pattern."""
+    return "ok"
+
+
 def _limited_app(rate_limit=_BURST) -> Litestar:
     """A throwaway app carrying nothing but the budget under test.
 
@@ -48,7 +55,10 @@ def _limited_app(rate_limit=_BURST) -> Litestar:
     a few hundred requests from one address in seconds is exactly the burst it exists to
     refuse. What matters is that the config this builds is the config main.py installs.
     """
-    return Litestar(route_handlers=[ping], middleware=[edge.rate_limit_config(rate_limit).middleware])
+    return Litestar(
+        route_handlers=[ping, health],
+        middleware=[edge.rate_limit_config(rate_limit).middleware],
+    )
 
 
 async def _seed(sm) -> tuple[int, int]:
@@ -86,18 +96,69 @@ async def _bid(sm, aid: int, uid: int, amount: Decimal, channels):
 
 
 def test_the_budget_refuses_a_burst_and_then_refills():
-    """Criterion 1. Two requests are the whole budget, the third is refused, and the window
-    turning over gives the budget back — a limit that never refills is an outage."""
-    with TestClient(app=_limited_app()) as client:
-        assert [client.get("/ping").status_code for _ in range(2)] == [200, 200]
+    """Criterion 1. A burst spends the budget and is refused, and the window turning over
+    gives it back — a limit that never refills is an outage with a nicer name.
 
-        refused = client.get("/ping")
-        assert refused.status_code == 429
+    The budget is spent in a loop rather than in a fixed number of requests. The window is
+    a real second of wall clock, so a burst can straddle the turn and the third request can
+    legitimately land in a fresh budget; what must hold is that a client going fast enough
+    is refused, and that waiting out the window clears it.
+    """
+    with TestClient(app=_limited_app()) as client:
+        for _ in range(_BURST[1] * 3):
+            refused = client.get("/ping")
+            if refused.status_code == 429:
+                break
+        assert refused.status_code == 429, "a burst well over the budget was never refused"
         # The number, not just the refusal: a client left to guess retries immediately.
         assert int(refused.headers["Retry-After"]) >= 1
 
         time.sleep(1.1)
         assert client.get("/ping").status_code == 200
+
+
+# --- criterion 1: the budget in detail -----------------------------------------------------
+
+
+def test_the_budget_is_on_unless_it_is_turned_off():
+    """Unset means the default, not off. A deployment that forgets the variable is limited,
+    and the suite running with it off cannot hide a production default that is off too."""
+    assert edge.limit_from_env(None) == edge.DEFAULT_RATE_LIMIT
+    assert edge.limit_from_env("   ") == edge.DEFAULT_RATE_LIMIT
+    assert edge.limit_from_env("60") == ("minute", 60)
+    assert edge.limit_from_env("0") is None
+
+
+def test_a_budget_that_is_not_a_number_refuses_to_start():
+    """At import rather than on the first request: a process serving with a budget nobody
+    can read is worse than one that did not start."""
+    with pytest.raises(ValueError):
+        edge.limit_from_env("plenty")
+    with pytest.raises(ValueError, match="cannot be negative"):
+        edge.limit_from_env("-1")
+
+
+def test_the_health_check_is_not_counted_against_the_budget():
+    """An uptime monitor polling it would otherwise spend the budget of whatever address it
+    arrives from — and on a platform that checks for you, that address is shared."""
+    with TestClient(app=_limited_app(("second", 1))) as client:
+        assert client.get("/ping").status_code == 200
+        assert client.get("/ping").status_code == 429
+        assert [client.get("/health").status_code for _ in range(5)] == [200] * 5
+
+
+def test_each_address_has_its_own_budget():
+    """Which is only true because the identifier is this project's client_ip. Litestar's
+    default reads the socket peer, and behind a proxy that is one address for everybody —
+    so the first busy minute would lock out every client at once."""
+    with TestClient(app=_limited_app(("second", 1))) as client:
+        assert client.get("/ping", headers={"X-Forwarded-For": "198.51.100.7"}).status_code == 200
+        assert client.get("/ping", headers={"X-Forwarded-For": "198.51.100.7"}).status_code == 429
+        # A different client, arriving through the same proxy, has spent nothing.
+        assert client.get("/ping", headers={"X-Forwarded-For": "203.0.113.9"}).status_code == 200
+
+
+# --- criterion 2: the bid log lines --------------------------------------------------------
 
 
 async def test_a_bid_logs_one_line_each_way_naming_the_guard(sm, channels, caplog):
@@ -129,6 +190,9 @@ async def test_a_bid_logs_one_line_each_way_naming_the_guard(sm, channels, caplo
     # A stable token, not the sentence the bidder is shown: a reworded message must not
     # break a log query, which is the whole difference between provable and argued.
     assert "guard=below_increment" in rejected
+
+
+# --- criterion 3: the header set -----------------------------------------------------------
 
 
 def test_the_security_headers_are_on_every_response():

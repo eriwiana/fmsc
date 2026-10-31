@@ -14,7 +14,7 @@ from litestar.channels.backends.base import ChannelsBackend
 from litestar.channels.backends.memory import MemoryChannelsBackend
 from litestar.channels.backends.redis import RedisChannelsPubSubBackend
 
-from app import auctions, auth, communities, settlement
+from app import auctions, auth, communities, edge, settlement
 
 # Railway injects DATABASE_URL as postgresql://; SQLAlchemy async needs +asyncpg.
 DATABASE_URL = os.environ.get(
@@ -88,6 +88,12 @@ channels = ChannelsPlugin(
 )
 
 
+# Read at import, so a value that is not a number stops the process here rather than
+# leaving it serving with a budget nobody can read. None means the environment asked for no
+# limit at all, which is what the test suite asks for.
+RATE_LIMIT = edge.limit_from_env(os.environ.get(edge.RATE_LIMIT_ENV))
+
+
 @get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -145,6 +151,7 @@ app = Litestar(
         auctions.place_bid,
         auctions.auction_ws,
     ],
+    middleware=[edge.rate_limit_config(RATE_LIMIT).middleware] if RATE_LIMIT else [],
     plugins=[SQLAlchemyPlugin(db_config), channels],
     on_startup=[_start_closer],
     on_shutdown=[_stop_closer, _close_channels_client],
