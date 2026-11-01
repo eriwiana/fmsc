@@ -53,103 +53,37 @@ Full request and response shapes are in `/schema`; the refusal codes each route 
 are asserted in `tests/`.
 
 ## How it works
-
-**The money path is one statement.** A bid is a single guarded `UPDATE`: amount above the
-reserve and the increment, auction open, deadline not passed, bidder not the seller, member
-of the community if there is one. Nothing is read and then acted on, so two bids racing
-cannot both win. The reserve is a hidden floor and the refusal never names it — a reserve a
-bidder can read is a reserve they can bid exactly. The increment is banded (10k below 1m,
-100k below 10m, 500k above) and comes from the standing bid, not the one being offered.
-
-**Anti-snipe.** A bid inside the last **60s** moves the deadline 60s out, so a bid placed too
-late to be answered cannot win on timing alone. `hard_ends_at` caps the total at **+2h** from
-creation. Every `bid` and `closed` event carries the current `ends_at`, so a watcher's
-countdown follows the extension.
-
-**Realtime.** A socket gets a `snapshot` first, then live events. The subscription opens
-before the snapshot is read, so nothing lands in the gap, and the snapshot doubles as proof
-that the subscription is live. Every event carries a per-auction `seq`, bumped inside the
-same `UPDATE` that caused it — a client can tell a dropped event from a quiet auction, and a
-subscriber more than **64** events behind is closed with **4408** rather than shown a price
-that skipped a bid. Reconnecting replays the snapshot.
-
-**Nothing is announced without being recorded.** Events are written to an **outbox** row in
-the transaction that caused them. A process dying between commit and publish loses nothing:
-the closer's tick relays whatever is unsent, prunes announced rows after a day, and sweeps
-spent tickets and expired sessions. Delivery is therefore at-least-once, which is safe only
-because of `seq`.
-
-**Scaling out** is one variable. `CHANNELS_URL` unset is in-memory and single-instance;
-`redis://…` is pub/sub; `postgresql://…` is `LISTEN`/`NOTIFY` and needs no new service. An
-unsupported scheme fails at startup rather than falling back to memory, because that typo
-looks exactly like a quiet auction. Measured at 500 sockets on one auction: all three
-backends delivered 2500 of 2500 events, p95 66–90 ms, and 500 sockets cost four extra
-database connections rather than five hundred. Re-run with
-`uv run python scripts/load_sockets.py --sockets 500`.
-
-**Lifecycle.** Four states, four edges, one guarded `UPDATE`: `draft → open → closed`, and
-`cancelled` from either, only while `bid_count = 0`. Legality, ownership and the bid count sit
-in the same `WHERE`, so a bid cannot land between a check and a cancel. Every refusal is the
-same **409** — not yours, wrong state and already has bids are one answer, because a caller
-cannot act on the difference and telling them apart would reveal which auctions exist. A
-same-state request refuses itself for free, which is what a double-clicked publish sends.
-
-**Communities gate bidding, not viewing**, with one more condition in the statement that was
-already accepting the bid. Owner rights come from `communities.owner_id`, never from a
-membership row, or remove-all would lock an owner out of their own community. A kick is
-measured against the auction's start, so somebody entitled to bid when a lot opened keeps
-that right. Remove-all bumps a generation instead of deleting rows, so the history of who was
-in a community survives it.
-
-**Invite codes** are 13 Crockford Base32 characters (65 bits of CSPRNG) plus a check symbol,
-shown as `FMSC-XXXX-XXXX-XXXX-XX`. Crockford drops I, L, O and U, and a typo in the check
-symbol never reaches the database — no audit row, no rate-limiter charge, because a mistype
-off a screenshot is not an attack. Only `HMAC-SHA256(code, FMSC_CODE_PEPPER)` is stored, so a
-leaked backup hands nobody a working code; **the app refuses to start without the pepper**,
-since a default is no pepper and a per-boot random one kills every live code on deploy.
-Redemption is counted by the statement that claims it, and every refusal is the same 404.
-
-**Discord** posts a community's events to one channel, as a second reader of the same outbox
-the money path writes. Slash commands (`/fmsc invite`, `/fmsc rotate`) are authorised by a
-guild permission and verified by Ed25519 over the exact bytes received; a bad or missing
-signature is **401**. No bot token means nothing is sent and the drop is logged — the feature
-is off, the app still starts.
-
-**Settlement is a record, not a transfer.** Money never touches fmsc, so there is no escrow
-and no payment licensing — and no leverage over a winner who never pays, which makes the
-record the product. The closing statement itself writes the winner, the runner-up and
-`closed_at`; a later query could read a different second place. Each side marks its own
-timestamp, "settled" is both of them, and the **7-day** grace period lives in the `WHERE`
-clause. A second-chance offer moves who owes the money without reopening the lot. Reputation
-is recomputed from those rows on every call — settled and unsettled, as seller and as buyer —
-never stored, because a stored total is one write from disagreeing with the rows it
-summarises.
-
-**Money is `Numeric(18,2)`** and every amount names its unit. A bid carries the currency the
-auction carries, copied across by the statement rather than supplied by the client, and the
-table enforces the pair: `bids (auction_id, currency)` references `auctions (id, currency)`.
-One constraint says both "the auction exists" and "the currencies agree".
-
-**Sessions and limits.** A token lasts **7 days**, with the expiry inside the authentication
-query. Logout revokes the token it was given; revoke-all takes every session. Failed logins
-are counted in two independent buckets — **5 per account**, **20 per address**, over 15
-minutes — and every HTTP route is limited to **120 requests a minute per address** by
-default. The address is the rightmost `X-Forwarded-For` entry, and only through a private or
-loopback hop: reached without a proxy the header is the caller's to choose, which would both
-dodge every budget and let one client spend another's.
-
-**Hardening.** Five security headers on every response, including the ones no route built.
-One logfmt line per bid, accepted or rejected, carrying the auction, the bidder, the guard
-and the `event_seq` that makes a double-win disprovable from logs. CI fails on a dependency
-with a published advisory, auditing the exported lock rather than what `pyproject.toml`
-permits. The container runs as uid 10001 with no compiler and no package manager.
+- **[The bid is one guarded `UPDATE`](docs/DESIGN.md#reserve-and-increment)** — reserve,
+  banded increment, deadline, seller and membership are all conditions in it, so two bids
+  racing cannot both win, and a refusal never names the reserve.
+- **[Anti-snipe](docs/DESIGN.md#anti-snipe)** — a bid in the last 60s moves the deadline 60s
+  out, capped at +2h from creation.
+- **[Realtime](docs/DESIGN.md#realtime)** — snapshot then live events, each carrying a
+  per-auction `seq` bumped in the statement that caused it; 64 behind is closed with 4408.
+- **[Nothing is announced without being recorded](docs/DESIGN.md#realtime)** — events land in
+  an outbox row in the same transaction; the closer's tick relays, prunes and sweeps.
+- **[Scaling out is one variable](docs/DESIGN.md#scaling-out)** — `CHANNELS_URL`: in-memory,
+  Redis pub/sub, or Postgres `LISTEN`/`NOTIFY`. Measured at 500 sockets: 2500 of 2500 events,
+  p95 66–90 ms.
+- **[Lifecycle](docs/DESIGN.md#lifecycle-and-ownership)** — four states, four edges, and every
+  refusal the same 409, because a caller cannot act on the difference.
+- **[Communities gate bidding, not viewing](docs/DESIGN.md#communities)** — and
+  [invite codes](docs/DESIGN.md#invite-codes) are stored only as an HMAC; no pepper, no start.
+- **[Settlement is a record, not a transfer](docs/DESIGN.md#settlement-and-trust)** — each
+  side marks its own side, the 7-day grace period lives in the `WHERE`, and reputation is
+  recomputed rather than stored.
+- **[Money names its unit](docs/DESIGN.md#money)** — `Numeric(18,2)`, and one foreign key that
+  says both "the auction exists" and "the currencies agree".
+- **[Limits and headers](docs/DESIGN.md#hardening)** — 120 requests a minute per address, five
+  security headers on every response, and one logfmt line per bid naming the guard that
+  decided it.
 
 ## Guardrails
 Every invariant the bid path assumes is a database constraint, not only a Python check:
 `update`, a migration and psql all bypass handlers. Twenty-odd of them live in
 `app/models.py` — the deadline ceiling, the known statuses, positive amounts, a reserve at
 least the starting bid, one live code per community, one live membership per generation, the
-currency pair above. Adding one to a table that already holds a violating row fails the
+currency pair that keeps a bid in its auction's currency. Adding one to a table that already holds a violating row fails the
 migration by design: a bad money row should be looked at, not silently rewritten.
 
 ## Local dev
