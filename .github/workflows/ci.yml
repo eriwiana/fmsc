@@ -32,10 +32,15 @@ jobs:
           # .python-version, not pyproject: setup-python reads requires-python as a
           # range and picks the NEWEST match, which silently ran CI on 3.14.
           python-version-file: .python-version
+      # The project's own environment, because the ruff hooks run `uv run ruff`: one
+      # pinned formatter for the hook, for CI and for whoever types `uv run ruff check`.
+      - name: Install
+        run: uv sync --extra dev --locked
+
       # Over the whole repo, not the changed files: a pre-commit hook only
       # formats what a commit touches, so a file nobody has edited since the
       # formatter changed its mind drifts silently.
-      - run: uvx pre-commit run --all-files --show-diff-on-failure
+      - run: uv run pre-commit run --all-files --show-diff-on-failure
 
   test:
     runs-on: ubuntu-latest
